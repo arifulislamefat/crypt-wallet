@@ -24,6 +24,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cryptwallet-crypto = { path = "../../crypto" }
 cryptwallet-vault = { path = "../../vault" }
+# Scrubs our copy of a passphrase arriving over IPC (see `unlock_wallet`).
+zeroize = { version = "1.8" }
+# Shuffles the confirmation word order in this process rather than the
+# webview, so the backend can interpret the slots the user clicked.
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
 
 [dev-dependencies]
 tempfile = "3"

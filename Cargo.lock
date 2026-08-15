@@ -907,12 +907,14 @@ version = "0.1.0"
 dependencies = [
  "cryptwallet-crypto",
  "cryptwallet-vault",
+ "rand_core",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

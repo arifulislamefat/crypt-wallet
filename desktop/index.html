@@ -57,34 +57,6 @@
           </label>
         </fieldset>
 
-        <fieldset>
-          <legend>Unlock passphrase</legend>
-          <p class="hint">
-            Use a passphrase of four or more random words — something like
-            <em>copper lantern drift almond</em>. Length protects you far more
-            than symbols and substitutions do: a long passphrase is both
-            easier to remember and much harder to crack than a short complex
-            password. Minimum 12 characters.
-          </p>
-          <p class="hint">
-            This passphrase encrypts your wallet on this device. If you forget
-            it, this file cannot be recovered — only your recovery phrase can
-            restore the wallet.
-          </p>
-          <input
-            id="password"
-            type="password"
-            autocomplete="new-password"
-            placeholder="Passphrase"
-          />
-          <input
-            id="password-confirm"
-            type="password"
-            autocomplete="new-password"
-            placeholder="Confirm passphrase"
-          />
-        </fieldset>
-
         <button id="generate-btn" type="button">Generate recovery phrase</button>
         <p id="setup-error" class="error"></p>
       </section>
@@ -113,6 +85,32 @@
 
         <ol id="selected-words" class="phrase selected"></ol>
         <div id="word-bank" class="word-bank"></div>
+
+        <fieldset>
+          <legend>Unlock passphrase</legend>
+          <p class="hint">
+            Use a passphrase of four or more random words — something like
+            <em>copper lantern drift almond</em>. Length protects you far more
+            than symbols and substitutions do. Minimum 12 characters.
+          </p>
+          <p class="hint">
+            This passphrase encrypts your wallet on this device. If you forget
+            it, this file cannot be recovered — only your recovery phrase can
+            restore the wallet.
+          </p>
+          <input
+            id="password"
+            type="password"
+            autocomplete="new-password"
+            placeholder="Passphrase"
+          />
+          <input
+            id="password-confirm"
+            type="password"
+            autocomplete="new-password"
+            placeholder="Confirm passphrase"
+          />
+        </fieldset>
 
         <div class="row">
           <button id="reset-selection-btn" type="button">Start over</button>

@@ -4,13 +4,14 @@
 //!
 //! - A generated mnemonic crosses the IPC bridge exactly **once** (on
 //!   [`generate_new_mnemonic`], for display on the backup screen). The
-//!   confirm step sends back only the ordering the user clicked; the
-//!   frontend never re-transmits the stored phrase, and the backend never
-//!   sends it a second time.
+//!   confirm step sends back only the *slot numbers* the user clicked, not
+//!   the words: this process holds the confirmation display order, so the
+//!   clicks can be checked without the phrase ever making a return trip.
 //! - The pending mnemonic lives in Tauri managed state, not in the webview,
-//!   and is cleared once it has been sealed (or once sealing has failed).
+//!   and is cleared once it has been sealed.
 //! - No error message, log line, or `Debug` output in this module ever
 //!   contains a mnemonic, seed, or password. Error strings are static.
+//! - Passphrases arriving over IPC are wrapped in `Zeroizing` on entry.
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -19,7 +20,10 @@ use std::sync::Mutex;
 
 use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
 use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
+use rand_core::{OsRng, RngCore};
+use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+use zeroize::Zeroizing;
 
 /// Filename of the sealed vault inside the app data directory.
 const VAULT_FILENAME: &str = "wallet.vault";
@@ -40,14 +44,53 @@ const VAULT_FILENAME: &str = "wallet.vault";
 /// multi-word passphrase. The UI recommends the latter accordingly.
 const MIN_PASSWORD_LEN: usize = 12;
 
-/// The mnemonic generated for a wallet-creation flow that hasn't been
-/// confirmed and sealed yet.
-///
-/// Held here — in the Rust process, in managed state — specifically so the
-/// confirm step can verify the user's word ordering *without* the frontend
-/// having to send the phrase back across the bridge.
+/// A newly generated phrase, plus the display order its confirmation step
+/// will use.
+#[derive(Serialize)]
+struct NewMnemonic {
+    /// The phrase in order, for the backup screen. This is the only time
+    /// the words cross the bridge.
+    words: Vec<String>,
+    /// Confirmation display order: slot `i` shows `words[bank[i]]`.
+    bank: Vec<usize>,
+}
+
+/// A wallet-creation flow that hasn't been confirmed and sealed yet.
+struct PendingCreation {
+    mnemonic: SecretMnemonic,
+    /// `bank[slot]` is the position in the phrase of the word shown in
+    /// confirmation slot `slot`.
+    ///
+    /// Keeping this here is what lets the confirm step work on slot numbers
+    /// alone: the frontend reports which slots were clicked, and only this
+    /// process can map those back to phrase positions. Without it, the
+    /// frontend would have to send the words themselves — i.e. the phrase,
+    /// a second time.
+    bank: Vec<usize>,
+}
+
+/// The pending wallet creation, held in the Rust process rather than the
+/// webview.
 #[derive(Default)]
-struct PendingMnemonic(Mutex<Option<SecretMnemonic>>);
+struct PendingMnemonic(Mutex<Option<PendingCreation>>);
+
+/// Fisher–Yates shuffle of `0..len`, seeded from the OS CSPRNG.
+///
+/// This ordering is **not** a security control — it only decides where each
+/// word appears on screen, and the user is looking at all of them anyway.
+/// It uses `OsRng` regardless, because the alternative (`Math.random` in the
+/// webview, as this previously did) leaves a reader auditing the app unsure
+/// which randomness here is load-bearing. Modulo bias is irrelevant at these
+/// sizes and for this purpose.
+fn shuffled_indices(len: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = (0..len).collect();
+    let mut rng = OsRng;
+    for i in (1..len).rev() {
+        let j = (rng.next_u32() as usize) % (i + 1);
+        out.swap(i, j);
+    }
+    out
+}
 
 /// The mnemonic of the currently-unlocked wallet, held for the lifetime of
 /// the unlocked session and cleared by [`lock_wallet`].
@@ -166,7 +209,7 @@ fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn generate_new_mnemonic(
     word_count: u32,
     pending: State<'_, PendingMnemonic>,
-) -> Result<Vec<String>, String> {
+) -> Result<NewMnemonic, String> {
     let word_count = match word_count {
         12 => WordCount::Twelve,
         24 => WordCount::TwentyFour,
@@ -184,13 +227,18 @@ fn generate_new_mnemonic(
         phrase.split_whitespace().map(str::to_string).collect()
     });
 
+    let bank = shuffled_indices(words.len());
+
     let mut guard = pending
         .0
         .lock()
         .map_err(|_| "wallet creation state is unavailable")?;
-    *guard = Some(mnemonic);
+    *guard = Some(PendingCreation {
+        mnemonic,
+        bank: bank.clone(),
+    });
 
-    Ok(words)
+    Ok(NewMnemonic { words, bank })
 }
 
 /// Whether a sealed vault already exists in app data.
@@ -207,6 +255,16 @@ fn unlock_wallet(
     app: AppHandle,
     unlocked: State<'_, UnlockedWallet>,
 ) -> Result<String, String> {
+    // Wrapped the moment it arrives, so it is scrubbed on every exit path
+    // including the error ones.
+    //
+    // What this deliberately does NOT claim to reach: Tauri's IPC layer and
+    // serde have already materialized their own copies of this string
+    // before this function is entered, and both are dropped without
+    // scrubbing. This removes our copy, not every copy — the remaining ones
+    // are outside this crate's control and are why M8 (locking pages out of
+    // swap) is the real ceiling here.
+    let password = Zeroizing::new(password);
     let path = vault_path(&app)?;
     unlock_impl(&unlocked, &password, &path)
 }
@@ -285,13 +343,15 @@ fn unlock_impl(
 /// Returns the derived account-0 address (public data) on success.
 #[tauri::command]
 fn confirm_and_seal_wallet(
-    selected_words: Vec<String>,
+    selected_order: Vec<usize>,
     password: String,
     app: AppHandle,
     pending: State<'_, PendingMnemonic>,
 ) -> Result<String, String> {
+    // See `unlock_wallet` for what this does and does not scrub.
+    let password = Zeroizing::new(password);
     let path = vault_path(&app)?;
-    confirm_and_seal_impl(&pending, &selected_words, &password, &path)
+    confirm_and_seal_impl(&pending, &selected_order, &password, &path)
 }
 
 /// The testable core of [`confirm_and_seal_wallet`], separated from the
@@ -299,7 +359,7 @@ fn confirm_and_seal_wallet(
 /// standing up an app runtime.
 fn confirm_and_seal_impl(
     pending: &PendingMnemonic,
-    selected_words: &[String],
+    selected_order: &[usize],
     password: &str,
     vault_path: &Path,
 ) -> Result<String, String> {
@@ -322,20 +382,28 @@ fn confirm_and_seal_impl(
         .0
         .lock()
         .map_err(|_| "wallet creation state is unavailable")?;
-    let mnemonic = guard
+    let creation = guard
         .as_ref()
         .ok_or("no wallet creation is in progress")?;
 
-    // Only the verdict leaves the closure — the phrase itself is never bound
-    // to a local in this function.
-    let confirmed = mnemonic.expose_secret(|phrase| {
-        let expected: Vec<&str> = phrase.split_whitespace().collect();
-        expected.len() == selected_words.len()
-            && expected
-                .iter()
-                .zip(selected_words)
-                .all(|(expected, selected)| selected.trim().eq_ignore_ascii_case(expected))
-    });
+    // Verification now happens entirely on slot numbers: the frontend
+    // reports which confirmation slots were clicked and in what order, and
+    // `bank` — which only this process has — maps each slot back to a
+    // position in the phrase. The phrase is not read at all here.
+    //
+    // `bank.get(slot)` rather than indexing: `selected_order` is untrusted
+    // input from the webview and may contain out-of-range or repeated
+    // values, which must fail the check rather than panic.
+    let confirmed = selected_order.len() == creation.bank.len()
+        && selected_order
+            .iter()
+            .enumerate()
+            .all(|(expected_position, &slot)| {
+                creation
+                    .bank
+                    .get(slot)
+                    .is_some_and(|&word_index| word_index == expected_position)
+            });
 
     if !confirmed {
         // Deliberately does NOT clear the pending mnemonic: a mis-click on
@@ -345,10 +413,9 @@ fn confirm_and_seal_impl(
         return Err("the recovery phrase confirmation did not match".to_string());
     }
 
-    // Past this point the phrase is confirmed and we're committing. Every
-    // exit from here — success or failure — clears the pending mnemonic.
+    // Past this point the phrase is confirmed and we're committing.
     let result = (|| {
-        let seed = mnemonic.to_seed("");
+        let seed = creation.mnemonic.to_seed("");
         let account = EvmAccountKey::derive(&seed, 0)
             .map_err(|_| "failed to derive an account from the recovery phrase".to_string())?;
         let address = account.address().to_checksummed_hex();
@@ -366,7 +433,8 @@ fn confirm_and_seal_impl(
         // the seed would permanently foreclose the authenticated
         // reveal/export flow, leaving a user who lost their paper backup
         // holding a wallet they can never migrate or restore elsewhere.
-        let sealed = mnemonic
+        let sealed = creation
+            .mnemonic
             .expose_secret(|phrase| {
                 SealedVault::seal(phrase.as_bytes(), password, KdfParams::DESKTOP_DEFAULT)
             })
@@ -483,21 +551,41 @@ mod tests {
     const TEST_PASSWORD: &str = "test-password-not-a-real-secret";
 
     /// Seeds `PendingMnemonic` the same way `generate_new_mnemonic` does,
-    /// returning the state plus the correct word ordering.
-    fn pending_with_mnemonic() -> (PendingMnemonic, Vec<String>) {
+    /// returning the state, the phrase words, and the slot order that a
+    /// user clicking correctly would produce.
+    fn pending_with_mnemonic() -> (PendingMnemonic, Vec<String>, Vec<usize>) {
         let mnemonic = SecretMnemonic::generate(WordCount::Twelve).expect("generation succeeds");
         let words: Vec<String> =
             mnemonic.expose_secret(|phrase| phrase.split_whitespace().map(str::to_string).collect());
-        (PendingMnemonic(Mutex::new(Some(mnemonic))), words)
+        let bank = shuffled_indices(words.len());
+
+        // Clicking correctly means picking, for each phrase position in
+        // turn, whichever slot happens to hold that word.
+        let correct_slots: Vec<usize> = (0..words.len())
+            .map(|position| {
+                bank.iter()
+                    .position(|&word_index| word_index == position)
+                    .expect("every phrase position appears in the bank exactly once")
+            })
+            .collect();
+
+        (
+            PendingMnemonic(Mutex::new(Some(PendingCreation {
+                mnemonic,
+                bank,
+            }))),
+            words,
+            correct_slots,
+        )
     }
 
     #[test]
     fn correct_word_order_seals_a_vault() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
-        let address = confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path)
+        let address = confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path)
             .expect("correct order should seal");
 
         assert!(address.starts_with("0x"), "expected a checksummed address");
@@ -515,10 +603,10 @@ mod tests {
     fn sealed_vault_reopens_and_rederives_the_same_address() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, words, correct_slots) = pending_with_mnemonic();
 
         let created_address =
-            confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+            confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
 
         // The unlock path, exercised end to end: read the vault, decrypt it,
         // re-import the phrase, re-derive the seed and account. This is the
@@ -548,10 +636,10 @@ mod tests {
     fn password_one_character_under_the_minimum_is_rejected() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
         let just_short: String = "a".repeat(MIN_PASSWORD_LEN - 1);
-        let result = confirm_and_seal_impl(&pending, &words, &just_short, &path);
+        let result = confirm_and_seal_impl(&pending, &correct_slots, &just_short, &path);
 
         assert!(result.is_err(), "boundary is inclusive of the minimum only");
         assert!(!path.exists());
@@ -561,7 +649,7 @@ mod tests {
     fn password_length_is_counted_in_characters_not_bytes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
         // Three emoji: 12 bytes, but only 3 characters. A byte-length check
         // would accept this as if it met a 12-character minimum.
@@ -569,9 +657,33 @@ mod tests {
         assert_eq!(emoji.len(), 12);
         assert!(emoji.chars().count() < MIN_PASSWORD_LEN);
 
-        let result = confirm_and_seal_impl(&pending, &words, emoji, &path);
+        let result = confirm_and_seal_impl(&pending, &correct_slots, emoji, &path);
 
         assert!(result.is_err(), "byte length must not satisfy the minimum");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn out_of_range_and_repeated_slots_are_rejected_without_panicking() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+
+        // `selected_order` is untrusted input from the webview. Indexing
+        // `bank` directly with these would panic; the check must simply fail.
+        let out_of_range = vec![usize::MAX; correct_slots.len()];
+        let path = dir.path().join("a.vault");
+        assert!(confirm_and_seal_impl(&pending, &out_of_range, TEST_PASSWORD, &path).is_err());
+        assert!(!path.exists());
+
+        // A repeated slot is the right length but cannot be a real ordering.
+        let repeated = vec![correct_slots[0]; correct_slots.len()];
+        let path = dir.path().join("b.vault");
+        assert!(confirm_and_seal_impl(&pending, &repeated, TEST_PASSWORD, &path).is_err());
+        assert!(!path.exists());
+
+        // Too few slots.
+        let path = dir.path().join("c.vault");
+        assert!(confirm_and_seal_impl(&pending, &correct_slots[..3], TEST_PASSWORD, &path).is_err());
         assert!(!path.exists());
     }
 
@@ -579,9 +691,9 @@ mod tests {
     fn unlock_returns_the_address_the_wallet_was_created_with() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
-        let created = confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path)
+        let created = confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path)
             .expect("seal succeeds");
 
         let unlocked = UnlockedWallet::default();
@@ -598,20 +710,20 @@ mod tests {
     fn unlock_with_wrong_passphrase_fails_without_leaking_why() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
-        confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
 
         let unlocked = UnlockedWallet::default();
         let error = unlock_impl(&unlocked, "the-wrong-passphrase", &path)
             .expect_err("wrong passphrase must fail");
 
-        // Must not distinguish a wrong passphrase from a corrupt file, and
-        // must not carry any phrase material back out.
+        // Fixed string, for the same reason as above: scanning for phrase
+        // words collides with ordinary English (`unlock` and `check` are
+        // both BIP-39 words and both appear in this message).
+        assert_eq!(error, "could not unlock the wallet: check your passphrase");
+        // Must not distinguish a wrong passphrase from a corrupt file.
         assert!(!error.to_lowercase().contains("corrupt"));
         assert!(!error.to_lowercase().contains("tamper"));
-        for word in &words {
-            assert!(!error.contains(word.as_str()), "error leaked a phrase word");
-        }
         assert!(
             unlocked.0.lock().expect("lock").is_none(),
             "a failed unlock must not leave a session open"
@@ -622,8 +734,8 @@ mod tests {
     fn old_seed_format_vault_reports_a_version_error_not_a_decryption_error() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
-        confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
 
         // Rewind the version byte to 1 — what the seed-sealing build wrote.
         // The container layout is identical, so this is byte-for-byte what
@@ -649,8 +761,8 @@ mod tests {
     fn locking_clears_the_session() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
-        confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
 
         let unlocked = UnlockedWallet::default();
         unlock_impl(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
@@ -677,11 +789,11 @@ mod tests {
     fn wrong_word_order_is_rejected() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
         // Same words, wrong order — the ordering is the whole point of the
         // confirm step, so this must fail even though the set matches.
-        let mut swapped = words.clone();
+        let mut swapped = correct_slots.clone();
         swapped.swap(0, 1);
 
         let result = confirm_and_seal_impl(&pending, &swapped, TEST_PASSWORD, &path);
@@ -698,9 +810,9 @@ mod tests {
     fn failed_confirm_leaves_no_vault_file_behind() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
-        let reversed: Vec<String> = words.iter().rev().cloned().collect();
+        let reversed: Vec<usize> = correct_slots.iter().rev().copied().collect();
         let result = confirm_and_seal_impl(&pending, &reversed, TEST_PASSWORD, &path);
 
         assert!(result.is_err());
@@ -715,9 +827,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
         fs::write(&path, b"pretend this is an existing wallet").expect("write fixture");
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
-        let result = confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path);
+        let result = confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path);
 
         assert!(result.is_err(), "must refuse to overwrite an existing vault");
         assert_eq!(
@@ -731,9 +843,9 @@ mod tests {
     fn short_password_is_rejected_before_anything_is_written() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
-        let result = confirm_and_seal_impl(&pending, &words, "short", &path);
+        let result = confirm_and_seal_impl(&pending, &correct_slots, "short", &path);
 
         assert!(result.is_err());
         assert!(!path.exists());
@@ -743,20 +855,22 @@ mod tests {
     fn errors_never_contain_phrase_words() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(VAULT_FILENAME);
-        let (pending, words) = pending_with_mnemonic();
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
 
-        let mut swapped = words.clone();
+        let mut swapped = correct_slots.clone();
         swapped.swap(0, 1);
         let error = confirm_and_seal_impl(&pending, &swapped, TEST_PASSWORD, &path)
             .expect_err("wrong order errors");
 
-        // An error surfaced to the UI (or a crash reporter) must never carry
-        // any part of the phrase back out with it.
-        for word in &words {
-            assert!(
-                !error.contains(word.as_str()),
-                "error message leaked a phrase word"
-            );
-        }
+        // Asserts the message is a fixed string, rather than scanning it for
+        // phrase words. The scanning version was unsound and intermittently
+        // failed: `match`, `check`, `unlock` and `phrase` are all BIP-39
+        // wordlist entries *and* ordinary English that appears in these very
+        // error strings, so a generated phrase containing one produced a
+        // false positive roughly 2% of the time.
+        //
+        // Equality is also the stronger property: it fails if anything is
+        // ever interpolated into this message, secret or not.
+        assert_eq!(error, "the recovery phrase confirmation did not match");
     }
 }

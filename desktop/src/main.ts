@@ -29,14 +29,14 @@ const ALL_STEPS: Step[] = [
 /**
  * The generated phrase, held only as long as the backup and confirm screens
  * need it. It is never sent back to the backend — the confirm step transmits
- * only the ordering the user clicked. Cleared as soon as the wallet is
- * sealed (see `clearPhraseFromMemory`).
+ * only the slot numbers the user clicked, and the backend maps those to
+ * phrase positions using the display order it generated and kept.
  */
 let phraseWords: string[] = [];
-/** Indices into `phraseWords`, in the order the user has clicked them. */
-let selectedIndices: number[] = [];
-/** The shuffled word bank: indices into `phraseWords`, in display order. */
-let bankOrder: number[] = [];
+/** Backend-supplied display order: slot `i` shows `phraseWords[bank[i]]`. */
+let bank: number[] = [];
+/** Slots the user has clicked, in click order. */
+let selectedSlots: number[] = [];
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -52,28 +52,38 @@ function showStep(step: Step) {
   }
 }
 
-function shuffled(values: number[]): number[] {
-  const out = [...values];
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [out[i], out[j]] = [out[j], out[i]];
-  }
-  return out;
+/**
+ * Clear the passphrase inputs.
+ *
+ * Called on *every* exit from a flow that touched them, including error
+ * paths — a passphrase left sitting in a DOM input is readable by any script
+ * in the webview for as long as it stays there.
+ */
+function clearPassphraseInputs() {
+  el<HTMLInputElement>("password").value = "";
+  el<HTMLInputElement>("password-confirm").value = "";
+  el<HTMLInputElement>("unlock-password").value = "";
 }
 
 /**
- * Drop our references to the phrase. JavaScript gives no way to actually
- * scrub the underlying string memory — the real guarantee lives on the Rust
- * side, where the mnemonic is zeroized on drop. This just makes sure the UI
- * isn't holding a copy any longer than the flow requires.
+ * Drop our references to the phrase and wipe what it rendered into.
+ *
+ * JavaScript gives no way to actually scrub the underlying string memory —
+ * the real guarantee lives on the Rust side, where the mnemonic is zeroized
+ * on drop. This only bounds how long the UI holds a copy.
  */
 function clearPhraseFromMemory() {
   phraseWords = [];
-  selectedIndices = [];
-  bankOrder = [];
+  bank = [];
+  selectedSlots = [];
   el("phrase-list").replaceChildren();
   el("word-bank").replaceChildren();
   el("selected-words").replaceChildren();
+}
+
+interface NewMnemonic {
+  words: string[];
+  bank: number[];
 }
 
 async function generatePhrase() {
@@ -87,24 +97,16 @@ async function generatePhrase() {
       ) as HTMLInputElement
     ).value,
   );
-  const password = el<HTMLInputElement>("password").value;
-  const passwordConfirm = el<HTMLInputElement>("password-confirm").value;
-
-  if (characterCount(password) < MIN_PASSWORD_LENGTH) {
-    errorEl.textContent = `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`;
-    return;
-  }
-  if (password !== passwordConfirm) {
-    errorEl.textContent = "Passwords do not match.";
-    return;
-  }
 
   try {
-    phraseWords = await invoke<string[]>("generate_new_mnemonic", {
+    const generated = await invoke<NewMnemonic>("generate_new_mnemonic", {
       wordCount,
     });
+    phraseWords = generated.words;
+    bank = generated.bank;
   } catch (error) {
     errorEl.textContent = String(error);
+    clearPhraseFromMemory();
     return;
   }
 
@@ -123,8 +125,7 @@ function renderPhrase() {
 }
 
 function startConfirmation() {
-  selectedIndices = [];
-  bankOrder = shuffled(phraseWords.map((_, index) => index));
+  selectedSlots = [];
   renderConfirmation();
   showStep("confirm");
 }
@@ -132,32 +133,32 @@ function startConfirmation() {
 function renderConfirmation() {
   const selectedList = el("selected-words");
   selectedList.replaceChildren();
-  for (const index of selectedIndices) {
+  for (const slot of selectedSlots) {
     const item = document.createElement("li");
-    item.textContent = phraseWords[index];
+    item.textContent = phraseWords[bank[slot]];
     selectedList.appendChild(item);
   }
 
-  const bank = el("word-bank");
-  bank.replaceChildren();
-  for (const index of bankOrder) {
+  const bankEl = el("word-bank");
+  bankEl.replaceChildren();
+  for (let slot = 0; slot < bank.length; slot++) {
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = phraseWords[index];
-    // Track by index, not by text: a BIP-39 phrase can legitimately repeat
+    button.textContent = phraseWords[bank[slot]];
+    // Tracked by slot, not by text: a BIP-39 phrase can legitimately repeat
     // a word, and each occurrence has to be selectable exactly once.
-    button.disabled = selectedIndices.includes(index);
+    button.disabled = selectedSlots.includes(slot);
     button.addEventListener("click", () => {
-      selectedIndices.push(index);
+      selectedSlots.push(slot);
       el("confirm-error").textContent = "";
       renderConfirmation();
     });
-    bank.appendChild(button);
+    bankEl.appendChild(button);
   }
 
   el("confirm-btn").toggleAttribute(
     "disabled",
-    selectedIndices.length !== phraseWords.length,
+    selectedSlots.length !== bank.length,
   );
 }
 
@@ -167,6 +168,20 @@ async function confirmAndSeal() {
   const confirmBtn = el<HTMLButtonElement>("confirm-btn");
   errorEl.textContent = "";
 
+  const password = el<HTMLInputElement>("password").value;
+  const passwordConfirm = el<HTMLInputElement>("password-confirm").value;
+
+  if (characterCount(password) < MIN_PASSWORD_LENGTH) {
+    errorEl.textContent = `Passphrase must be at least ${MIN_PASSWORD_LENGTH} characters.`;
+    clearPassphraseInputs();
+    return;
+  }
+  if (password !== passwordConfirm) {
+    errorEl.textContent = "Passphrases do not match.";
+    clearPassphraseInputs();
+    return;
+  }
+
   // Argon2id at the desktop cost parameters takes several seconds by
   // design, and it blocks this call. Say so, and don't let the user
   // double-submit while it runs.
@@ -175,25 +190,26 @@ async function confirmAndSeal() {
 
   try {
     const address = await invoke<string>("confirm_and_seal_wallet", {
-      // Only the user's chosen ordering goes back across the bridge. The
-      // backend compares it against the phrase it already holds.
-      selectedWords: selectedIndices.map((index) => phraseWords[index]),
-      password: el<HTMLInputElement>("password").value,
+      // Only slot numbers cross the bridge. The backend holds the display
+      // order and maps these back to phrase positions itself.
+      selectedOrder: selectedSlots,
+      password,
     });
 
     clearPhraseFromMemory();
-    el<HTMLInputElement>("password").value = "";
-    el<HTMLInputElement>("password-confirm").value = "";
-
     el("address").textContent = address;
     showStep("done");
   } catch (error) {
     errorEl.textContent = String(error);
     // Let the user retry the ordering; the backend keeps the phrase pending
-    // on a mismatch precisely so a mis-click isn't fatal.
-    selectedIndices = [];
+    // on a mismatch precisely so a mis-click isn't fatal. The phrase itself
+    // must stay for that retry — it is already on screen — but the
+    // passphrase does not, so it goes.
+    selectedSlots = [];
     renderConfirmation();
   } finally {
+    // Runs on success and failure alike.
+    clearPassphraseInputs();
     statusEl.textContent = "";
     confirmBtn.disabled = false;
   }
@@ -203,7 +219,6 @@ async function unlock() {
   const errorEl = el("unlock-error");
   const statusEl = el("unlock-status");
   const unlockBtn = el<HTMLButtonElement>("unlock-btn");
-  const passwordEl = el<HTMLInputElement>("unlock-password");
   errorEl.textContent = "";
 
   // Same Argon2id cost as sealing, so unlocking is deliberately slow too.
@@ -212,14 +227,16 @@ async function unlock() {
 
   try {
     const address = await invoke<string>("unlock_wallet", {
-      password: passwordEl.value,
+      password: el<HTMLInputElement>("unlock-password").value,
     });
-    passwordEl.value = "";
     el("unlocked-address").textContent = address;
     showStep("unlocked");
   } catch (error) {
     errorEl.textContent = String(error);
   } finally {
+    // Cleared whether the unlock succeeded or failed; a wrong attempt means
+    // retyping, which is a small price for not leaving it in the DOM.
+    clearPassphraseInputs();
     statusEl.textContent = "";
     unlockBtn.disabled = false;
   }
@@ -228,7 +245,8 @@ async function unlock() {
 async function lock() {
   await invoke("lock_wallet");
   el("unlocked-address").textContent = "";
-  el<HTMLInputElement>("unlock-password").value = "";
+  clearPassphraseInputs();
+  clearPhraseFromMemory();
   showStep("unlock");
 }
 
@@ -237,13 +255,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("backup-done-btn").addEventListener("click", startConfirmation);
   el("confirm-btn").addEventListener("click", confirmAndSeal);
   el("reset-selection-btn").addEventListener("click", () => {
-    selectedIndices = [];
+    selectedSlots = [];
     el("confirm-error").textContent = "";
     renderConfirmation();
   });
   el("unlock-btn").addEventListener("click", unlock);
   el("lock-btn").addEventListener("click", lock);
-  el("to-unlock-btn").addEventListener("click", () => showStep("unlock"));
+  el("to-unlock-btn").addEventListener("click", () => {
+    clearPhraseFromMemory();
+    clearPassphraseInputs();
+    showStep("unlock");
+  });
   el("unlock-password").addEventListener("keydown", (event) => {
     if ((event as KeyboardEvent).key === "Enter") {
       unlock();

@@ -59,6 +59,95 @@ struct PendingMnemonic(Mutex<Option<SecretMnemonic>>);
 #[derive(Default)]
 struct UnlockedWallet(Mutex<Option<SecretMnemonic>>);
 
+/// Create a file readable only by the owning user.
+///
+/// On Unix the mode is applied at creation time (alongside `O_CREAT|O_EXCL`),
+/// so there is no window in which the file exists with the default
+/// `0644` — which would have made the vault world-readable and available
+/// for offline cracking by any local user.
+///
+/// On Windows nothing extra is applied: files here inherit the user-profile
+/// ACL of the app data directory, which grants only SYSTEM, Administrators
+/// and the owning user. That was verified against a real vault file rather
+/// than assumed.
+fn create_new_private_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Create a directory tree traversable only by the owning user (Unix).
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Write the vault so the target file is either absent or complete, never
+/// truncated: contents go to a temp file that is fsynced, then renamed over
+/// the target.
+///
+/// The failure this prevents is not an attack. Previously a mid-write error
+/// left a partial file that `create_new` had already claimed, so the user
+/// could neither unlock it nor create a new wallet — locked out with no
+/// attacker involved.
+fn write_vault_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("invalid wallet file path")?;
+    create_private_dir_all(parent)
+        .map_err(|_| "could not create the application data directory".to_string())?;
+
+    let temp_path = path.with_extension("tmp");
+    // A leftover temp file means a previous attempt died mid-write. It holds
+    // no usable wallet, so clearing it is safe; `create_new` below still
+    // provides the `O_EXCL` semantics that defeat a symlink swap.
+    if temp_path.exists() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    let mut file = create_new_private_file(&temp_path)
+        .map_err(|_| "could not create the wallet file".to_string())?;
+    file.write_all(bytes)
+        .map_err(|_| "could not write the wallet file".to_string())?;
+    // Without this the rename can become visible before the contents reach
+    // disk, so a crash leaves a present-but-empty vault.
+    file.sync_all()
+        .map_err(|_| "could not flush the wallet file to disk".to_string())?;
+    drop(file);
+
+    // Re-checked here rather than relying on `create_new` against the final
+    // path, because atomic replacement rules that out (POSIX `rename` always
+    // replaces). The remaining TOCTOU window is accepted: exploiting it
+    // requires an attacker already running as this user, who could overwrite
+    // the vault directly anyway — whereas the lockout this replaces was
+    // hurting ordinary users with no attacker present.
+    if path.exists() {
+        let _ = fs::remove_file(&temp_path);
+        return Err("a wallet already exists on this device".to_string());
+    }
+
+    fs::rename(&temp_path, path)
+        .map_err(|_| "could not finalize the wallet file".to_string())?;
+
+    // On Unix the rename itself is only durable once the directory entry is
+    // synced; on Windows `MoveFileEx` ordering already covers this.
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
+}
+
 /// Path the sealed vault lives at, inside Tauri's resolved app data
 /// directory (never a hardcoded path — that varies per user and per OS).
 fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -283,29 +372,19 @@ fn confirm_and_seal_impl(
             })
             .map_err(|_| "failed to encrypt the wallet".to_string())?;
 
-        if let Some(parent) = vault_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|_| "could not create the application data directory".to_string())?;
-        }
-
-        // `create_new` fails if the path already exists, so an existing
-        // vault can never be clobbered — including by a racing writer that
-        // appeared after the check above.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(vault_path)
-            .map_err(|e| match e.kind() {
-                ErrorKind::AlreadyExists => "a wallet already exists on this device".to_string(),
-                _ => "could not create the wallet file".to_string(),
-            })?;
-        file.write_all(&sealed.to_bytes())
-            .map_err(|_| "could not write the wallet file".to_string())?;
+        write_vault_atomically(vault_path, &sealed.to_bytes())?;
 
         Ok(address)
     })();
 
-    *guard = None;
+    // Cleared only once the wallet is durably on disk. On failure the phrase
+    // stays pending so the user can retry without restarting the flow —
+    // safe now that the write is atomic, since a failed attempt persists
+    // nothing. The tradeoff is that the mnemonic lives in memory longer on
+    // that path than it would if we discarded it unconditionally.
+    if result.is_ok() {
+        *guard = None;
+    }
     result
 }
 

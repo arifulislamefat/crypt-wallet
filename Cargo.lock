@@ -905,6 +905,8 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "cryptwallet-crypto",
+ "cryptwallet-vault",
  "serde",
  "serde_json",
  "tauri",

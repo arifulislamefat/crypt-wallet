@@ -8,7 +8,7 @@
 
 use bip39::{Language, Mnemonic};
 use rand_core::OsRng;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 /// Supported mnemonic lengths for *generation*. BIP-39 itself also allows
 /// 15/18/21 words; those are still accepted on *import* (see
@@ -111,19 +111,44 @@ impl SecretMnemonic {
         self.inner.word_count()
     }
 
-    /// Render the phrase as a `String`, for one-time display on a
-    /// screenshot-blocked, re-authenticated backup/reveal screen only.
+    /// Expose the phrase as a `&str` for the duration of `f` — for one-time
+    /// display on a screenshot-blocked, re-authenticated backup screen only.
     ///
-    /// Callers MUST NOT log this value, pass it to any analytics/crash
-    /// framework, write it to disk unencrypted, or hold it longer than the
-    /// screen needs it. This function returning a `String` rather than
-    /// something zeroizing is a conscious trade-off for Phase 1 simplicity —
-    /// **flagging this as a follow-up hardening item**: the UI layer should
-    /// wrap the returned `String` in its own zeroize-on-drop holder
-    /// immediately, since a bare `String` here will leave a copy in the
-    /// allocator until overwritten, and `String` does not zeroize itself.
-    pub fn reveal(&self) -> String {
-        self.inner.to_string()
+    /// Takes a closure rather than returning an owned `String` so that the
+    /// phrase's lifetime is bounded lexically and **this crate**, not each
+    /// call site, guarantees the temporary is scrubbed: the phrase is
+    /// materialized into a `Zeroizing<String>` that is zeroed when `f`
+    /// returns. It is built into a single pre-sized allocation so the
+    /// string never reallocates mid-construction, which would otherwise
+    /// leave stale partial-phrase copies in freed heap memory that nothing
+    /// would ever scrub.
+    ///
+    /// Deliberately shares a name with [`Seed::expose_secret`] so that one
+    /// `grep -r expose_secret` enumerates every site in the workspace that
+    /// touches raw secret material.
+    ///
+    /// Callers MUST NOT log this value, pass it to an analytics or crash
+    /// framework, or write it to disk unencrypted. Be clear-eyed about what
+    /// this shape can and cannot enforce: copying the phrase out of the
+    /// closure (`.to_string()`, pushing it into a `Vec<String>`) still
+    /// produces an un-zeroizing copy, and no safe-Rust API can prevent that.
+    /// Return the smallest thing that answers the question — a `bool`, a
+    /// count — in preference to the phrase itself.
+    pub fn expose_secret<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let words = self.inner.words();
+        // +1 per word covers the separators; over-allocating by one byte is
+        // cheaper than risking a realloc that leaves an unscrubbed copy.
+        let capacity: usize = words.clone().map(|word| word.len() + 1).sum();
+
+        let mut phrase = Zeroizing::new(String::with_capacity(capacity));
+        for (i, word) in words.enumerate() {
+            if i > 0 {
+                phrase.push(' ');
+            }
+            phrase.push_str(word);
+        }
+
+        f(&phrase)
     }
 
     /// Construct a mnemonic from explicit entropy, for use in tests only —
@@ -148,6 +173,20 @@ impl SecretMnemonic {
 /// A 64-byte BIP-39 seed, zeroized on drop, never `Debug`-printed in full.
 #[derive(ZeroizeOnDrop)]
 pub struct Seed(pub(crate) [u8; 64]);
+
+// NOTE: `Seed` deliberately exposes no public accessor for its bytes.
+//
+// One existed briefly, to hand the seed to the vault for sealing. Sealing
+// the *mnemonic* instead (see the create-wallet flow, and architecture spec
+// §D.5 on recoverability) removed the only caller that ever needed raw seed
+// bytes outside this crate, so the accessor was removed with it and the
+// `pub(crate)` field is once again the whole story: seed bytes are
+// unreachable outside this crate by compiler enforcement, not by
+// documented convention.
+//
+// If a future phase genuinely needs them, prefer adding a narrowly-scoped
+// `expose_secret(|bytes| ...)` in the shape `SecretMnemonic` uses, rather
+// than a plain `as_bytes()` borrow — and re-justify it at that point.
 
 impl std::fmt::Debug for Seed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

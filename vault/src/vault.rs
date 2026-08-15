@@ -53,10 +53,29 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 // the `aead` crate's own `OsRng` re-export, so exactly one CSPRNG source is
 // used consistently across both the crypto and vault crates.
 
-/// Format version byte. Bumping this is how a future change to the on-disk
-/// layout stays distinguishable from today's — `open()` should refuse to
-/// parse a version it doesn't recognize rather than guess.
-const FORMAT_VERSION: u8 = 1;
+/// Format version byte. Bumping this is how a change to what a sealed vault
+/// contains stays distinguishable from what came before — `from_bytes()`
+/// refuses to parse a version it doesn't recognize rather than guess.
+///
+/// History:
+/// - **1** — Crypt Wallet sealed a raw 64-byte BIP-39 seed.
+/// - **2** — seals the BIP-39 mnemonic phrase instead, so the recovery
+///   phrase remains exportable (architecture spec §D.5).
+///
+/// Note that the *container* layout is byte-identical between 1 and 2; only
+/// the meaning of the plaintext changed. The bump exists precisely because
+/// of that: without it a v1 vault decrypts successfully and is then
+/// misinterpreted as a phrase, which surfaces as a confusing parse failure
+/// far from the real cause. A version byte that tracks only layout, and
+/// lets payload meaning change silently underneath it, isn't doing its job.
+///
+/// Caveat for future readers: this crate is otherwise deliberately
+/// payload-agnostic (it seals arbitrary `&[u8]`), so encoding a *consumer's*
+/// payload semantics here is a compromise, justified by this being a
+/// single-application workspace with one consumer. If this crate ever gains
+/// a second consumer, payload versioning belongs in a header the consumer
+/// writes inside the plaintext, not in this byte.
+const FORMAT_VERSION: u8 = 2;
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24; // XChaCha20Poly1305's extended nonce size

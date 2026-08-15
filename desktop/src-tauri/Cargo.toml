@@ -25,3 +25,6 @@ serde_json = "1"
 cryptwallet-crypto = { path = "../../crypto" }
 cryptwallet-vault = { path = "../../vault" }
 
+[dev-dependencies]
+tempfile = "3"
+

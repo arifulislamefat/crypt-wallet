@@ -1,7 +1,313 @@
-#[cfg(debug_assertions)]
+//! Tauri command surface for Crypt Wallet's desktop app.
+//!
+//! ## Secret-handling rules this module follows
+//!
+//! - A generated mnemonic crosses the IPC bridge exactly **once** (on
+//!   [`generate_new_mnemonic`], for display on the backup screen). The
+//!   confirm step sends back only the ordering the user clicked; the
+//!   frontend never re-transmits the stored phrase, and the backend never
+//!   sends it a second time.
+//! - The pending mnemonic lives in Tauri managed state, not in the webview,
+//!   and is cleared once it has been sealed (or once sealing has failed).
+//! - No error message, log line, or `Debug` output in this module ever
+//!   contains a mnemonic, seed, or password. Error strings are static.
+
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
 use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
-#[cfg(debug_assertions)]
-use cryptwallet_vault::{KdfParams, SealedVault};
+use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
+use tauri::{AppHandle, Manager, State};
+
+/// Filename of the sealed vault inside the app data directory.
+const VAULT_FILENAME: &str = "wallet.vault";
+
+/// Minimum accepted unlock-password length.
+///
+/// This password is the only thing standing between an attacker who has
+/// copied the vault file and the recovery phrase inside it. Argon2id at
+/// `KdfParams::DESKTOP_DEFAULT` (256 MiB, 3 iterations) makes each guess
+/// expensive, which buys a great deal — but the KDF cost multiplies the
+/// search space, it doesn't create one, so the password's own entropy is
+/// still the binding constraint.
+///
+/// 12 is a floor, not a target. Length dominates character variety here:
+/// against an offline attacker running a wordlist-and-mangling-rules attack
+/// (which is what real cracking looks like, not brute force over the
+/// alphabet), a short string with substitutions is weaker than a longer
+/// multi-word passphrase. The UI recommends the latter accordingly.
+const MIN_PASSWORD_LEN: usize = 12;
+
+/// The mnemonic generated for a wallet-creation flow that hasn't been
+/// confirmed and sealed yet.
+///
+/// Held here — in the Rust process, in managed state — specifically so the
+/// confirm step can verify the user's word ordering *without* the frontend
+/// having to send the phrase back across the bridge.
+#[derive(Default)]
+struct PendingMnemonic(Mutex<Option<SecretMnemonic>>);
+
+/// The mnemonic of the currently-unlocked wallet, held for the lifetime of
+/// the unlocked session and cleared by [`lock_wallet`].
+///
+/// Storing the mnemonic (rather than a derived key) is what lets a later
+/// authenticated reveal/export flow work without asking for the passphrase
+/// again. `SecretMnemonic` is `ZeroizeOnDrop`, so both replacing and
+/// clearing this scrub the previous value.
+#[derive(Default)]
+struct UnlockedWallet(Mutex<Option<SecretMnemonic>>);
+
+/// Path the sealed vault lives at, inside Tauri's resolved app data
+/// directory (never a hardcoded path — that varies per user and per OS).
+fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "could not resolve the application data directory".to_string())?;
+    Ok(dir.join(VAULT_FILENAME))
+}
+
+/// Generate a new BIP-39 mnemonic and return its words for display.
+///
+/// This is the one and only time the phrase crosses the bridge. The
+/// mnemonic itself stays in [`PendingMnemonic`] for the confirm step.
+#[tauri::command]
+fn generate_new_mnemonic(
+    word_count: u32,
+    pending: State<'_, PendingMnemonic>,
+) -> Result<Vec<String>, String> {
+    let word_count = match word_count {
+        12 => WordCount::Twelve,
+        24 => WordCount::TwentyFour,
+        _ => return Err("word count must be 12 or 24".to_string()),
+    };
+
+    let mnemonic =
+        SecretMnemonic::generate(word_count).map_err(|_| "failed to generate a recovery phrase")?;
+
+    // The words are returned for display, so they necessarily become plain
+    // `String`s at this boundary — that copy is the residual exposure
+    // `expose_secret`'s docs warn about, and it's unavoidable for a phrase
+    // the user has to be shown. It must not outlive the backup screen.
+    let words: Vec<String> = mnemonic.expose_secret(|phrase| {
+        phrase.split_whitespace().map(str::to_string).collect()
+    });
+
+    let mut guard = pending
+        .0
+        .lock()
+        .map_err(|_| "wallet creation state is unavailable")?;
+    *guard = Some(mnemonic);
+
+    Ok(words)
+}
+
+/// Whether a sealed vault already exists in app data.
+#[tauri::command]
+fn wallet_exists(app: AppHandle) -> bool {
+    vault_path(&app).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Open the sealed vault with `password` and unlock the wallet for this
+/// session. Returns the derived account-0 address (public data).
+#[tauri::command]
+fn unlock_wallet(
+    password: String,
+    app: AppHandle,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    let path = vault_path(&app)?;
+    unlock_impl(&unlocked, &password, &path)
+}
+
+/// Clear the unlocked wallet from memory, ending the session.
+#[tauri::command]
+fn lock_wallet(unlocked: State<'_, UnlockedWallet>) -> Result<(), String> {
+    let mut guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    // Dropping the `SecretMnemonic` zeroizes it.
+    *guard = None;
+    Ok(())
+}
+
+/// The testable core of [`unlock_wallet`].
+fn unlock_impl(
+    unlocked: &UnlockedWallet,
+    password: &str,
+    vault_path: &Path,
+) -> Result<String, String> {
+    let bytes = fs::read(vault_path).map_err(|e| match e.kind() {
+        ErrorKind::NotFound => "no wallet exists on this device yet".to_string(),
+        _ => "could not read the wallet file".to_string(),
+    })?;
+
+    // Version is checked before the passphrase is even used, so an
+    // out-of-date vault reports the real problem instead of spending ~10s in
+    // the KDF and then surfacing as a decryption failure. This also isn't a
+    // password oracle — it tells the user nothing about their passphrase.
+    let vault = SealedVault::from_bytes(&bytes).map_err(|e| match e {
+        VaultError::UnsupportedVersion => {
+            "this wallet file was created by an earlier version of Crypt Wallet \
+             and cannot be opened by this build. Restore from your recovery \
+             phrase instead."
+                .to_string()
+        }
+        _ => "the wallet file is damaged or not a Crypt Wallet vault".to_string(),
+    })?;
+
+    // Deliberately one message for wrong-passphrase AND tampered/corrupt
+    // ciphertext. AEAD tag verification cannot tell them apart anyway, and
+    // reporting which occurred would hand an attacker a free oracle.
+    let decrypted = vault
+        .open(password)
+        .map_err(|_| "could not unlock the wallet: check your passphrase".to_string())?;
+
+    // Defense in depth behind the version check: a v2 vault whose plaintext
+    // somehow isn't a valid phrase is corrupt in a way the AEAD tag couldn't
+    // catch (i.e. it was sealed wrong), not a passphrase problem.
+    let phrase = std::str::from_utf8(decrypted.as_bytes())
+        .map_err(|_| "the wallet file's contents are not a valid recovery phrase".to_string())?;
+    let mnemonic = SecretMnemonic::import(phrase)
+        .map_err(|_| "the wallet file's contents are not a valid recovery phrase".to_string())?;
+
+    // Seed is re-derived from the phrase rather than stored — deterministic,
+    // so nothing is lost by not persisting it.
+    let address = EvmAccountKey::derive(&mnemonic.to_seed(""), 0)
+        .map_err(|_| "failed to derive an account from the recovery phrase".to_string())?
+        .address()
+        .to_checksummed_hex();
+
+    let mut guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    *guard = Some(mnemonic);
+
+    Ok(address)
+}
+
+/// Verify the user's word ordering against the pending mnemonic, then seal
+/// the derived seed to disk under `password`.
+///
+/// Returns the derived account-0 address (public data) on success.
+#[tauri::command]
+fn confirm_and_seal_wallet(
+    selected_words: Vec<String>,
+    password: String,
+    app: AppHandle,
+    pending: State<'_, PendingMnemonic>,
+) -> Result<String, String> {
+    let path = vault_path(&app)?;
+    confirm_and_seal_impl(&pending, &selected_words, &password, &path)
+}
+
+/// The testable core of [`confirm_and_seal_wallet`], separated from the
+/// Tauri plumbing so it can be exercised against a temp directory without
+/// standing up an app runtime.
+fn confirm_and_seal_impl(
+    pending: &PendingMnemonic,
+    selected_words: &[String],
+    password: &str,
+    vault_path: &Path,
+) -> Result<String, String> {
+    // Counts characters, not bytes: `"👍👍👍"` is 12 bytes but 3 characters,
+    // and byte length would wave it through as if it met the minimum.
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        ));
+    }
+
+    // Checked before the KDF as well as at write time. The `create_new`
+    // below is the authoritative guard (it can't be raced); this early
+    // check just avoids burning ~10s of Argon2id on a doomed attempt.
+    if vault_path.exists() {
+        return Err("a wallet already exists on this device".to_string());
+    }
+
+    let mut guard = pending
+        .0
+        .lock()
+        .map_err(|_| "wallet creation state is unavailable")?;
+    let mnemonic = guard
+        .as_ref()
+        .ok_or("no wallet creation is in progress")?;
+
+    // Only the verdict leaves the closure — the phrase itself is never bound
+    // to a local in this function.
+    let confirmed = mnemonic.expose_secret(|phrase| {
+        let expected: Vec<&str> = phrase.split_whitespace().collect();
+        expected.len() == selected_words.len()
+            && expected
+                .iter()
+                .zip(selected_words)
+                .all(|(expected, selected)| selected.trim().eq_ignore_ascii_case(expected))
+    });
+
+    if !confirmed {
+        // Deliberately does NOT clear the pending mnemonic: a mis-click on
+        // the confirm screen is an ordinary user error, and discarding the
+        // phrase here would force them to restart with a different one.
+        // Nothing has been written at this point.
+        return Err("the recovery phrase confirmation did not match".to_string());
+    }
+
+    // Past this point the phrase is confirmed and we're committing. Every
+    // exit from here — success or failure — clears the pending mnemonic.
+    let result = (|| {
+        let seed = mnemonic.to_seed("");
+        let account = EvmAccountKey::derive(&seed, 0)
+            .map_err(|_| "failed to derive an account from the recovery phrase".to_string())?;
+        let address = account.address().to_checksummed_hex();
+
+        // What gets sealed is the **mnemonic**, not the derived seed, and
+        // unlock re-derives the seed from it (mnemonic -> seed is
+        // deterministic, so nothing is lost by not storing the seed).
+        //
+        // Deliberate tradeoff, per architecture spec §D.5: the mnemonic is
+        // the more dangerous secret to have sealed here, because it is
+        // *portable* — an attacker who cracks the vault can type it into any
+        // wallet on any device, whereas a bare seed is useful only to
+        // software that speaks this exact derivation scheme. That extra
+        // exposure is accepted in exchange for recoverability: sealing only
+        // the seed would permanently foreclose the authenticated
+        // reveal/export flow, leaving a user who lost their paper backup
+        // holding a wallet they can never migrate or restore elsewhere.
+        let sealed = mnemonic
+            .expose_secret(|phrase| {
+                SealedVault::seal(phrase.as_bytes(), password, KdfParams::DESKTOP_DEFAULT)
+            })
+            .map_err(|_| "failed to encrypt the wallet".to_string())?;
+
+        if let Some(parent) = vault_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|_| "could not create the application data directory".to_string())?;
+        }
+
+        // `create_new` fails if the path already exists, so an existing
+        // vault can never be clobbered — including by a racing writer that
+        // appeared after the check above.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(vault_path)
+            .map_err(|e| match e.kind() {
+                ErrorKind::AlreadyExists => "a wallet already exists on this device".to_string(),
+                _ => "could not create the wallet file".to_string(),
+            })?;
+        file.write_all(&sealed.to_bytes())
+            .map_err(|_| "could not write the wallet file".to_string())?;
+
+        Ok(address)
+    })();
+
+    *guard = None;
+    result
+}
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -55,25 +361,323 @@ fn core_health_check() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Two full builder chains rather than a shared `invoke_handler` binding:
-    // `generate_handler!`'s output type isn't pinned down until it's chained
-    // directly onto `.invoke_handler()`, so splitting it into a separate
-    // `let` (even cfg-gated per branch) leaves the runtime type parameter
-    // unresolved and fails to compile (E0282).
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(PendingMnemonic::default())
+        .manage(UnlockedWallet::default());
+
+    // The handler list is the only part that differs between debug and
+    // release. It's branched here rather than hoisted into a shared `let`
+    // because `generate_handler!`'s type isn't resolved until it's chained
+    // onto `.invoke_handler()` (doing otherwise fails to compile, E0282).
     #[cfg(debug_assertions)]
-    {
-        tauri::Builder::default()
-            .plugin(tauri_plugin_opener::init())
-            .invoke_handler(tauri::generate_handler![greet, core_health_check])
-            .run(tauri::generate_context!())
-            .expect("error while running tauri application");
-    }
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        greet,
+        core_health_check,
+        generate_new_mnemonic,
+        confirm_and_seal_wallet,
+        wallet_exists,
+        unlock_wallet,
+        lock_wallet
+    ]);
     #[cfg(not(debug_assertions))]
-    {
-        tauri::Builder::default()
-            .plugin(tauri_plugin_opener::init())
-            .invoke_handler(tauri::generate_handler![greet])
-            .run(tauri::generate_context!())
-            .expect("error while running tauri application");
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        greet,
+        generate_new_mnemonic,
+        confirm_and_seal_wallet,
+        wallet_exists,
+        unlock_wallet,
+        lock_wallet
+    ]);
+
+    builder
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A password comfortably over `MIN_PASSWORD_LEN`, so these tests
+    /// exercise the confirm logic rather than the length check.
+    const TEST_PASSWORD: &str = "test-password-not-a-real-secret";
+
+    /// Seeds `PendingMnemonic` the same way `generate_new_mnemonic` does,
+    /// returning the state plus the correct word ordering.
+    fn pending_with_mnemonic() -> (PendingMnemonic, Vec<String>) {
+        let mnemonic = SecretMnemonic::generate(WordCount::Twelve).expect("generation succeeds");
+        let words: Vec<String> =
+            mnemonic.expose_secret(|phrase| phrase.split_whitespace().map(str::to_string).collect());
+        (PendingMnemonic(Mutex::new(Some(mnemonic))), words)
+    }
+
+    #[test]
+    fn correct_word_order_seals_a_vault() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let address = confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path)
+            .expect("correct order should seal");
+
+        assert!(address.starts_with("0x"), "expected a checksummed address");
+        assert_eq!(address.len(), 42);
+        assert!(path.exists(), "vault file should have been written");
+
+        // The pending mnemonic must not survive a successful seal.
+        assert!(
+            pending.0.lock().expect("lock").is_none(),
+            "pending mnemonic should be cleared after sealing"
+        );
+    }
+
+    #[test]
+    fn sealed_vault_reopens_and_rederives_the_same_address() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let created_address =
+            confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        // The unlock path, exercised end to end: read the vault, decrypt it,
+        // re-import the phrase, re-derive the seed and account. This is the
+        // property that sealing the *mnemonic* rather than the seed exists
+        // to guarantee — if it ever breaks, a user who lost their paper
+        // backup is holding an unrecoverable wallet.
+        let bytes = fs::read(&path).expect("read vault back");
+        let vault = SealedVault::from_bytes(&bytes).expect("parse sealed vault");
+        let decrypted = vault.open(TEST_PASSWORD).expect("open with correct password");
+
+        let phrase = std::str::from_utf8(decrypted.as_bytes()).expect("phrase is valid utf-8");
+        let restored = SecretMnemonic::import(phrase).expect("sealed phrase must re-import");
+        let restored_address = EvmAccountKey::derive(&restored.to_seed(""), 0)
+            .expect("derive from restored phrase")
+            .address()
+            .to_checksummed_hex();
+
+        assert_eq!(
+            created_address, restored_address,
+            "a restored wallet must derive the same address it was created with"
+        );
+        // And what was sealed really is the phrase the user wrote down.
+        assert_eq!(phrase.split_whitespace().collect::<Vec<_>>(), words);
+    }
+
+    #[test]
+    fn password_one_character_under_the_minimum_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let just_short: String = "a".repeat(MIN_PASSWORD_LEN - 1);
+        let result = confirm_and_seal_impl(&pending, &words, &just_short, &path);
+
+        assert!(result.is_err(), "boundary is inclusive of the minimum only");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn password_length_is_counted_in_characters_not_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        // Three emoji: 12 bytes, but only 3 characters. A byte-length check
+        // would accept this as if it met a 12-character minimum.
+        let emoji = "👍👍👍";
+        assert_eq!(emoji.len(), 12);
+        assert!(emoji.chars().count() < MIN_PASSWORD_LEN);
+
+        let result = confirm_and_seal_impl(&pending, &words, emoji, &path);
+
+        assert!(result.is_err(), "byte length must not satisfy the minimum");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unlock_returns_the_address_the_wallet_was_created_with() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let created = confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path)
+            .expect("seal succeeds");
+
+        let unlocked = UnlockedWallet::default();
+        let opened = unlock_impl(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
+
+        assert_eq!(created, opened);
+        assert!(
+            unlocked.0.lock().expect("lock").is_some(),
+            "unlocking must hold the mnemonic for the session"
+        );
+    }
+
+    #[test]
+    fn unlock_with_wrong_passphrase_fails_without_leaking_why() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        let unlocked = UnlockedWallet::default();
+        let error = unlock_impl(&unlocked, "the-wrong-passphrase", &path)
+            .expect_err("wrong passphrase must fail");
+
+        // Must not distinguish a wrong passphrase from a corrupt file, and
+        // must not carry any phrase material back out.
+        assert!(!error.to_lowercase().contains("corrupt"));
+        assert!(!error.to_lowercase().contains("tamper"));
+        for word in &words {
+            assert!(!error.contains(word.as_str()), "error leaked a phrase word");
+        }
+        assert!(
+            unlocked.0.lock().expect("lock").is_none(),
+            "a failed unlock must not leave a session open"
+        );
+    }
+
+    #[test]
+    fn old_seed_format_vault_reports_a_version_error_not_a_decryption_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        // Rewind the version byte to 1 — what the seed-sealing build wrote.
+        // The container layout is identical, so this is byte-for-byte what
+        // an old vault looks like to the parser.
+        let mut bytes = fs::read(&path).expect("read vault");
+        bytes[0] = 1;
+        fs::write(&path, &bytes).expect("write downgraded vault");
+
+        let unlocked = UnlockedWallet::default();
+        let error = unlock_impl(&unlocked, TEST_PASSWORD, &path)
+            .expect_err("a v1 vault must be refused");
+
+        assert!(
+            error.contains("earlier version"),
+            "expected a version message, got: {error}"
+        );
+        // Detected before the passphrase is used, so the *correct* passphrase
+        // still produces the version error rather than a decryption error.
+        assert!(!error.contains("passphrase") || error.contains("recovery phrase"));
+    }
+
+    #[test]
+    fn locking_clears_the_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        let unlocked = UnlockedWallet::default();
+        unlock_impl(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
+        assert!(unlocked.0.lock().expect("lock").is_some());
+
+        // Mirrors what `lock_wallet` does to the same state.
+        *unlocked.0.lock().expect("lock") = None;
+        assert!(unlocked.0.lock().expect("lock").is_none());
+    }
+
+    #[test]
+    fn unlock_with_no_wallet_present_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+
+        let unlocked = UnlockedWallet::default();
+        let error =
+            unlock_impl(&unlocked, TEST_PASSWORD, &path).expect_err("missing file must fail");
+
+        assert!(error.contains("no wallet"), "got: {error}");
+    }
+
+    #[test]
+    fn wrong_word_order_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        // Same words, wrong order — the ordering is the whole point of the
+        // confirm step, so this must fail even though the set matches.
+        let mut swapped = words.clone();
+        swapped.swap(0, 1);
+
+        let result = confirm_and_seal_impl(&pending, &swapped, TEST_PASSWORD, &path);
+
+        assert!(result.is_err(), "wrong order must not be accepted");
+        // Still pending, so the user can retry without losing the phrase.
+        assert!(
+            pending.0.lock().expect("lock").is_some(),
+            "a mis-click should leave the phrase available to retry"
+        );
+    }
+
+    #[test]
+    fn failed_confirm_leaves_no_vault_file_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let reversed: Vec<String> = words.iter().rev().cloned().collect();
+        let result = confirm_and_seal_impl(&pending, &reversed, TEST_PASSWORD, &path);
+
+        assert!(result.is_err());
+        assert!(
+            !path.exists(),
+            "a failed confirmation must not write a vault file"
+        );
+    }
+
+    #[test]
+    fn existing_vault_is_never_overwritten() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        fs::write(&path, b"pretend this is an existing wallet").expect("write fixture");
+        let (pending, words) = pending_with_mnemonic();
+
+        let result = confirm_and_seal_impl(&pending, &words, TEST_PASSWORD, &path);
+
+        assert!(result.is_err(), "must refuse to overwrite an existing vault");
+        assert_eq!(
+            fs::read(&path).expect("read back"),
+            b"pretend this is an existing wallet",
+            "the existing vault file must be left byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn short_password_is_rejected_before_anything_is_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let result = confirm_and_seal_impl(&pending, &words, "short", &path);
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn errors_never_contain_phrase_words() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, words) = pending_with_mnemonic();
+
+        let mut swapped = words.clone();
+        swapped.swap(0, 1);
+        let error = confirm_and_seal_impl(&pending, &swapped, TEST_PASSWORD, &path)
+            .expect_err("wrong order errors");
+
+        // An error surfaced to the UI (or a crash reporter) must never carry
+        // any part of the phrase back out with it.
+        for word in &words {
+            assert!(
+                !error.contains(word.as_str()),
+                "error message leaked a phrase word"
+            );
+        }
     }
 }

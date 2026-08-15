@@ -4,39 +4,139 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <title>Crypt Wallet</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
     <main class="container">
-      <h1>Welcome to Tauri</h1>
+      <h1>Crypt Wallet</h1>
 
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+      <!-- Unlock: shown instead of the create flow when a vault exists -->
+      <section id="step-unlock" class="step hidden">
+        <h2>Unlock your wallet</h2>
+        <p class="hint">
+          Enter the passphrase you chose when you created this wallet.
+        </p>
+        <input
+          id="unlock-password"
+          type="password"
+          autocomplete="current-password"
+          placeholder="Passphrase"
+        />
+        <div class="row">
+          <button id="unlock-btn" type="button">Unlock</button>
+        </div>
+        <p id="unlock-status" class="hint"></p>
+        <p id="unlock-error" class="error"></p>
+      </section>
 
-      <div class="row">
-        <button id="health-check-btn" type="button">Run core health check</button>
-      </div>
-      <p id="health-check-msg"></p>
+      <!-- Unlocked session -->
+      <section id="step-unlocked" class="step hidden">
+        <h2>Wallet unlocked</h2>
+        <p class="hint">Your first account address:</p>
+        <p id="unlocked-address" class="address"></p>
+        <div class="row">
+          <button id="lock-btn" type="button">Lock wallet</button>
+        </div>
+      </section>
+
+      <!-- Step 1: choose phrase length and set an unlock password -->
+      <section id="step-setup" class="step hidden">
+        <h2>Create a new wallet</h2>
+
+        <fieldset>
+          <legend>Recovery phrase length</legend>
+          <label>
+            <input type="radio" name="word-count" value="12" checked />
+            12 words
+          </label>
+          <label>
+            <input type="radio" name="word-count" value="24" />
+            24 words (stronger)
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Unlock passphrase</legend>
+          <p class="hint">
+            Use a passphrase of four or more random words — something like
+            <em>copper lantern drift almond</em>. Length protects you far more
+            than symbols and substitutions do: a long passphrase is both
+            easier to remember and much harder to crack than a short complex
+            password. Minimum 12 characters.
+          </p>
+          <p class="hint">
+            This passphrase encrypts your wallet on this device. If you forget
+            it, this file cannot be recovered — only your recovery phrase can
+            restore the wallet.
+          </p>
+          <input
+            id="password"
+            type="password"
+            autocomplete="new-password"
+            placeholder="Passphrase"
+          />
+          <input
+            id="password-confirm"
+            type="password"
+            autocomplete="new-password"
+            placeholder="Confirm passphrase"
+          />
+        </fieldset>
+
+        <button id="generate-btn" type="button">Generate recovery phrase</button>
+        <p id="setup-error" class="error"></p>
+      </section>
+
+      <!-- Step 2: display the generated phrase -->
+      <section id="step-backup" class="step hidden">
+        <h2>Write down your recovery phrase</h2>
+
+        <p class="warning">
+          Anyone with these words controls your funds. Write them on paper and
+          store them somewhere safe. Do not screenshot them, photograph them,
+          or save them to a file, a password manager note, or a cloud service.
+        </p>
+
+        <ol id="phrase-list" class="phrase"></ol>
+
+        <button id="backup-done-btn" type="button">
+          I have written it down
+        </button>
+      </section>
+
+      <!-- Step 3: confirm the phrase by clicking words in order -->
+      <section id="step-confirm" class="step hidden">
+        <h2>Confirm your recovery phrase</h2>
+        <p class="hint">Click the words in the correct order.</p>
+
+        <ol id="selected-words" class="phrase selected"></ol>
+        <div id="word-bank" class="word-bank"></div>
+
+        <div class="row">
+          <button id="reset-selection-btn" type="button">Start over</button>
+          <button id="confirm-btn" type="button">Confirm and create wallet</button>
+        </div>
+
+        <p id="confirm-status" class="hint"></p>
+        <p id="confirm-error" class="error"></p>
+      </section>
+
+      <!-- Step 4: success -->
+      <section id="step-done" class="step hidden">
+        <h2>Wallet created</h2>
+        <p>Your wallet is encrypted and saved on this device.</p>
+        <p class="hint">Your first account address:</p>
+        <p id="address" class="address"></p>
+        <p class="hint">
+          The recovery phrase has been cleared from memory. Unlock with your
+          passphrase to use the wallet.
+        </p>
+        <div class="row">
+          <button id="to-unlock-btn" type="button">Continue to unlock</button>
+        </div>
+      </section>
     </main>
   </body>
 </html>

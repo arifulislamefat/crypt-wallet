@@ -91,8 +91,103 @@ button {
   outline: none;
 }
 
-#greet-input {
-  margin-right: 5px;
+/* --- create-wallet flow (minimal styling, proper UI comes later) --- */
+
+.hidden {
+  display: none;
+}
+
+.step {
+  max-width: 40rem;
+  margin: 0 auto;
+  text-align: left;
+}
+
+fieldset {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #8884;
+  border-radius: 8px;
+}
+
+fieldset label {
+  margin-right: 1rem;
+}
+
+fieldset input[type="password"] {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 0.5rem;
+}
+
+.hint {
+  font-size: 0.9em;
+  opacity: 0.75;
+}
+
+.warning {
+  padding: 0.75rem;
+  border-left: 4px solid #d9822b;
+  background-color: #d9822b1a;
+  border-radius: 4px;
+}
+
+.error {
+  color: #c0392b;
+  min-height: 1.2em;
+}
+
+.phrase {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  margin: 1rem 0;
+  padding-left: 1.5rem;
+}
+
+.phrase li {
+  padding: 0.4rem 0.6rem;
+  border: 1px solid #8884;
+  border-radius: 6px;
+  font-family: ui-monospace, monospace;
+}
+
+.phrase.selected {
+  min-height: 2rem;
+}
+
+.word-bank {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.word-bank button {
+  padding: 0.4rem 0.8rem;
+  font-family: ui-monospace, monospace;
+}
+
+.word-bank button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.address {
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+#unlock-password {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 1rem 0;
+}
+
+.row {
+  gap: 0.5rem;
 }
 
 @media (prefers-color-scheme: dark) {

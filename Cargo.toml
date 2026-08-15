@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crypto", "vault"]
+members = ["crypto", "vault", "desktop/src-tauri"]
 
 # Workspace-wide lint policy: deny common footguns. Individual crates can
 # tighten further (see crypto/src/lib.rs for #![deny(...)] at the crate level).

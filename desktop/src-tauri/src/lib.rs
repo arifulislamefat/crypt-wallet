@@ -1,4 +1,6 @@
+#[cfg(debug_assertions)]
 use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
+#[cfg(debug_assertions)]
 use cryptwallet_vault::{KdfParams, SealedVault};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -12,10 +14,14 @@ fn greet(name: &str) -> String {
 /// boundary. MUST be removed before any real release; this is scaffolding
 /// to verify crate wiring, not a real feature.
 ///
+/// Gated behind `debug_assertions` so it is physically absent from release
+/// builds — not just unregistered, but not compiled into the binary at all.
+///
 /// The mnemonic and seed generated here never leave this function and are
 /// never stored or logged — only the derived (public) address is returned.
 /// Both are dropped (and zeroized, per `crypto`'s own `ZeroizeOnDrop`
 /// guarantees) at the end of this function's scope.
+#[cfg(debug_assertions)]
 #[tauri::command]
 fn core_health_check() -> String {
     let crypto_summary = match SecretMnemonic::generate(WordCount::Twelve) {
@@ -49,9 +55,25 @@ fn core_health_check() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, core_health_check])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    // Two full builder chains rather than a shared `invoke_handler` binding:
+    // `generate_handler!`'s output type isn't pinned down until it's chained
+    // directly onto `.invoke_handler()`, so splitting it into a separate
+    // `let` (even cfg-gated per branch) leaves the runtime type parameter
+    // unresolved and fails to compile (E0282).
+    #[cfg(debug_assertions)]
+    {
+        tauri::Builder::default()
+            .plugin(tauri_plugin_opener::init())
+            .invoke_handler(tauri::generate_handler![greet, core_health_check])
+            .run(tauri::generate_context!())
+            .expect("error while running tauri application");
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        tauri::Builder::default()
+            .plugin(tauri_plugin_opener::init())
+            .invoke_handler(tauri::generate_handler![greet])
+            .run(tauri::generate_context!())
+            .expect("error while running tauri application");
+    }
 }

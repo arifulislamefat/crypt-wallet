@@ -1,0 +1,34 @@
+[package]
+name = "cryptwallet-vault"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Crypt Wallet — password-based encrypted-at-rest storage for secret material (Argon2id + XChaCha20-Poly1305). No platform keystore integration yet — that's a later, platform-specific phase; this crate is the portable core."
+
+[lints]
+workspace = true
+
+[dependencies]
+# --- Password-based key derivation ---
+# RustCrypto `argon2` — pure-Rust Argon2. We use the *raw KDF* API
+# (`hash_password_into`), NOT the PHC-string password-hashing/verification
+# API — the crate's own docs explicitly warn not to use the PHC-string API
+# for deriving encryption keys, which is exactly why this distinction is
+# called out in vault.rs's doc comments too.
+argon2 = { version = "0.5", default-features = false, features = ["std"] }
+
+# --- Authenticated encryption ---
+# RustCrypto `chacha20poly1305`, XChaCha20Poly1305 variant specifically: a
+# 192-bit (24-byte) random nonce, vs. the base construction's 96-bit (12-byte)
+# nonce. With a 96-bit nonce, generating it randomly on every encryption
+# carries a real (if small) collision risk over the lifetime of a vault that
+# gets re-encrypted many times (e.g. every settings change); XChaCha's larger
+# nonce space makes "just generate it randomly every time" safe without
+# needing a persistent counter, which is a simpler and more failure-resistant
+# design for a wallet than counter-based nonce management.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+
+zeroize = { version = "1.8", features = ["derive"] }
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+thiserror = "1.0"
+hex = "0.4"

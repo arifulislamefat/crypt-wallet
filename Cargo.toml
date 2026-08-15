@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crypto", "vault"]
+
+# Workspace-wide lint policy: deny common footguns. Individual crates can
+# tighten further (see crypto/src/lib.rs for #![deny(...)] at the crate level).
+[workspace.lints.rust]
+unsafe_code = "deny"

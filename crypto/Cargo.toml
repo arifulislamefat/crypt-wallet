@@ -1,0 +1,61 @@
+[package]
+name = "cryptwallet-crypto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Crypt Wallet — key generation, HD derivation, and address derivation core. No signing, no networking, no I/O."
+
+[lints]
+workspace = true
+
+[dependencies]
+# --- BIP-39 mnemonic generation / import / seed derivation ---
+# rust-bitcoin/rust-bip39 — the reference-grade BIP-39 crate in the Rust
+# ecosystem (12.2M+ downloads, maintained under the rust-bitcoin org).
+# Chosen over hand-rolling BIP-39 because a self-written wordlist/checksum
+# implementation is exactly the kind of "reinvented primitive" the project
+# brief explicitly forbids.
+#
+# NOTE: pin the exact patch version cargo resolves on first `cargo add` —
+# 2.2.2 was current at spec-writing time; verify against
+# https://crates.io/crates/bip39 before committing Cargo.lock.
+bip39 = { version = "2.2", default-features = false, features = ["std", "rand_core", "unicode-normalization", "zeroize"] }
+
+# --- BIP-32 hierarchical deterministic key derivation (secp256k1) ---
+# RustCrypto `bip32` — implements BIP-32 generically over the `elliptic-curve`
+# traits with a `secp256k1` feature backed by the pure-Rust `k256` crate.
+# NOTE: verify current version against https://crates.io/crates/bip32 —
+# not independently re-confirmed in this delivery; the API shape (XPrv,
+# DerivationPath, derive_path) is documented on docs.rs but exact method
+# names should be checked against the pinned version on first `cargo build`.
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
+
+# k256 — pure-Rust secp256k1 implementation used directly here for the final
+# public-key -> Ethereum-address step, and transitively by `bip32`. Using the
+# same crate `bip32` already depends on avoids pulling in a second,
+# potentially inconsistent secp256k1 implementation.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+# sha3 — RustCrypto's Keccak/SHA3 implementation. We use `Keccak256`
+# specifically (NOT `Sha3_256` — see evm.rs doc comment for why they differ
+# and why Ethereum needs the former).
+sha3 = "0.10"
+
+# zeroize — deterministic, compiler-fence-protected zeroing of secret memory
+# on drop. Applied to every type in this crate that ever holds key material.
+zeroize = { version = "1.8", features = ["derive"] }
+
+# rand_core — trait-only crate providing OsRng's interface without pulling in
+# `rand`'s broader (non-CSPRNG) generator surface. We construct OsRng
+# explicitly inside this crate rather than accepting a caller-supplied RNG,
+# so no caller can accidentally wire in a non-cryptographic source.
+rand_core = { version = "0.6", features = ["std"] }
+
+# thiserror — structured error types. Deliberately used so error Display
+# strings are static and can never accidentally interpolate secret data
+# (see mnemonic.rs / derivation.rs error enums: no variant carries the
+# invalid input itself).
+thiserror = "1.0"
+
+[dev-dependencies]
+hex = "0.4"

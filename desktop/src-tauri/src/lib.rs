@@ -16,17 +16,32 @@
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
 use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 use zeroize::Zeroizing;
 
 /// Filename of the sealed vault inside the app data directory.
 const VAULT_FILENAME: &str = "wallet.vault";
+
+/// Filename of the persisted consecutive-failed-unlock counter, kept next to
+/// the vault in app data. Survives process restart on purpose: an in-memory
+/// counter is reset simply by killing and relaunching the app, which is
+/// exactly the scripted-attack case the rate limit is meant to slow.
+const UNLOCK_FAILURES_FILENAME: &str = "unlock-failures";
+
+/// How long an unlocked wallet may sit before its mnemonic is cleared from
+/// memory. See [`UnlockedWallet`] for the reasoning behind this value.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How often the background sweeper checks the idle timeout. Only bounds how
+/// long past the timeout a session can linger, so coarse is fine.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Minimum accepted unlock-password length.
 ///
@@ -92,15 +107,117 @@ fn shuffled_indices(len: usize) -> Vec<usize> {
     out
 }
 
-/// The mnemonic of the currently-unlocked wallet, held for the lifetime of
-/// the unlocked session and cleared by [`lock_wallet`].
+/// An unlocked wallet: the mnemonic plus when the session began.
+struct UnlockedSession {
+    // Held for the not-yet-built authenticated reveal/export flow (spec
+    // §D.5), which is the whole reason to keep the mnemonic rather than a
+    // derived key. Nothing reads it yet — hence `dead_code` — but the idle
+    // timeout and window-event clears added here exist specifically so that,
+    // when that flow lands, the mnemonic isn't sitting in memory
+    // indefinitely and reachable without re-auth.
+    #[allow(dead_code)]
+    mnemonic: SecretMnemonic,
+    /// When this session was unlocked. The idle timeout is measured from
+    /// here. A future reveal/export command should refresh this on use so
+    /// the timeout tracks *inactivity* rather than raw session age — today
+    /// nothing reads the session, so the two are the same thing.
+    unlocked_at: Instant,
+}
+
+/// The currently-unlocked wallet, held for the lifetime of the session.
 ///
 /// Storing the mnemonic (rather than a derived key) is what lets a later
 /// authenticated reveal/export flow work without asking for the passphrase
 /// again. `SecretMnemonic` is `ZeroizeOnDrop`, so both replacing and
 /// clearing this scrub the previous value.
-#[derive(Default)]
-struct UnlockedWallet(Mutex<Option<SecretMnemonic>>);
+///
+/// The session is cleared on four triggers: [`lock_wallet`], an idle timeout
+/// ([`SESSION_IDLE_TIMEOUT`], swept by a background thread), and window
+/// blur/close. The idle default is **10 minutes**: this holds a raw mnemonic
+/// in process memory, so the window wants to be short, but there is no
+/// activity signal to extend it yet (no command reads the session), so it is
+/// really "time since unlock" — 10 minutes is long enough not to evict a
+/// user mid-task and short enough to bound how long the mnemonic lingers if
+/// they walk away with the window focused. Blur/close cover the commoner
+/// "switched away" case immediately; the timer is the backstop for "left it
+/// focused and left."
+///
+/// `Arc` so the background sweeper thread can hold its own handle.
+#[derive(Default, Clone)]
+struct UnlockedWallet(Arc<Mutex<Option<UnlockedSession>>>);
+
+impl UnlockedWallet {
+    /// Unconditionally clear the session (drop zeroizes the mnemonic).
+    fn clear(&self) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Clear the session if it has been idle at least `timeout` as of `now`.
+    /// Split out from the sweeper loop so the expiry rule is unit-testable
+    /// without waiting on wall-clock time.
+    fn clear_if_expired(&self, now: Instant, timeout: Duration) {
+        if let Ok(mut guard) = self.0.lock() {
+            let expired = guard
+                .as_ref()
+                .is_some_and(|s| now.duration_since(s.unlocked_at) >= timeout);
+            if expired {
+                *guard = None;
+            }
+        }
+    }
+}
+
+/// Consecutive failed unlock attempts to enforce a delay before, capped so a
+/// user who eventually remembers their passphrase isn't locked out forever.
+///
+/// The first few misses cost nothing (ordinary fat-fingering); past that the
+/// wait doubles each time. On top of the ~10s Argon2id already pays per
+/// attempt, this throttles a script hard while barely touching a human.
+///
+/// | consecutive failures | delay before next attempt |
+/// |---|---|
+/// | 0–2 | none |
+/// | 3 | 1s |
+/// | 4 | 2s |
+/// | 5 | 4s |
+/// | … | doubling |
+/// | 12+ | 300s (capped) |
+fn unlock_delay(failures: u32) -> Duration {
+    const FREE_ATTEMPTS: u32 = 3;
+    const CAP: Duration = Duration::from_secs(300);
+    if failures < FREE_ATTEMPTS {
+        return Duration::ZERO;
+    }
+    // `1u64 << n` for n up to ~40 stays well inside u64; the `.min` against
+    // the cap (300) means the shift exponent never grows large enough to
+    // overflow in practice, but saturate anyway to be safe.
+    let shift = failures - FREE_ATTEMPTS;
+    let seconds = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    Duration::from_secs(seconds).min(CAP)
+}
+
+/// Read the persisted consecutive-failure count. A missing or unparseable
+/// file reads as 0 — the counter is a throttle, not an integrity control, so
+/// failing open here is acceptable (see the honesty note in `unlock_impl`).
+fn read_unlock_failures(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the consecutive-failure count (best effort).
+fn write_unlock_failures(path: &Path, failures: u32) {
+    if let Some(parent) = path.parent() {
+        let _ = create_private_dir_all(parent);
+    }
+    // Not atomic and not private-mode-forced: this file holds no secret (an
+    // integer), and a torn write at worst under- or over-counts by one,
+    // which the throttle tolerates.
+    let _ = fs::write(path, failures.to_string());
+}
 
 /// Create a file readable only by the owning user.
 ///
@@ -194,11 +311,18 @@ fn write_vault_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Path the sealed vault lives at, inside Tauri's resolved app data
 /// directory (never a hardcoded path — that varies per user and per OS).
 fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
+    Ok(app_data_dir(app)?.join(VAULT_FILENAME))
+}
+
+/// Path of the persisted failed-unlock counter, alongside the vault.
+fn failures_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(UNLOCK_FAILURES_FILENAME))
+}
+
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
         .app_data_dir()
-        .map_err(|_| "could not resolve the application data directory".to_string())?;
-    Ok(dir.join(VAULT_FILENAME))
+        .map_err(|_| "could not resolve the application data directory".to_string())
 }
 
 /// Generate a new BIP-39 mnemonic and return its words for display.
@@ -266,26 +390,35 @@ fn unlock_wallet(
     // swap) is the real ceiling here.
     let password = Zeroizing::new(password);
     let path = vault_path(&app)?;
-    unlock_impl(&unlocked, &password, &path)
+    let failures = failures_path(&app)?;
+    unlock_impl(&unlocked, &password, &path, &failures, sleep_for)
 }
 
 /// Clear the unlocked wallet from memory, ending the session.
 #[tauri::command]
 fn lock_wallet(unlocked: State<'_, UnlockedWallet>) -> Result<(), String> {
-    let mut guard = unlocked
-        .0
-        .lock()
-        .map_err(|_| "wallet session state is unavailable")?;
     // Dropping the `SecretMnemonic` zeroizes it.
-    *guard = None;
+    unlocked.clear();
     Ok(())
 }
 
+/// Real delay enforcer, injected into [`unlock_impl`] so tests can pass a
+/// no-op instead of sleeping for real.
+fn sleep_for(d: Duration) {
+    if !d.is_zero() {
+        std::thread::sleep(d);
+    }
+}
+
 /// The testable core of [`unlock_wallet`].
+///
+/// `delay` is injected so tests exercise the counter without real sleeps.
 fn unlock_impl(
     unlocked: &UnlockedWallet,
     password: &str,
     vault_path: &Path,
+    failures_path: &Path,
+    delay: impl Fn(Duration),
 ) -> Result<String, String> {
     let bytes = fs::read(vault_path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => "no wallet exists on this device yet".to_string(),
@@ -306,16 +439,36 @@ fn unlock_impl(
         _ => "the wallet file is damaged or not a Crypt Wallet vault".to_string(),
     })?;
 
+    // Rate limit: wait out the penalty earned by prior consecutive failures
+    // *before* attempting the KDF, so the delay can't be skipped by killing
+    // the process mid-wait — on restart the count is still on disk and the
+    // same delay applies. Only wrong-passphrase failures (the `vault.open`
+    // path below) increment it; a missing/corrupt/old-format file is not a
+    // guess and is handled above without touching the counter.
+    //
+    // Honest limit: an attacker who can read the vault for offline cracking
+    // can also delete this counter file to reset the throttle. It is not
+    // claimed to stop that attacker — it stops the in-app "kill and relaunch
+    // to reset an in-memory counter" loop the review described, which a
+    // memory-only counter would not.
+    let failures = read_unlock_failures(failures_path);
+    delay(unlock_delay(failures));
+
     // Deliberately one message for wrong-passphrase AND tampered/corrupt
     // ciphertext. AEAD tag verification cannot tell them apart anyway, and
     // reporting which occurred would hand an attacker a free oracle.
-    let decrypted = vault
-        .open(password)
-        .map_err(|_| "could not unlock the wallet: check your passphrase".to_string())?;
+    let decrypted = match vault.open(password) {
+        Ok(decrypted) => decrypted,
+        Err(_) => {
+            write_unlock_failures(failures_path, failures.saturating_add(1));
+            return Err("could not unlock the wallet: check your passphrase".to_string());
+        }
+    };
 
     // Defense in depth behind the version check: a v2 vault whose plaintext
     // somehow isn't a valid phrase is corrupt in a way the AEAD tag couldn't
-    // catch (i.e. it was sealed wrong), not a passphrase problem.
+    // catch (i.e. it was sealed wrong), not a passphrase problem — so it does
+    // not count against the passphrase throttle.
     let phrase = std::str::from_utf8(decrypted.as_bytes())
         .map_err(|_| "the wallet file's contents are not a valid recovery phrase".to_string())?;
     let mnemonic = SecretMnemonic::import(phrase)
@@ -328,11 +481,17 @@ fn unlock_impl(
         .address()
         .to_checksummed_hex();
 
+    // Success resets the throttle.
+    let _ = fs::remove_file(failures_path);
+
     let mut guard = unlocked
         .0
         .lock()
         .map_err(|_| "wallet session state is unavailable")?;
-    *guard = Some(mnemonic);
+    *guard = Some(UnlockedSession {
+        mnemonic,
+        unlocked_at: Instant::now(),
+    });
 
     Ok(address)
 }
@@ -456,12 +615,6 @@ fn confirm_and_seal_impl(
     result
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 /// DIAGNOSTIC ONLY — proves `cryptwallet-crypto` and `cryptwallet-vault` are
 /// actually linked into the app and working, exercised across the Tauri IPC
 /// boundary. MUST be removed before any real release; this is scaffolding
@@ -508,10 +661,42 @@ fn core_health_check() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let unlocked = UnlockedWallet::default();
+
+    // Idle-timeout sweeper: clears the session once it has sat unused past
+    // SESSION_IDLE_TIMEOUT. Holds its own Arc handle, so it keeps running
+    // for the process lifetime independent of any command.
+    let sweeper = unlocked.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(SESSION_SWEEP_INTERVAL);
+        sweeper.clear_if_expired(Instant::now(), SESSION_IDLE_TIMEOUT);
+    });
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(PendingMnemonic::default())
-        .manage(UnlockedWallet::default());
+        .manage(unlocked)
+        // Clear the session the moment the window loses focus (covers
+        // minimize and switching away on every platform), is asked to close,
+        // or is destroyed. Immediate lock on switch-away is the common case;
+        // the idle timer above is the backstop for a window left focused.
+        //
+        // UX note for when a real post-unlock UI exists: `Focused(false)`
+        // also fires on a routine alt-tab (e.g. to a password manager), so
+        // this will feel aggressive then and should probably emit an event
+        // that returns the frontend to the unlock screen. Today only the
+        // (public) address is shown post-unlock, so there is nothing to hide
+        // and the frontend is intentionally left untouched.
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                WindowEvent::Focused(false)
+                    | WindowEvent::CloseRequested { .. }
+                    | WindowEvent::Destroyed
+            ) {
+                window.state::<UnlockedWallet>().clear();
+            }
+        });
 
     // The handler list is the only part that differs between debug and
     // release. It's branched here rather than hoisted into a shared `let`
@@ -519,7 +704,6 @@ pub fn run() {
     // onto `.invoke_handler()` (doing otherwise fails to compile, E0282).
     #[cfg(debug_assertions)]
     let builder = builder.invoke_handler(tauri::generate_handler![
-        greet,
         core_health_check,
         generate_new_mnemonic,
         confirm_and_seal_wallet,
@@ -529,7 +713,6 @@ pub fn run() {
     ]);
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![
-        greet,
         generate_new_mnemonic,
         confirm_and_seal_wallet,
         wallet_exists,
@@ -549,6 +732,17 @@ mod tests {
     /// A password comfortably over `MIN_PASSWORD_LEN`, so these tests
     /// exercise the confirm logic rather than the length check.
     const TEST_PASSWORD: &str = "test-password-not-a-real-secret";
+
+    /// `unlock_impl` with a no-op delay and a failures file beside the vault,
+    /// so tests exercise the counter without ever sleeping for real.
+    fn try_unlock(
+        unlocked: &UnlockedWallet,
+        password: &str,
+        vault_path: &Path,
+    ) -> Result<String, String> {
+        let failures = vault_path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        unlock_impl(unlocked, password, vault_path, &failures, |_| {})
+    }
 
     /// Seeds `PendingMnemonic` the same way `generate_new_mnemonic` does,
     /// returning the state, the phrase words, and the slot order that a
@@ -697,7 +891,7 @@ mod tests {
             .expect("seal succeeds");
 
         let unlocked = UnlockedWallet::default();
-        let opened = unlock_impl(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
+        let opened = try_unlock(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
 
         assert_eq!(created, opened);
         assert!(
@@ -714,7 +908,7 @@ mod tests {
         confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
 
         let unlocked = UnlockedWallet::default();
-        let error = unlock_impl(&unlocked, "the-wrong-passphrase", &path)
+        let error = try_unlock(&unlocked, "the-wrong-passphrase", &path)
             .expect_err("wrong passphrase must fail");
 
         // Fixed string, for the same reason as above: scanning for phrase
@@ -745,7 +939,7 @@ mod tests {
         fs::write(&path, &bytes).expect("write downgraded vault");
 
         let unlocked = UnlockedWallet::default();
-        let error = unlock_impl(&unlocked, TEST_PASSWORD, &path)
+        let error = try_unlock(&unlocked, TEST_PASSWORD, &path)
             .expect_err("a v1 vault must be refused");
 
         assert!(
@@ -765,7 +959,7 @@ mod tests {
         confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
 
         let unlocked = UnlockedWallet::default();
-        unlock_impl(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
+        try_unlock(&unlocked, TEST_PASSWORD, &path).expect("unlock succeeds");
         assert!(unlocked.0.lock().expect("lock").is_some());
 
         // Mirrors what `lock_wallet` does to the same state.
@@ -780,9 +974,110 @@ mod tests {
 
         let unlocked = UnlockedWallet::default();
         let error =
-            unlock_impl(&unlocked, TEST_PASSWORD, &path).expect_err("missing file must fail");
+            try_unlock(&unlocked, TEST_PASSWORD, &path).expect_err("missing file must fail");
 
         assert!(error.contains("no wallet"), "got: {error}");
+    }
+
+    #[test]
+    fn unlock_delay_schedule_is_free_then_doubling_then_capped() {
+        // First three misses are free.
+        assert_eq!(unlock_delay(0), Duration::ZERO);
+        assert_eq!(unlock_delay(1), Duration::ZERO);
+        assert_eq!(unlock_delay(2), Duration::ZERO);
+        // Then doubling from 1s.
+        assert_eq!(unlock_delay(3), Duration::from_secs(1));
+        assert_eq!(unlock_delay(4), Duration::from_secs(2));
+        assert_eq!(unlock_delay(5), Duration::from_secs(4));
+        assert_eq!(unlock_delay(11), Duration::from_secs(256));
+        // Capped at 5 minutes, and never overflows even at the extreme.
+        assert_eq!(unlock_delay(12), Duration::from_secs(300));
+        assert_eq!(unlock_delay(1000), Duration::from_secs(300));
+        assert_eq!(unlock_delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn failed_unlock_increments_persisted_counter_and_success_resets_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let failures = path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal");
+
+        let unlocked = UnlockedWallet::default();
+
+        // Two wrong attempts persist a count of 2 (still under the free
+        // threshold, so no real sleep is incurred by the no-op delay).
+        assert_eq!(read_unlock_failures(&failures), 0);
+        assert!(try_unlock(&unlocked, "wrong-passphrase-1", &path).is_err());
+        assert_eq!(read_unlock_failures(&failures), 1);
+        assert!(try_unlock(&unlocked, "wrong-passphrase-2", &path).is_err());
+        assert_eq!(read_unlock_failures(&failures), 2);
+
+        // A correct unlock clears the counter file entirely.
+        try_unlock(&unlocked, TEST_PASSWORD, &path).expect("correct passphrase unlocks");
+        assert!(!failures.exists(), "success must reset the throttle");
+    }
+
+    #[test]
+    fn wrong_format_and_missing_file_do_not_increment_the_counter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let failures = path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        let unlocked = UnlockedWallet::default();
+
+        // Missing file: not a guessing attempt.
+        assert!(try_unlock(&unlocked, TEST_PASSWORD, &path).is_err());
+        assert_eq!(read_unlock_failures(&failures), 0);
+
+        // Old-format vault: also not a passphrase guess.
+        let (pending, _w, slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &slots, TEST_PASSWORD, &path).expect("seal");
+        let mut bytes = fs::read(&path).expect("read");
+        bytes[0] = 1;
+        fs::write(&path, &bytes).expect("downgrade");
+        assert!(try_unlock(&unlocked, TEST_PASSWORD, &path).is_err());
+        assert_eq!(read_unlock_failures(&failures), 0);
+    }
+
+    #[test]
+    fn idle_session_is_cleared_after_the_timeout_but_not_before() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal");
+
+        let unlocked = UnlockedWallet::default();
+        try_unlock(&unlocked, TEST_PASSWORD, &path).expect("unlock");
+
+        let now = Instant::now();
+        // Not yet expired: a check "now" against a 10-minute timeout leaves it.
+        unlocked.clear_if_expired(now, SESSION_IDLE_TIMEOUT);
+        assert!(unlocked.0.lock().expect("lock").is_some());
+
+        // A check dated far in the future clears it.
+        let later = now + SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
+        unlocked.clear_if_expired(later, SESSION_IDLE_TIMEOUT);
+        assert!(
+            unlocked.0.lock().expect("lock").is_none(),
+            "an idle session past the timeout must be cleared"
+        );
+    }
+
+    #[test]
+    fn clear_wipes_an_unlocked_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal");
+
+        let unlocked = UnlockedWallet::default();
+        try_unlock(&unlocked, TEST_PASSWORD, &path).expect("unlock");
+        assert!(unlocked.0.lock().expect("lock").is_some());
+
+        // This is what the window blur/close handlers call.
+        unlocked.clear();
+        assert!(unlocked.0.lock().expect("lock").is_none());
     }
 
     #[test]

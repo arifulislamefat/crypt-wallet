@@ -39,10 +39,21 @@ pub enum DerivationError {
     /// The requested derivation path string didn't parse.
     #[error("invalid derivation path")]
     InvalidPath,
+    /// The account index was `>= 2^31`, which is the hardened-key range.
+    /// BIP-44's `address_index` level is non-hardened, so only `0 ..= 2^31-1`
+    /// is valid here. Rejected explicitly rather than formatted into the path
+    /// string, where the `bip32` parser would otherwise reinterpret it as a
+    /// *hardened* index and silently derive a different, unexpected key.
+    #[error("account index out of range")]
+    IndexOutOfRange,
     /// Child key derivation failed for the given path/index.
     #[error("child key derivation failed")]
     ChildDerivation,
 }
+
+/// The BIP-32 hardened-index boundary. Indices at or above this select
+/// hardened children; the BIP-44 `address_index` level must stay below it.
+const HARDENED_OFFSET: u32 = 0x8000_0000;
 
 /// BIP-44 path prefix shared by all EVM chains under this crate's derivation
 /// policy: `purpose' / coin_type' / account' / change`, with `account` fixed
@@ -97,6 +108,15 @@ impl EvmAccountKey {
     /// guaranteed — a mismatch here is a compile error, not a silent bug,
     /// so it's a safe class of thing to fix iteratively.
     pub fn derive(seed: &Seed, index: u32) -> Result<Self, DerivationError> {
+        // Reject the hardened range before it reaches the path string.
+        // `format!("{EVM_PATH_PREFIX}/{index}")` emits a bare number, which
+        // the parser treats as non-hardened — but a caller passing, say,
+        // `0x8000_0000` clearly means something the non-hardened level
+        // cannot represent, so deriving *some* key silently would be wrong.
+        if index >= HARDENED_OFFSET {
+            return Err(DerivationError::IndexOutOfRange);
+        }
+
         let path_string = format!("{EVM_PATH_PREFIX}/{index}");
         let path =
             DerivationPath::from_str(&path_string).map_err(|_| DerivationError::InvalidPath)?;
@@ -145,6 +165,27 @@ mod tests {
         // — if it ever fails, "restore my wallet" silently produces the
         // wrong addresses, which is a fund-loss-adjacent bug class.
         assert_eq!(key_a.address(), key_b.address());
+    }
+
+    #[test]
+    fn hardened_range_index_is_rejected() {
+        let seed = SecretMnemonic::from_entropy_for_testing(&[0x55u8; 32])
+            .expect("valid entropy")
+            .to_seed("");
+
+        // The largest valid non-hardened index derives fine...
+        assert!(EvmAccountKey::derive(&seed, HARDENED_OFFSET - 1).is_ok());
+
+        // ...but the first hardened index, and u32::MAX, must be refused
+        // rather than silently deriving a hardened key.
+        assert!(matches!(
+            EvmAccountKey::derive(&seed, HARDENED_OFFSET),
+            Err(DerivationError::IndexOutOfRange)
+        ));
+        assert!(matches!(
+            EvmAccountKey::derive(&seed, u32::MAX),
+            Err(DerivationError::IndexOutOfRange)
+        ));
     }
 
     #[test]

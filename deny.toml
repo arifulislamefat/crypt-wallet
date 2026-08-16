@@ -1,0 +1,118 @@
+# cargo-deny configuration for the Crypt Wallet workspace.
+#
+# BASELINE SNAPSHOT — this file reflects the dependency tree as scanned on
+# 2026-08-16 (515 crates, `cargo-deny 0.20.2`, workspace at commit e88f943).
+# It is not "solved and done." In particular:
+#
+#   - The `[advisories].ignore` list below downgrades 17 *specific,
+#     currently-known* advisories to notes, each with a reason recorded
+#     inline. It deliberately does NOT use a blanket rule (e.g. "allow all
+#     unmaintained advisories") — a brand-new advisory against any crate,
+#     including these same ones under a new ID, must still fail the check.
+#   - Most of these exemptions are justified by "not in the Windows build
+#     graph" (the GTK3 Linux-bindings cluster) or "build-dependency only"
+#     (the `unic-*` cluster). Both justifications are properties of
+#     *today's* dependency graph, not of the advisories themselves — an
+#     upgrade to Tauri (which pulls in `muda` -> `gtk` on some platforms,
+#     and `urlpattern` -> `unic-*` as a build dep of `tauri-build`) can
+#     change which targets pull these crates in, or replace them outright.
+#
+# RE-REVIEW THIS FILE whenever the Tauri version (or any dependency that
+# pulls in the crates named below) is upgraded. Re-run:
+#   cargo tree -i <crate> --target all
+# for each ignored crate and confirm the justification still holds before
+# assuming these exemptions still apply. Findings and full command output
+# for the original scan are not duplicated here; ask for the review if you
+# need the reasoning behind a specific exemption beyond what's inline below.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = [
+    # --- GTK3 bindings cluster: unmaintained, upstream is retiring GTK3 ---
+    # support in favor of GTK4. Pulled in via tauri -> muda -> gtk on
+    # platforms where Tauri uses a GTK-based tray/menu backend.
+    #
+    # Verified via `cargo tree -i <crate> --target all` (2026-08-16): every
+    # crate in this group resolves ONLY through that path, and `cargo tree
+    # -i glib` (no --target, i.e. the actual Windows build) returns nothing
+    # — none of this cluster is in this app's real Windows dependency graph.
+    # This does NOT hold if the build ever targets Linux, or if Tauri swaps
+    # its tray backend to still depend on this cluster on Windows.
+    { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys, unmaintained GTK3 binding; not in the Windows build graph (Linux-only path via tauri->muda->gtk)" },
+    { id = "RUSTSEC-2024-0412", reason = "gdk, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0413", reason = "atk, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0414", reason = "gdkx11-sys, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0415", reason = "gtk, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0416", reason = "atk-sys, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0417", reason = "gdkx11, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0418", reason = "gdk-sys, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0419", reason = "gtk3-macros, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0420", reason = "gtk-sys, unmaintained GTK3 binding; not in the Windows build graph" },
+    { id = "RUSTSEC-2024-0429", reason = "glib, unsound Iterator/DoubleEndedIterator impl; not in the Windows build graph (same GTK3 cluster)" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error, unmaintained; only reached as a proc-macro dependency of glib-macros in the same GTK3 cluster, not in the Windows build graph" },
+
+    # --- unic-* cluster: unmaintained, superseded by the `icu` crates. ---
+    # Pulled in via urlpattern -> tauri-utils -> tauri-build, and
+    # tauri-build is a *build-dependency* (desktop/src-tauri's
+    # [build-dependencies]) — compile-time only, never linked into the
+    # shipped binary. Verified via `cargo tree -i unic-common --target all`
+    # (2026-08-16): the only path is through that build-dependency edge.
+    # This stops holding if urlpattern/tauri-utils drops unic-* in favor of
+    # icu (likely, given the deprecation notices) or if any of these crates
+    # are ever pulled in as a normal (non-build) dependency instead.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
+]
+
+[licenses]
+# Every SPDX atom actually present across the workspace's 515 resolved
+# crates as of the 2026-08-16 scan (`cargo metadata` license fields).
+# Permissive/public-domain-equivalent licenses only. Where a crate's SPDX
+# expression is an OR of several licenses (e.g. "MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later"), cargo-deny passes it as long as ONE listed term is
+# allowed — so e.g. LGPL-2.1-or-later does not need to be listed here, since
+# every crate offering it also offers MIT or Apache-2.0 as an alternative.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# Our three workspace crates (crypto, vault, desktop) are all `publish =
+# false` and carry no `license` field, which is correct — they are not
+# meant to leave this repository. This exempts them from the license check
+# instead of listing them as manual per-crate exceptions.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

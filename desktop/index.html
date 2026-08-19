@@ -52,7 +52,82 @@
         </fieldset>
 
         <div class="row">
+          <button id="send-nav-btn" type="button">Send</button>
           <button id="lock-btn" type="button">Lock wallet</button>
+        </div>
+      </section>
+
+      <!-- Send step 1: amount, fixed recipient (account 2 of this wallet) -->
+      <section id="step-send" class="step hidden">
+        <h2>Send Sepolia ETH</h2>
+        <p class="hint">
+          Sending to <strong>Account 2</strong> of this wallet — a second
+          address this wallet already controls, so this first real transfer
+          can't move funds anywhere the user doesn't already hold them.
+          Sending to any other address is a later step.
+        </p>
+        <p id="send-recipient" class="address"></p>
+
+        <label for="send-amount" class="hint rpc-label">Amount (ETH)</label>
+        <input id="send-amount" type="text" inputmode="decimal" spellcheck="false" placeholder="0.0" />
+
+        <div class="row">
+          <button id="send-cancel-btn" type="button">Cancel</button>
+          <button id="send-review-btn" type="button">Review send</button>
+        </div>
+
+        <p id="send-status" class="hint"></p>
+        <p id="send-error" class="error"></p>
+      </section>
+
+      <!-- Send step 2: mandatory confirmation, no skip path -->
+      <section id="step-send-confirm" class="step hidden">
+        <h2>Confirm this transaction</h2>
+        <p class="warning">
+          This sends a real transaction on the Sepolia test network and
+          cannot be undone once broadcast. Review every field below.
+        </p>
+
+        <dl class="review-list">
+          <dt>Recipient</dt>
+          <dd id="review-recipient" class="address"></dd>
+          <dt>Amount</dt>
+          <dd id="review-amount"></dd>
+          <dt>Network</dt>
+          <dd>Sepolia (chain ID 11155111)</dd>
+          <dt>Estimated fee</dt>
+          <dd id="review-fee"></dd>
+          <dt>Estimated maximum total</dt>
+          <dd id="review-total"></dd>
+        </dl>
+
+        <label class="review-ack">
+          <input id="send-ack-checkbox" type="checkbox" />
+          I understand this cannot be undone.
+        </label>
+
+        <div class="row">
+          <button id="send-back-btn" type="button">Back</button>
+          <button id="send-confirm-btn" type="button" disabled>
+            Confirm and send
+          </button>
+        </div>
+
+        <p id="send-confirm-error" class="error"></p>
+      </section>
+
+      <!-- Send step 3: signing / broadcasting / pending / confirmed -->
+      <section id="step-send-status" class="step hidden">
+        <h2>Sending transaction</h2>
+
+        <p id="send-progress" class="hint" aria-live="polite"></p>
+        <p id="send-tx-hash" class="address"></p>
+        <p id="send-final-error" class="error"></p>
+
+        <div class="row">
+          <button id="send-done-btn" type="button" class="hidden">
+            Back to wallet
+          </button>
         </div>
       </section>
 

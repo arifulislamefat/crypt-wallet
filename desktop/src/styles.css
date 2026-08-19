@@ -216,6 +216,47 @@ fieldset input[type="password"] {
   gap: 0.5rem;
 }
 
+#send-amount {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 0.4rem;
+  font-family: ui-monospace, monospace;
+}
+
+.review-list {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #8884;
+  border-radius: 8px;
+}
+
+.review-list dt {
+  font-size: 0.85em;
+  opacity: 0.7;
+  margin-top: 0.6rem;
+}
+
+.review-list dt:first-child {
+  margin-top: 0;
+}
+
+.review-list dd {
+  margin: 0.15rem 0 0;
+  font-family: ui-monospace, monospace;
+}
+
+.review-ack {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.review-ack input {
+  width: auto;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;

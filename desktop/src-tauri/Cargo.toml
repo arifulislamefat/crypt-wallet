@@ -30,6 +30,28 @@ zeroize = { version = "1.8" }
 # Shuffles the confirmation word order in this process rather than the
 # webview, so the backend can interpret the slots the user clicked.
 rand_core = { version = "0.6", features = ["std", "getrandom"] }
+# EIP-1559 transaction construction, RLP encoding, and the EIP-2718 typed
+# envelope for signing — audited library territory, not something to
+# hand-write. See sign_transaction in this file.
+#
+# Feature note: "primitives" is not a real feature on this crate (0.9.2) —
+# verified against the downloaded source (alloy-0.9.2/Cargo.toml has no
+# such feature) rather than assumed. `alloy-core`, which is where
+# `Address`/`U256`/`TxKind` actually live, is a mandatory non-optional
+# dependency and its re-export at `alloy::primitives` is unconditional
+# (alloy-0.9.2/src/lib.rs), so nothing needs enabling for it. What's
+# enabled instead, each checked against real usage below:
+#   - "consensus" -> TxEip1559, SignableTransaction, Signed
+#   - "eips"      -> AccessList (alloy_eips::eip2930), needed as a
+#                    TxEip1559 field even though it's empty for a plain send
+#   - "k256"      -> PrimitiveSignature::recover_address_from_prehash,
+#                    used both in sign_transaction's own sanity check and
+#                    in the self-verifying signature-recovery test
+#   - "rlp"       -> the RLP/EIP-2718 encoding the "consensus" types build on
+#   - "std"       -> default-features carries "std" among other things
+#                    (reqwest, network I/O) this app doesn't want; re-added
+#                    explicitly rather than pulled in wholesale
+alloy = { version = "0.9", default-features = false, features = ["consensus", "eips", "k256", "rlp", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

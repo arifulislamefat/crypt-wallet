@@ -34,7 +34,17 @@ bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "a
 # public-key -> Ethereum-address step, and transitively by `bip32`. Using the
 # same crate `bip32` already depends on avoids pulling in a second,
 # potentially inconsistent secp256k1 implementation.
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+#
+# "sha256" (not itself the message hash — transactions are signed over their
+# own Keccak256-based hash, computed in desktop/src-tauri via `alloy`) is
+# needed for `SigningKey::sign_prehash_recoverable`'s RFC6979 deterministic-
+# nonce derivation, which uses the curve's own digest (SHA-256 for
+# secp256k1, per convention — the same choice go-ethereum and every other
+# conformant secp256k1 signer makes) internally regardless of what hashed
+# the message being signed. Verified against k256's own source
+# (`ecdsa.rs`'s `impl DigestPrimitive for Secp256k1` is gated on this exact
+# feature) rather than assumed.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256", "std"] }
 
 # sha3 — RustCrypto's Keccak/SHA3 implementation. We use `Keccak256`
 # specifically (NOT `Sha3_256` — see evm.rs doc comment for why they differ

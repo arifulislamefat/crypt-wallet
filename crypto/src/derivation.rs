@@ -143,6 +143,29 @@ impl EvmAccountKey {
         let signing_key: &k256::ecdsa::SigningKey = self.xprv.private_key();
         crate::evm::Address::from_signing_key(signing_key)
     }
+
+    /// Expose the underlying secp256k1 signing key for the duration of `f`.
+    ///
+    /// This is the account's actual private key — anyone holding it can sign
+    /// transactions that move this account's funds. Deliberately shares the
+    /// `expose_secret` name with [`crate::Seed::expose_secret`] and
+    /// [`crate::SecretMnemonic::expose_secret`] so that one
+    /// `grep -r expose_secret` across the workspace enumerates every site
+    /// that touches raw secret material, this key included.
+    ///
+    /// Signing itself is deliberately NOT implemented in this crate. This
+    /// crate's scope is derivation, not transaction construction (RLP
+    /// encoding, the EIP-1559 signing-hash rules, the EIP-2718 typed
+    /// envelope) — that belongs with an audited library
+    /// (`desktop/src-tauri`'s `alloy` dependency), not hand-rolled here.
+    /// This accessor is the seam: it hands the caller a `&SigningKey` to
+    /// drive that library's signing API, and nothing more.
+    ///
+    /// Callers MUST NOT log this key, serialize it, or hold the borrow
+    /// longer than the signing operation needs.
+    pub fn expose_secret<R>(&self, f: impl FnOnce(&k256::ecdsa::SigningKey) -> R) -> R {
+        f(self.xprv.private_key())
+    }
 }
 
 #[cfg(test)]

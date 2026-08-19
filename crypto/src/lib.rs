@@ -4,8 +4,12 @@
 //! import, BIP-32/44 hierarchical derivation, and EVM address derivation.
 //!
 //! Explicitly OUT of scope for this crate (by design, not oversight):
-//! - Transaction construction or signing (comes in a later phase, once this
-//!   module has been reviewed — signing reuses the keys derived here).
+//! - Transaction construction, RLP encoding, and the EIP-1559/EIP-2718
+//!   signing rules. This crate exposes exactly one seam for signing —
+//!   [`EvmAccountKey::expose_secret`], which hands out the raw `k256`
+//!   signing key — and stops there. Everything downstream of that (building
+//!   the transaction, hashing it per spec, constructing the signed envelope)
+//!   lives in `desktop/src-tauri` via the audited `alloy` crate, not here.
 //! - Any form of storage, serialization to disk, or networking. This crate
 //!   never touches a filesystem, a socket, or a logging framework. That is
 //!   a structural security property, not just a convention: there is no

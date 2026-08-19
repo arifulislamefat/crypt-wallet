@@ -19,12 +19,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alloy::consensus::{SignableTransaction, TxEip1559};
+use alloy::primitives::{Address as AlloyAddress, Bytes as AlloyBytes, PrimitiveSignature, TxKind, U256};
+use alloy::eips::eip2930::AccessList;
 use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
 use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use zeroize::Zeroizing;
+
+/// Sepolia's chain ID. `sign_transaction` refuses to sign for anything
+/// else — see that function's doc comment for why this check exists at
+/// all despite the frontend already only ever sending this value.
+const SEPOLIA_CHAIN_ID: u64 = 11155111;
 
 /// Filename of the sealed vault inside the app data directory.
 const VAULT_FILENAME: &str = "wallet.vault";
@@ -109,13 +117,11 @@ fn shuffled_indices(len: usize) -> Vec<usize> {
 
 /// An unlocked wallet: the mnemonic plus when the session began.
 struct UnlockedSession {
-    // Held for the not-yet-built authenticated reveal/export flow (spec
-    // §D.5), which is the whole reason to keep the mnemonic rather than a
-    // derived key. Nothing reads it yet — hence `dead_code` — but the idle
-    // timeout and window-event clears added here exist specifically so that,
-    // when that flow lands, the mnemonic isn't sitting in memory
-    // indefinitely and reachable without re-auth.
-    #[allow(dead_code)]
+    // Read by get_second_account_address and sign_transaction to re-derive
+    // account keys on demand, and held (rather than a derived key) for the
+    // not-yet-built authenticated reveal/export flow (spec §D.5) too. The
+    // idle timeout and window-event clears exist so that neither use finds
+    // this sitting in memory indefinitely, reachable without re-auth.
     mnemonic: SecretMnemonic,
     /// When this session was unlocked. The idle timeout is measured from
     /// here. A future reveal/export command should refresh this on use so
@@ -615,6 +621,210 @@ fn confirm_and_seal_impl(
     result
 }
 
+/// The address of EVM account index 1 ("Account 2") for the currently
+/// unlocked wallet — the fixed send destination for the first real-
+/// transaction test. Sending between two addresses this wallet itself
+/// controls means a signing or broadcast mistake can't move funds anywhere
+/// the user doesn't already hold them; free-form recipients are a later
+/// step with their own address-entry validation UX.
+#[tauri::command]
+fn get_second_account_address(unlocked: State<'_, UnlockedWallet>) -> Result<String, String> {
+    get_second_account_address_impl(&unlocked)
+}
+
+/// The testable core of [`get_second_account_address`].
+fn get_second_account_address_impl(unlocked: &UnlockedWallet) -> Result<String, String> {
+    let guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    let session = guard.as_ref().ok_or("wallet is locked")?;
+
+    let seed = session.mnemonic.to_seed("");
+    let account = EvmAccountKey::derive(&seed, 1)
+        .map_err(|_| "failed to derive the second account".to_string())?;
+    Ok(account.address().to_checksummed_hex())
+}
+
+/// Sign an EIP-1559 Sepolia transaction sending from account 0 of the
+/// currently-unlocked wallet, and return the raw signed transaction as a
+/// `0x`-prefixed hex string, ready for `eth_sendRawTransaction`.
+///
+/// Does NOT broadcast. Signing and broadcasting are deliberately separate:
+/// the frontend already owns RPC communication via `viem`, and duplicating
+/// that in Rust would mean two places that need to agree on how to talk to
+/// an endpoint, with no benefit — a signed transaction is not secret (it is
+/// about to go out over the public network), so handing it back for the
+/// frontend to broadcast leaks nothing that broadcasting itself wouldn't.
+///
+/// `to`/`value_wei`/fees are untrusted input from the webview and are
+/// parsed strictly: a malformed address or a numeric string that doesn't
+/// parse cleanly is rejected outright, never guessed at or coerced.
+///
+/// The `chain_id == 11155111` check is deliberately redundant with the
+/// frontend only ever constructing Sepolia transactions — this command is
+/// the last line of defense before a real signature is produced, so it
+/// does not trust the caller's chain_id, however that value got here.
+/// Every other numeric argument (nonce, fees, gas limit) is taken as given
+/// once past basic parsing: those come from the RPC node's own
+/// `getTransactionCount`/fee-estimate responses, not from the user, and
+/// this command has no independent way to second-guess them.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn sign_transaction(
+    to: String,
+    value_wei: String,
+    nonce: u64,
+    max_fee_per_gas: String,
+    max_priority_fee_per_gas: String,
+    gas_limit: u64,
+    chain_id: u64,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    sign_transaction_impl(
+        &unlocked,
+        &to,
+        &value_wei,
+        nonce,
+        &max_fee_per_gas,
+        &max_priority_fee_per_gas,
+        gas_limit,
+        chain_id,
+    )
+}
+
+/// The testable core of [`sign_transaction`].
+#[allow(clippy::too_many_arguments)]
+fn sign_transaction_impl(
+    unlocked: &UnlockedWallet,
+    to: &str,
+    value_wei: &str,
+    nonce: u64,
+    max_fee_per_gas: &str,
+    max_priority_fee_per_gas: &str,
+    gas_limit: u64,
+    chain_id: u64,
+) -> Result<String, String> {
+    if chain_id != SEPOLIA_CHAIN_ID {
+        return Err(format!(
+            "refusing to sign: expected chain ID {SEPOLIA_CHAIN_ID} (Sepolia), got {chain_id}"
+        ));
+    }
+
+    // Strict EIP-55 checksum validation — rejects malformed input outright
+    // rather than attempting to "fix" casing or accept an unchecksummed
+    // address. `None` selects plain EIP-55 rather than EIP-1191's
+    // chain-specific checksum variant.
+    let to_address = AlloyAddress::parse_checksummed(&to, None)
+        .map_err(|_| "recipient address is not a well-formed, checksummed address".to_string())?;
+
+    // `U256`'s `FromStr` (verified against ruint's source) accepts plain
+    // decimal or a "0x"-prefixed hex string and rejects anything else
+    // cleanly — no separate radix argument needed.
+    let value: U256 = value_wei
+        .parse()
+        .map_err(|_| "amount is not a valid integer".to_string())?;
+    let max_fee_per_gas = parse_gas_price(&max_fee_per_gas, "max fee per gas")?;
+    let max_priority_fee_per_gas =
+        parse_gas_price(&max_priority_fee_per_gas, "max priority fee per gas")?;
+
+    let unsigned = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        to: TxKind::Call(to_address),
+        value,
+        access_list: AccessList::default(),
+        input: AlloyBytes::default(),
+    };
+
+    let guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    let session = guard.as_ref().ok_or("wallet is locked")?;
+
+    let seed = session.mnemonic.to_seed("");
+    let account = EvmAccountKey::derive(&seed, 0)
+        .map_err(|_| "failed to derive the sending account".to_string())?;
+
+    // Only the raw signed bytes leave this closure — the signing key
+    // itself never does.
+    let raw_signed_hex = account.expose_secret(|signing_key| -> Result<String, String> {
+        let signing_hash = unsigned.signature_hash();
+
+        // RFC6979-deterministic (same key + same hash always produces the
+        // same signature, so no signing-time RNG that could be weak or
+        // reused), and — verified against k256's own source, not assumed —
+        // k256's SigningKey<Secp256k1> normalizes the resulting signature
+        // to low-S form and adjusts the recovery ID to match before
+        // returning it. Ethereum's mempool rejects high-S signatures
+        // (EIP-2), so a signer that didn't do this would produce
+        // transactions real nodes refuse — normalize_s() is deliberately
+        // NOT called again here, because calling it on an
+        // already-normalized signature without also re-deriving the
+        // matching recovery ID would desynchronize the two.
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(signing_hash.as_slice())
+            .map_err(|_| "failed to sign transaction".to_string())?;
+
+        let r = U256::from_be_slice(signature.r().to_bytes().as_ref());
+        let s = U256::from_be_slice(signature.s().to_bytes().as_ref());
+        let alloy_signature = PrimitiveSignature::new(r, s, recovery_id.is_y_odd());
+
+        // Self-check before this ever leaves the process: recover the
+        // signer from the signature this same call just produced, and
+        // confirm it's actually account 0. A signature that doesn't
+        // recover to the account that supposedly made it is not a
+        // transaction that should ever be returned for broadcast,
+        // regardless of what upstream produced it.
+        let recovered = alloy_signature
+            .recover_address_from_prehash(&signing_hash)
+            .map_err(|_| "produced signature failed self-verification".to_string())?;
+        let expected_sender = AlloyAddress::new(*account.address().as_bytes());
+        if recovered != expected_sender {
+            return Err("produced signature did not recover to the sending account".to_string());
+        }
+
+        let signed = unsigned.clone().into_signed(alloy_signature);
+        let mut raw = Vec::with_capacity(signed.eip2718_encoded_length());
+        signed.eip2718_encode(&mut raw);
+
+        Ok(format!("0x{}", hex_encode(&raw)))
+    })?;
+
+    Ok(raw_signed_hex)
+}
+
+/// Parse a gas price field: strict integer parsing via `U256` (rejecting
+/// anything that doesn't parse cleanly, per the same rule as `value_wei`),
+/// then a checked narrowing to `u128` — `TxEip1559`'s actual field type —
+/// rather than a silent truncation. A value that overflows `u128` here
+/// would otherwise wrap into a wildly wrong, much smaller fee, which is
+/// exactly the kind of silent-wrong-number bug that must be a hard error
+/// in anything that spends real funds.
+fn parse_gas_price(value: &str, field_name: &str) -> Result<u128, String> {
+    let as_u256: U256 = value
+        .parse()
+        .map_err(|_| format!("{field_name} is not a valid integer"))?;
+    u128::try_from(&as_u256).map_err(|_| format!("{field_name} is too large"))
+}
+
+/// Lowercase hex encoding with no external dependency for this one call
+/// site — `alloy::primitives::hex` would work equally well, but the
+/// standard library has no built-in encoder, and pulling in a whole crate
+/// for six lines is not proportionate.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// DIAGNOSTIC ONLY — proves `cryptwallet-crypto` and `cryptwallet-vault` are
 /// actually linked into the app and working, exercised across the Tauri IPC
 /// boundary. MUST be removed before any real release; this is scaffolding
@@ -709,7 +919,9 @@ pub fn run() {
         confirm_and_seal_wallet,
         wallet_exists,
         unlock_wallet,
-        lock_wallet
+        lock_wallet,
+        get_second_account_address,
+        sign_transaction
     ]);
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -717,7 +929,9 @@ pub fn run() {
         confirm_and_seal_wallet,
         wallet_exists,
         unlock_wallet,
-        lock_wallet
+        lock_wallet,
+        get_second_account_address,
+        sign_transaction
     ]);
 
     builder
@@ -771,6 +985,159 @@ mod tests {
             words,
             correct_slots,
         )
+    }
+
+    /// An `UnlockedWallet` with a freshly-generated (real `OsRng`, not a
+    /// fixed test seed — `SecretMnemonic::from_entropy_for_testing` is
+    /// `pub(crate)` to the crypto crate and not reachable from here)
+    /// mnemonic already in session. The signing tests below don't need a
+    /// *reproducible* seed, only internal self-consistency: derive
+    /// account 0's address here, sign with the same session, and confirm
+    /// the signature recovers to that same address.
+    fn unlocked_with_fresh_mnemonic() -> UnlockedWallet {
+        let mnemonic = SecretMnemonic::generate(WordCount::Twelve).expect("generation succeeds");
+        let unlocked = UnlockedWallet::default();
+        *unlocked.0.lock().expect("lock") = Some(UnlockedSession {
+            mnemonic,
+            unlocked_at: Instant::now(),
+        });
+        unlocked
+    }
+
+    #[test]
+    fn signature_recovers_to_the_signing_account() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        // The expected signer, derived independently from the same session
+        // for comparison — not read back out of the signing path itself.
+        let expected_address = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            EvmAccountKey::derive(&seed, 0)
+                .expect("derive account 0")
+                .address()
+                .to_checksummed_hex()
+        };
+        // Recipient: account 1 of the same wallet, so its address is
+        // guaranteed well-formed and correctly checksummed by our own
+        // (EIP-55-vector-tested) implementation, rather than a hand-typed
+        // literal whose checksum casing this test would be trusting blind.
+        let recipient = get_second_account_address_impl(&unlocked).expect("derive account 1");
+
+        let raw_hex = sign_transaction_impl(
+            &unlocked,
+            &recipient,
+            "1000000000000000", // 0.001 ETH, in wei
+            0,
+            "20000000000", // 20 gwei
+            "1000000000",  // 1 gwei
+            21000,
+            SEPOLIA_CHAIN_ID,
+        )
+        .expect("signing should succeed");
+
+        assert!(raw_hex.starts_with("0x"));
+        // EIP-2718 type byte 0x02 (EIP-1559) must be the first byte after
+        // the 0x prefix -- confirms this is actually a typed transaction,
+        // not a bare RLP list a naive `eth_sendRawTransaction` call would
+        // silently misinterpret.
+        assert!(raw_hex.starts_with("0x02"), "expected an EIP-1559 (type 2) envelope, got: {raw_hex}");
+
+        // Independent verification: decode the raw bytes and recover the
+        // signer via the exact path a real Ethereum node uses to validate
+        // an incoming transaction. This does NOT reuse
+        // sign_transaction_impl's own internal self-check -- it re-derives
+        // everything from the returned bytes alone, so it would catch a
+        // bug even if that internal check were ever removed or broken.
+        let raw_bytes: Vec<u8> =
+            alloy::primitives::hex::decode(&raw_hex[2..]).expect("valid hex");
+        let signed = alloy::consensus::Signed::<TxEip1559>::eip2718_decode(&mut raw_bytes.as_slice())
+            .expect("decode the signed envelope");
+
+        // Recovery must be against the *signing* hash (what ECDSA actually
+        // signed: keccak256(0x02 || rlp(unsigned fields))) -- NOT
+        // `signed.hash()`, which is the final tx hash computed *from* the
+        // completed signature and would not recover correctly.
+        let signing_hash = signed.tx().signature_hash();
+        let recovered = signed
+            .signature()
+            .recover_address_from_prehash(&signing_hash)
+            .expect("signature recovers");
+
+        let expected = AlloyAddress::parse_checksummed(&expected_address, None)
+            .expect("our own checksummed output must itself be valid");
+        assert_eq!(
+            recovered, expected,
+            "signature must recover to the account that produced it"
+        );
+    }
+
+    #[test]
+    fn wrong_chain_id_is_rejected_before_any_signing() {
+        // Deliberately locked (no session at all) so that if the chain-id
+        // check were NOT first, this would fail with "wallet is locked"
+        // instead -- getting the chain-id-specific message proves that
+        // gate runs before any attempt to touch signing state.
+        let unlocked = UnlockedWallet::default();
+
+        let result = sign_transaction_impl(
+            &unlocked,
+            "0x0000000000000000000000000000000000dEaD",
+            "0",
+            0,
+            "0",
+            "0",
+            21000,
+            1, // Ethereum mainnet, not Sepolia -- must be refused
+        );
+
+        let error = result.expect_err("a non-Sepolia chain id must be rejected");
+        assert!(
+            error.contains("chain ID"),
+            "expected a chain-id error, got: {error}"
+        );
+        assert!(
+            !error.to_lowercase().contains("locked"),
+            "got a 'wallet locked' error instead of a chain-id error -- the \
+             chain-id check ran after touching session state, not before: {error}"
+        );
+    }
+
+    #[test]
+    fn malformed_recipient_address_is_rejected() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        let malformed = [
+            "not an address",
+            "0x123",
+            "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        ];
+        for bad in malformed {
+            let result =
+                sign_transaction_impl(&unlocked, bad, "0", 0, "0", "0", 21000, SEPOLIA_CHAIN_ID);
+            assert!(result.is_err(), "expected {bad:?} to be rejected");
+        }
+
+        // The subtler case: syntactically a valid 40-hex-char address, but
+        // not checksummed (all-lowercase). This is exactly what
+        // "well-formed, checksummed" (not just well-formed) rules out --
+        // parse_checksummed must refuse it rather than silently accept the
+        // unchecksummed casing.
+        let unchecksummed = "0x0000000000000000000000000000000000dead";
+        let result = sign_transaction_impl(
+            &unlocked,
+            unchecksummed,
+            "0",
+            0,
+            "0",
+            "0",
+            21000,
+            SEPOLIA_CHAIN_ID,
+        );
+        assert!(
+            result.is_err(),
+            "an unchecksummed (all-lowercase) address must be rejected, not silently accepted"
+        );
     }
 
     #[test]

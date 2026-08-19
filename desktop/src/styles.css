@@ -186,6 +186,32 @@ fieldset input[type="password"] {
   margin: 1rem 0;
 }
 
+.balance-section .balance-value {
+  font-family: ui-monospace, monospace;
+  font-size: 1.3em;
+  min-height: 1.4em;
+}
+
+.balance-section .balance-value.loading {
+  opacity: 0.6;
+  font-size: 1em;
+  font-family: inherit;
+}
+
+.rpc-label {
+  display: block;
+  margin-top: 1rem;
+}
+
+#rpc-url {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 0.4rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+}
+
 .row {
   gap: 0.5rem;
 }

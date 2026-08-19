@@ -36,6 +36,21 @@
         <h2>Wallet unlocked</h2>
         <p class="hint">Your first account address:</p>
         <p id="unlocked-address" class="address"></p>
+
+        <fieldset class="balance-section">
+          <legend>Balance — Sepolia testnet</legend>
+
+          <p id="balance-value" class="balance-value" aria-live="polite"></p>
+          <p id="balance-error" class="error"></p>
+
+          <div class="row">
+            <button id="refresh-balance-btn" type="button">Refresh balance</button>
+          </div>
+
+          <label for="rpc-url" class="hint rpc-label">RPC endpoint (this session only)</label>
+          <input id="rpc-url" type="text" spellcheck="false" />
+        </fieldset>
+
         <div class="row">
           <button id="lock-btn" type="button">Lock wallet</button>
         </div>

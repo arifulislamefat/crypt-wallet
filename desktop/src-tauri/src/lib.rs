@@ -22,12 +22,23 @@ use std::time::{Duration, Instant};
 use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::primitives::{Address as AlloyAddress, Bytes as AlloyBytes, PrimitiveSignature, TxKind, U256};
 use alloy::eips::eip2930::AccessList;
+use alloy::sol_types::SolCall;
 use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
 use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use zeroize::Zeroizing;
+
+alloy::sol! {
+    /// Just the one ERC-20 function this app calls. `sol!` compiles this
+    /// signature to a real ABI encoder/decoder (`IERC20::transferCall`,
+    /// used by `encode_erc20_transfer`) — the calldata layout and the
+    /// `0xa9059cbb` selector both come from this macro, not hand-written.
+    interface IERC20 {
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+}
 
 /// Sepolia's chain ID. `sign_transaction` refuses to sign for anything
 /// else — see that function's doc comment for why this check exists at
@@ -758,6 +769,157 @@ fn sign_transaction_impl(
         input: AlloyBytes::default(),
     };
 
+    sign_unsigned_transaction(&unsigned, from_index, unlocked)
+}
+
+/// Encode a Solidity `transfer(address,uint256)` call — the standard ERC-20
+/// transfer function, selector `0xa9059cbb` — via `alloy`'s `sol!`-generated
+/// `SolCall` implementation, never hand-packed. The selector is not just
+/// assumed to be right because it came out of the macro: it's checked
+/// against the real, standardized value on every call, so a mistake in this
+/// function's Solidity signature (which the macro compiles down to a
+/// selector at compile time) would surface immediately at runtime instead
+/// of silently invoking the wrong function on whatever contract `to` points
+/// at — the single most dangerous failure mode for a token send.
+fn encode_erc20_transfer(to: AlloyAddress, amount: U256) -> Result<Vec<u8>, String> {
+    let encoded = IERC20::transferCall { to, amount }.abi_encode();
+
+    const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
+    if encoded.get(..4) != Some(TRANSFER_SELECTOR.as_slice()) {
+        // Not expected to be reachable — `sol!` derives the selector from
+        // the function signature at compile time — but this function signs
+        // real transactions, so an internal encoding mistake gets caught
+        // here rather than trusted blind.
+        return Err("internal error: encoded ERC-20 transfer calldata has an unexpected function selector".to_string());
+    }
+
+    Ok(encoded)
+}
+
+/// Sign an EIP-1559 Sepolia transaction that calls `transfer(address,uint256)`
+/// on `token_address` — an ERC-20 token send — from account `from_index` of
+/// the currently-unlocked wallet, returning the raw signed transaction the
+/// same way [`sign_transaction`] does.
+///
+/// This is a separate command from [`sign_transaction`], not that command
+/// generalized with an optional `data` field: an ERC-20 transfer has a
+/// materially different shape (the transaction's own `to` is a contract, not
+/// the fund recipient; `value` is always zero; the recipient and amount live
+/// inside ABI-encoded `data`), and threading that distinction through a
+/// single command's parameters — "when `data` is present, some other
+/// argument means something different" — would be exactly the kind of
+/// implicit, easy-to-misuse API shape this codebase avoids elsewhere.
+/// Keeping them separate makes each command's parameters mean one thing.
+///
+/// `token_address` is checksum-validated the same as any address, but note
+/// its ROLE here differs from a plain ETH send's `to`: it's a contract being
+/// called, not a fund recipient, and is never trusted beyond "well-formed,
+/// checksummed address" — encoding failures or a non-token contract there
+/// are the RPC node's problem to reject at broadcast time, not something
+/// this command can detect.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn sign_token_transfer(
+    token_address: String,
+    to: String,
+    amount_raw: String,
+    nonce: u64,
+    max_fee_per_gas: String,
+    max_priority_fee_per_gas: String,
+    gas_limit: u64,
+    chain_id: u64,
+    from_index: u32,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    sign_token_transfer_impl(
+        &unlocked,
+        &token_address,
+        &to,
+        &amount_raw,
+        nonce,
+        &max_fee_per_gas,
+        &max_priority_fee_per_gas,
+        gas_limit,
+        chain_id,
+        from_index,
+    )
+}
+
+/// The testable core of [`sign_token_transfer`].
+#[allow(clippy::too_many_arguments)]
+fn sign_token_transfer_impl(
+    unlocked: &UnlockedWallet,
+    token_address: &str,
+    to: &str,
+    amount_raw: &str,
+    nonce: u64,
+    max_fee_per_gas: &str,
+    max_priority_fee_per_gas: &str,
+    gas_limit: u64,
+    chain_id: u64,
+    from_index: u32,
+) -> Result<String, String> {
+    // Same hard rule as sign_transaction_impl, no exceptions for token
+    // sends: this is the last line of defense before a real signature is
+    // produced, so it does not trust the caller's chain_id.
+    if chain_id != SEPOLIA_CHAIN_ID {
+        return Err(format!(
+            "refusing to sign: expected chain ID {SEPOLIA_CHAIN_ID} (Sepolia), got {chain_id}"
+        ));
+    }
+
+    let token_contract = AlloyAddress::parse_checksummed(token_address, None).map_err(|_| {
+        "token contract address is not a well-formed, checksummed address".to_string()
+    })?;
+    let recipient = AlloyAddress::parse_checksummed(to, None)
+        .map_err(|_| "recipient address is not a well-formed, checksummed address".to_string())?;
+
+    // The token's smallest-unit amount (e.g. USDC's 6-decimal raw integer),
+    // already converted from a human amount by the frontend using the
+    // token's real on-chain `decimals()` — this command has no way to
+    // second-guess that conversion, only to parse the integer strictly.
+    let amount: U256 = amount_raw
+        .parse()
+        .map_err(|_| "amount is not a valid integer".to_string())?;
+
+    let max_fee_per_gas = parse_gas_price(max_fee_per_gas, "max fee per gas")?;
+    let max_priority_fee_per_gas =
+        parse_gas_price(max_priority_fee_per_gas, "max priority fee per gas")?;
+
+    let calldata = encode_erc20_transfer(recipient, amount)?;
+
+    let unsigned = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        // The transaction calls the TOKEN CONTRACT, not the recipient --
+        // the recipient only appears as an encoded parameter inside `input`.
+        to: TxKind::Call(token_contract),
+        // No ETH moves with an ERC-20 transfer call; the transferred value
+        // is entirely inside `calldata`.
+        value: U256::ZERO,
+        access_list: AccessList::default(),
+        input: AlloyBytes::from(calldata),
+    };
+
+    sign_unsigned_transaction(&unsigned, from_index, unlocked)
+}
+
+/// Shared signing core for both [`sign_transaction_impl`] (plain ETH sends)
+/// and [`sign_token_transfer_impl`] (ERC-20 sends): derive the sending
+/// account, sign `unsigned`'s EIP-1559 signing hash, and self-check the
+/// result before returning it. Factored out specifically so the self-check
+/// — recover the signer from the signature this same call just produced,
+/// and refuse to return anything that doesn't recover to the expected
+/// account — can never accidentally exist in one signing path and not the
+/// other; both call this, so both get it automatically.
+fn sign_unsigned_transaction(
+    unsigned: &TxEip1559,
+    from_index: u32,
+    unlocked: &UnlockedWallet,
+) -> Result<String, String> {
     let guard = unlocked
         .0
         .lock()
@@ -797,7 +959,9 @@ fn sign_transaction_impl(
         // confirm it's actually account `from_index`. A signature that
         // doesn't recover to the account that supposedly made it is not a
         // transaction that should ever be returned for broadcast,
-        // regardless of what upstream produced it.
+        // regardless of what upstream produced it — and regardless of
+        // whether it's a plain ETH send or a token-transfer call, this
+        // check applies identically to both.
         let recovered = alloy_signature
             .recover_address_from_prehash(&signing_hash)
             .map_err(|_| "produced signature failed self-verification".to_string())?;
@@ -939,7 +1103,8 @@ pub fn run() {
         unlock_wallet,
         lock_wallet,
         get_account_address,
-        sign_transaction
+        sign_transaction,
+        sign_token_transfer
     ]);
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -949,7 +1114,8 @@ pub fn run() {
         unlock_wallet,
         lock_wallet,
         get_account_address,
-        sign_transaction
+        sign_transaction,
+        sign_token_transfer
     ]);
 
     builder
@@ -1168,6 +1334,197 @@ mod tests {
             result.is_err(),
             "an unchecksummed (all-lowercase) address must be rejected, not silently accepted"
         );
+    }
+
+    #[test]
+    fn erc20_transfer_encoding_matches_the_standard_selector_and_layout() {
+        let recipient = AlloyAddress::from([0x11u8; 20]);
+        let amount = U256::from(1_234_567u64);
+
+        let calldata = encode_erc20_transfer(recipient, amount).expect("encoding succeeds");
+
+        // Built independently of encode_erc20_transfer's own internals --
+        // this does not just call the same function again and compare, it
+        // hand-assembles the expected ABI layout byte by byte, so it would
+        // catch a bug in the real implementation rather than agreeing with
+        // it by construction.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]); // transfer(address,uint256) selector
+        let mut address_word = [0u8; 32]; // left-padded: 12 zero bytes + the 20 address bytes
+        address_word[12..].copy_from_slice(recipient.as_slice());
+        expected.extend_from_slice(&address_word);
+        expected.extend_from_slice(&amount.to_be_bytes::<32>()); // uint256, big-endian, 32 bytes
+
+        assert_eq!(calldata.len(), 4 + 32 + 32, "selector + two 32-byte ABI words");
+        assert_eq!(calldata, expected);
+        assert_eq!(
+            &calldata[..4],
+            &[0xa9, 0x05, 0x9c, 0xbb],
+            "must start with the real transfer(address,uint256) selector 0xa9059cbb"
+        );
+    }
+
+    #[test]
+    fn token_transfer_signature_recovers_to_the_signing_account() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        let expected_address = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            EvmAccountKey::derive(&seed, 0)
+                .expect("derive account 0")
+                .address()
+                .to_checksummed_hex()
+        };
+        let recipient = get_account_address_impl(1, &unlocked).expect("derive account 1");
+        // A syntactically valid, checksummed address standing in for a
+        // token contract -- this test only exercises signing, not contract
+        // interaction, so it doesn't need to be the real USDC address.
+        let token_address = get_account_address_impl(2, &unlocked).expect("derive account 2");
+
+        let raw_hex = sign_token_transfer_impl(
+            &unlocked,
+            &token_address,
+            &recipient,
+            "1000000", // 1.0 USDC at 6 decimals, in raw units
+            0,
+            "20000000000",
+            "1000000000",
+            65_000, // a token transfer costs meaningfully more than a plain 21000 ETH send
+            SEPOLIA_CHAIN_ID,
+            0,
+        )
+        .expect("signing should succeed");
+
+        assert!(raw_hex.starts_with("0x02"), "expected an EIP-1559 (type 2) envelope, got: {raw_hex}");
+
+        // Independent verification, same discipline as
+        // signature_recovers_to_the_signing_account: decode the raw bytes
+        // and recover the signer via the exact path a real node would, not
+        // by reusing sign_token_transfer_impl's own internal self-check.
+        let raw_bytes: Vec<u8> = alloy::primitives::hex::decode(&raw_hex[2..]).expect("valid hex");
+        let signed = alloy::consensus::Signed::<TxEip1559>::eip2718_decode(&mut raw_bytes.as_slice())
+            .expect("decode the signed envelope");
+
+        let signing_hash = signed.tx().signature_hash();
+        let recovered = signed
+            .signature()
+            .recover_address_from_prehash(&signing_hash)
+            .expect("signature recovers");
+        let expected = AlloyAddress::parse_checksummed(&expected_address, None)
+            .expect("our own checksummed output must itself be valid");
+        assert_eq!(
+            recovered, expected,
+            "signature must recover to the account that produced it"
+        );
+
+        // And the transaction actually IS a token-contract call, not an ETH
+        // send that happened to reuse this test's addresses: `to` is the
+        // token contract, `value` is zero, and `input` decodes back to
+        // exactly the recipient and amount this test asked for.
+        let expected_token_contract = AlloyAddress::parse_checksummed(&token_address, None)
+            .expect("token address is valid");
+        assert_eq!(signed.tx().to, TxKind::Call(expected_token_contract));
+        assert_eq!(signed.tx().value, U256::ZERO);
+
+        let decoded = IERC20::transferCall::abi_decode(signed.tx().input.as_ref(), true)
+            .expect("input decodes as a transfer() call");
+        let expected_recipient =
+            AlloyAddress::parse_checksummed(&recipient, None).expect("recipient is valid");
+        assert_eq!(decoded.to, expected_recipient);
+        assert_eq!(decoded.amount, U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn token_transfer_wrong_chain_id_is_rejected_before_any_signing() {
+        // Deliberately locked, same reasoning as
+        // wrong_chain_id_is_rejected_before_any_signing: proves the chain-id
+        // check runs before anything touches session state.
+        let unlocked = UnlockedWallet::default();
+
+        let result = sign_token_transfer_impl(
+            &unlocked,
+            "0x0000000000000000000000000000000000dEaD",
+            "0x0000000000000000000000000000000000dEaD",
+            "0",
+            0,
+            "0",
+            "0",
+            65_000,
+            1, // Ethereum mainnet, not Sepolia -- must be refused
+            0,
+        );
+
+        let error = result.expect_err("a non-Sepolia chain id must be rejected");
+        assert!(error.contains("chain ID"), "expected a chain-id error, got: {error}");
+        assert!(
+            !error.to_lowercase().contains("locked"),
+            "chain-id check must run before touching session state: {error}"
+        );
+    }
+
+    #[test]
+    fn token_transfer_requires_an_unlocked_session() {
+        let unlocked = UnlockedWallet::default();
+
+        // A real, correctly-checksummed address, independent of the (locked)
+        // `unlocked` session under test -- needed so this test actually
+        // reaches the session-lock check rather than failing address
+        // parsing first. A hand-typed literal risks exactly that: EIP-55
+        // checksum casing isn't something to eyeball.
+        let seed = SecretMnemonic::generate(WordCount::Twelve)
+            .expect("generation succeeds")
+            .to_seed("");
+        let address = EvmAccountKey::derive(&seed, 0)
+            .expect("derive account 0")
+            .address()
+            .to_checksummed_hex();
+
+        let result = sign_token_transfer_impl(
+            &unlocked,
+            &address,
+            &address,
+            "0",
+            0,
+            "0",
+            "0",
+            65_000,
+            SEPOLIA_CHAIN_ID,
+            0,
+        );
+
+        assert_eq!(result, Err("wallet is locked".to_string()));
+    }
+
+    #[test]
+    fn token_transfer_malformed_token_or_recipient_address_is_rejected() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let valid = get_account_address_impl(1, &unlocked).expect("derive account 1");
+
+        // Malformed TOKEN address, valid recipient.
+        let result = sign_token_transfer_impl(
+            &unlocked, "not an address", &valid, "0", 0, "0", "0", 65_000, SEPOLIA_CHAIN_ID, 0,
+        );
+        assert!(result.is_err(), "a malformed token contract address must be rejected");
+
+        // Valid token address, malformed recipient.
+        let result = sign_token_transfer_impl(
+            &unlocked, &valid, "not an address", "0", 0, "0", "0", 65_000, SEPOLIA_CHAIN_ID, 0,
+        );
+        assert!(result.is_err(), "a malformed recipient address must be rejected");
+
+        // Same subtler case as sign_transaction's own test: syntactically
+        // valid but unchecksummed (all-lowercase) must also be refused, for
+        // both roles.
+        let unchecksummed = "0x0000000000000000000000000000000000dead";
+        let result = sign_token_transfer_impl(
+            &unlocked, unchecksummed, &valid, "0", 0, "0", "0", 65_000, SEPOLIA_CHAIN_ID, 0,
+        );
+        assert!(result.is_err(), "an unchecksummed token address must be rejected");
+        let result = sign_token_transfer_impl(
+            &unlocked, &valid, unchecksummed, "0", 0, "0", "0", 65_000, SEPOLIA_CHAIN_ID, 0,
+        );
+        assert!(result.is_err(), "an unchecksummed recipient address must be rejected");
     }
 
     #[test]

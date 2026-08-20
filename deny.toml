@@ -2,12 +2,12 @@
 #
 # BASELINE SNAPSHOT — this file reflects the dependency tree as scanned on
 # 2026-08-16 (515 crates, `cargo-deny 0.20.2`, workspace at commit e88f943),
-# plus one targeted addition on 2026-08-20 (see the `paste` entry below) —
-# that update was a single-advisory delta found during a `cargo audit`/
-# `cargo deny check` re-run, not a full re-scan of all 515 crates. It is not
-# "solved and done." In particular:
+# plus two targeted additions on 2026-08-20 (see the `paste` and
+# `proc-macro-error2` entries below) — single-advisory deltas found while
+# re-running `cargo audit`/`cargo deny check`, not a full re-scan of all 515
+# crates. It is not "solved and done." In particular:
 #
-#   - The `[advisories].ignore` list below downgrades 18 *specific,
+#   - The `[advisories].ignore` list below downgrades 19 *specific,
 #     currently-known* advisories to notes, each with a reason recorded
 #     inline. It deliberately does NOT use a blanket rule (e.g. "allow all
 #     unmaintained advisories") — a brand-new advisory against any crate,
@@ -19,29 +19,42 @@
 #     upgrade to Tauri (which pulls in `muda` -> `gtk` on some platforms,
 #     and `urlpattern` -> `unic-*` as a build dep of `tauri-build`) can
 #     change which targets pull these crates in, or replace them outright.
-#   - One entry (`paste`, RUSTSEC-2024-0436) is exempted on different grounds
-#     from the other two clusters: it genuinely IS in the real Windows build
-#     graph (via `alloy`, which this wallet needs for transaction signing —
-#     not a wrong-platform or build-only situation at all). See that entry's
-#     own comment for why it's exempted anyway.
+#   - Two entries (`paste`, RUSTSEC-2024-0436, and `proc-macro-error2`,
+#     RUSTSEC-2026-0173) are exempted on different grounds from the other
+#     two clusters: both genuinely ARE in the real Windows build graph (via
+#     `alloy`, which this wallet needs for transaction signing and, since
+#     2026-08-20, ERC-20 transfer-calldata encoding via `alloy`'s
+#     `sol-types` feature) — not a wrong-platform or build-only situation at
+#     all. See each entry's own comment for why it's exempted anyway.
 #
-# Two `cargo-audit`-only findings from the same 2026-08-20 re-run are
+# One `cargo-audit`-only finding from the same 2026-08-20 re-run is
 # DELIBERATELY NOT added here: `derivative` (RUSTSEC-2024-0388, reached via
-# `ark-ff`) and `proc-macro-error2` (RUSTSEC-2026-0173, reached via
-# `alloy-sol-macro`/`alloy-sol-macro-expander`). Both are present in
-# Cargo.lock (cargo-audit scans the lockfile unconditionally) but resolve to
-# nothing under `cargo tree -i <crate> --target all --workspace` — neither is
-# actually reachable in this workspace's real build graph under its current
-# feature selection (`[graph] all-features = false` below), so cargo-deny
-# correctly does not flag them and an ignore entry for either would be
-# exempting an advisory that was never actually failing anything. Re-check
-# with the same `cargo tree -i` command if either ever starts actually
-# resolving (e.g. if `alloy`'s `sol!`-macro feature or whatever pulls in
-# `ark-ff` gets enabled some day).
+# `ark-ff`). It's present in Cargo.lock (cargo-audit scans the lockfile
+# unconditionally) but resolves to nothing under `cargo tree -i derivative
+# --target all --workspace` — not actually reachable in this workspace's
+# real build graph under its current feature selection (`[graph]
+# all-features = false` below), so cargo-deny correctly does not flag it and
+# an ignore entry would be exempting an advisory that was never actually
+# failing anything.
+#
+# `proc-macro-error2` (RUSTSEC-2026-0173) was ALSO cargo-audit-only and
+# deliberately left out for that same reason as of the first 2026-08-20
+# pass — until enabling `alloy`'s "sol-types" feature (for ERC-20 transfer
+# encoding, see desktop/src-tauri/Cargo.toml) pulled in `alloy-sol-macro`,
+# which genuinely does depend on it. This is a live example of exactly the
+# "properties of today's dependency graph, not of the advisories
+# themselves" caveat above: the same crate went from correctly-excluded to
+# correctly-included within the same day, purely because a feature flag
+# changed what's actually reachable. Re-verify with `cargo tree -i
+# <crate> --target all --workspace` before trusting either classification,
+# rather than assuming past output still holds.
 #
 # RE-REVIEW THIS FILE whenever the Tauri version (or any dependency that
-# pulls in the crates named below) is upgraded. Re-run:
-#   cargo tree -i <crate> --target all
+# pulls in the crates named below) is upgraded, OR whenever this workspace's
+# enabled features change (see the `proc-macro-error2` note above for why
+# that specifically, not just version bumps, can flip a crate's
+# reachability). Re-run:
+#   cargo tree -i <crate> --target all --workspace
 # for each ignored crate and confirm the justification still holds before
 # assuming these exemptions still apply. Findings and full command output
 # for the original scan are not duplicated here; ask for the review if you
@@ -112,6 +125,24 @@ ignore = [
     # or if a real vulnerability (not just "unmaintained") is ever filed
     # against it.
     { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained proc-macro dependency of alloy (needed for tx signing); compile-time only, not shipped in the binary; no alternative until alloy moves off it" },
+
+    # --- proc-macro-error2: unmaintained, real dependency of alloy's ---
+    # sol-types feature (added 2026-08-20 for ERC-20 transfer-calldata
+    # encoding via the `sol!` macro, see desktop/src-tauri/Cargo.toml and
+    # `encode_erc20_transfer` in lib.rs). Same category as `paste` above,
+    # not the GTK3/unic clusters: genuinely in the real Windows build graph
+    # (verified via `cargo tree -i proc-macro-error2 --target
+    # x86_64-pc-windows-msvc`, 2026-08-20 — reached through
+    # alloy-sol-macro/alloy-sol-macro-expander), and exempted for the same
+    # reason -- it's a proc-macro crate, compile-time code generation only,
+    # nothing shipped in the built binary's runtime behavior. Confusingly
+    # similar-sounding to `proc-macro-error` (RUSTSEC-2024-0370, the GTK3
+    # cluster entry above) but a DIFFERENT crate (this is the "2" fork) with
+    # a DIFFERENT dependency path -- don't conflate the two if either
+    # advisory is ever revisited. RE-REVIEW if `alloy` upgrades and no
+    # longer depends on it, or if a real vulnerability (not just
+    # "unmaintained") is ever filed against it.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2, unmaintained proc-macro dependency of alloy's sol-types feature (needed for ERC-20 transfer encoding); compile-time only, not shipped in the binary; no alternative until alloy moves off it" },
 ]
 
 [licenses]

@@ -79,9 +79,9 @@
         </div>
       </section>
 
-      <!-- Send step 1: amount, destination restricted to the wallet's own other accounts -->
+      <!-- Send step 1: asset, amount, destination restricted to the wallet's own other accounts -->
       <section id="step-send" class="step hidden">
-        <h2>Send Sepolia ETH</h2>
+        <h2>Send on Sepolia</h2>
         <p class="hint">
           Choose which of your own accounts to send to — this wallet already
           controls every address below, so this can't move funds anywhere
@@ -92,7 +92,12 @@
         <label for="send-recipient-select" class="hint rpc-label">Destination account</label>
         <select id="send-recipient-select" class="account-select"></select>
 
-        <label for="send-amount" class="hint rpc-label">Amount (ETH)</label>
+        <label for="send-asset-select" class="hint rpc-label">Asset</label>
+        <select id="send-asset-select" class="account-select"></select>
+
+        <label for="send-amount" class="hint rpc-label">
+          Amount (<span id="send-amount-unit">ETH</span>)
+        </label>
         <input id="send-amount" type="text" inputmode="decimal" spellcheck="false" placeholder="0.0" />
 
         <div class="row">

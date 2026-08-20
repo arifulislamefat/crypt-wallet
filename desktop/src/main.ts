@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { formatEther, formatGwei, formatUnits } from "viem";
+import { decodeFunctionData, encodeFunctionData, erc20Abi, formatEther, formatGwei, formatUnits } from "viem";
 import {
   ALLOWED_RPC_ORIGINS,
   DEFAULT_SEPOLIA_RPC_URL,
@@ -8,7 +8,13 @@ import {
   sepoliaClient,
   type Address,
 } from "./sepolia";
-import { SEPOLIA_TOKENS, fetchTokenBalance } from "./tokens";
+import {
+  SEPOLIA_TOKENS,
+  fetchTokenBalance,
+  fetchTokenMetadata,
+  parseUnitsStrict,
+  type TokenMetadata,
+} from "./tokens";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -132,24 +138,69 @@ let txHistoryRequestId = 0;
 let tokenBalanceRequestId = 0;
 
 /**
+ * Cache of each token's real, contract-read symbol/decimals, keyed by
+ * address. Populated opportunistically whenever either the balance display
+ * (`fetchTokenBalances`) or the send flow's token selector fetches a
+ * token's metadata, and read by the transaction-history renderer so it can
+ * label a token-transfer row without a fetch (and, on a cache miss, fall
+ * back to a raw-units display rather than block rendering — see
+ * `renderTxHistoryItem`). Never the SOURCE of truth for a signed amount:
+ * every actual send re-fetches decimals fresh (see `handleAssetSelectionChanged`)
+ * rather than trusting whatever happens to be cached.
+ */
+const tokenMetadataCache = new Map<Address, TokenMetadata>();
+
+/**
+ * The asset currently selected in the send flow's token picker. `null`
+ * means ETH (a plain value transfer); otherwise the specific token being
+ * sent, with its real, freshly-fetched decimals/symbol — never the cosmetic
+ * `label` from `SEPOLIA_TOKENS`.
+ */
+type SelectedAsset = { address: Address; symbol: string; decimals: number } | null;
+let selectedAsset: SelectedAsset = null;
+
+/**
  * Send-flow state, gathered on "Review send" and consumed on "Confirm and
  * send". All public data (a recipient address, an amount, network fee
  * fields) — nothing here is secret, unlike the phrase/passphrase state
  * above. Reset (`clearSendState`) on cancel, on returning to the wallet
  * after a send, and on lock.
+ *
+ * A discriminated union rather than one shape with optional token fields:
+ * `confirmSend` has to pick between two entirely different backend
+ * commands (`sign_transaction` vs `sign_token_transfer`), and a `kind` tag
+ * makes that an exhaustive `switch` the compiler checks, instead of an
+ * "if amountRaw is set" convention that's easy to get wrong on either side.
  */
-interface PreparedSend {
+interface PreparedEthSend {
+  kind: "eth";
   recipient: Address;
   amountWei: bigint;
-  amountEthDisplay: string;
   nonce: number;
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
+  gasLimit: bigint;
 }
+interface PreparedTokenSend {
+  kind: "token";
+  tokenAddress: Address;
+  tokenSymbol: string;
+  tokenDecimals: number;
+  recipient: Address;
+  amountRaw: bigint;
+  nonce: number;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  gasLimit: bigint;
+}
+type PreparedSend = PreparedEthSend | PreparedTokenSend;
 let preparedSend: PreparedSend | null = null;
 
 function clearSendState() {
   preparedSend = null;
+  selectedAsset = null;
+  el<HTMLSelectElement>("send-asset-select").value = "ETH";
+  el("send-amount-unit").textContent = "ETH";
   el<HTMLInputElement>("send-amount").value = "";
   el<HTMLInputElement>("send-ack-checkbox").checked = false;
   el("send-status").textContent = "";
@@ -568,12 +619,16 @@ async function fetchTokenBalances(rpcUrl: string) {
 
   const client = sepoliaClient(rpcUrl);
 
-  for (const tokenAddress of SEPOLIA_TOKENS) {
+  for (const { address: tokenAddress } of SEPOLIA_TOKENS) {
     const row = renderTokenRow({ address: tokenAddress, state: "loading" });
     listEl.appendChild(row);
 
     fetchTokenBalance(client, tokenAddress, owner)
       .then((result) => {
+        // Opportunistically warms the cache the transaction-history
+        // renderer reads to label a token-transfer row -- this fetch was
+        // happening anyway, so there's no extra request for that benefit.
+        tokenMetadataCache.set(tokenAddress, { symbol: result.symbol, decimals: result.decimals });
         if (requestId !== tokenBalanceRequestId) {
           return; // Superseded by a newer fetch (refresh, lock, RPC change).
         }
@@ -657,6 +712,24 @@ async function fetchTxHistory() {
   statusEl.textContent = "Loading transaction history…";
   refreshBtn.disabled = true;
 
+  // Best-effort warm-up so a token-transfer row (see describeTokenTransfer)
+  // can usually render its real symbol/decimals without an extra fetch of
+  // its own. Never blocks or fails history loading: a rejected token-info
+  // read here just means those rows fall back to a raw-units display.
+  const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
+  if (rpcUrl) {
+    const client = sepoliaClient(rpcUrl);
+    void Promise.all(
+      SEPOLIA_TOKENS.filter((t) => !tokenMetadataCache.has(t.address)).map(async (t) => {
+        try {
+          tokenMetadataCache.set(t.address, await fetchTokenMetadata(client, t.address));
+        } catch {
+          // See comment above: best-effort only.
+        }
+      }),
+    );
+  }
+
   try {
     const transactions = await fetchSepoliaTransactions(activeAccountAddress);
 
@@ -698,25 +771,88 @@ function renderTxHistory(transactions: SepoliaTransaction[]) {
   }
 }
 
+interface TokenTransferDescription {
+  tokenAddress: Address;
+  recipient: Address;
+  amountRaw: bigint;
+}
+
+/**
+ * If `tx` calls `transfer(address,uint256)` on a token this app knows about
+ * (`SEPOLIA_TOKENS`), decode the real recipient and amount; otherwise
+ * `null` (a plain value transfer, or a call to some other contract/function
+ * this app doesn't render specially).
+ *
+ * Etherscan's `txlist` only ever returns a transaction shaped like this
+ * for transfers **we sent**: its `to` is the token contract, never our own
+ * address, so the only way such a row appears in our own history query is
+ * `tx.from` being us. An incoming token transfer (someone else calling
+ * `transfer()` with our address as the recipient) does NOT appear in
+ * `txlist` at all — Etherscan only surfaces that via the separate `tokentx`
+ * endpoint (indexed from the token's own `Transfer` event logs), which this
+ * app doesn't query. Known, accepted gap: this detects and correctly labels
+ * every token transfer this wallet sends, not ones it receives.
+ */
+function describeTokenTransfer(tx: SepoliaTransaction): TokenTransferDescription | null {
+  if (tx.to === null) {
+    return null;
+  }
+  const token = SEPOLIA_TOKENS.find((t) => t.address.toLowerCase() === tx.to?.toLowerCase());
+  if (!token) {
+    return null;
+  }
+  try {
+    const decoded = decodeFunctionData({ abi: erc20Abi, data: tx.input });
+    if (decoded.functionName !== "transfer") {
+      return null;
+    }
+    const [recipient, amountRaw] = decoded.args;
+    return { tokenAddress: token.address, recipient, amountRaw };
+  } catch {
+    return null; // Not a well-formed transfer() call -- not this function's job to render.
+  }
+}
+
 function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
   const address = activeAccountAddress as Address;
-  const isFromUs = tx.from.toLowerCase() === address.toLowerCase();
-  const isToUs = tx.to !== null && tx.to.toLowerCase() === address.toLowerCase();
+  const tokenTransfer = describeTokenTransfer(tx);
 
-  // Self-sends (account 2 test transfers, e.g.) are both at once — labeled
-  // as their own case rather than picked arbitrarily as one or the other,
-  // since "sent" or "received" alone would each be half true.
+  // A token-transfer row is always a send (see describeTokenTransfer's doc
+  // comment for why "received" can't happen here) — direction is decided
+  // before the general from/to comparison below even runs for this case.
   let direction: string;
   let otherParty: string;
-  if (isFromUs && isToUs) {
-    direction = "Self";
-    otherParty = address;
-  } else if (isFromUs) {
+  let amountDisplay: string;
+
+  if (tokenTransfer) {
     direction = "Sent";
-    otherParty = tx.to ?? "(contract creation)";
+    otherParty = tokenTransfer.recipient;
+    const metadata = tokenMetadataCache.get(tokenTransfer.tokenAddress);
+    amountDisplay = metadata
+      ? `${formatUnits(tokenTransfer.amountRaw, metadata.decimals)} ${metadata.symbol}`
+      // Cache miss (rare -- see fetchTxHistory's warm-up): still correctly
+      // NOT "0 ETH", the bug this whole function exists to avoid, just
+      // without a human-readable amount until the token's decimals are
+      // known. Never guesses a decimals value to force a display here.
+      : `${tokenTransfer.amountRaw} raw units of token ${tokenTransfer.tokenAddress} (decimals unknown)`;
   } else {
-    direction = "Received";
-    otherParty = tx.from;
+    const isFromUs = tx.from.toLowerCase() === address.toLowerCase();
+    const isToUs = tx.to !== null && tx.to.toLowerCase() === address.toLowerCase();
+
+    // Self-sends (account 2 test transfers, e.g.) are both at once —
+    // labeled as their own case rather than picked arbitrarily as one or
+    // the other, since "sent" or "received" alone would each be half true.
+    if (isFromUs && isToUs) {
+      direction = "Self";
+      otherParty = address;
+    } else if (isFromUs) {
+      direction = "Sent";
+      otherParty = tx.to ?? "(contract creation)";
+    } else {
+      direction = "Received";
+      otherParty = tx.from;
+    }
+    amountDisplay = `${formatEther(tx.valueWei)} ETH`;
   }
 
   const item = document.createElement("li");
@@ -732,7 +868,7 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
 
   const amountEl = document.createElement("span");
   amountEl.className = "tx-amount";
-  amountEl.textContent = `${formatEther(tx.valueWei)} ETH`;
+  amountEl.textContent = amountDisplay;
   summary.appendChild(amountEl);
 
   const statusEl = document.createElement("span");
@@ -828,6 +964,74 @@ async function goToSend() {
     option.textContent = `Account ${account.index + 1} — ${account.address}`;
     select.appendChild(option);
   }
+
+  const assetSelect = el<HTMLSelectElement>("send-asset-select");
+  assetSelect.replaceChildren();
+  const ethOption = document.createElement("option");
+  ethOption.value = "ETH";
+  ethOption.textContent = "ETH";
+  assetSelect.appendChild(ethOption);
+  for (const token of SEPOLIA_TOKENS) {
+    const option = document.createElement("option");
+    option.value = token.address;
+    // The list's cosmetic label, not a fetched symbol -- selecting this
+    // option is what triggers the real fetch (handleAssetSelectionChanged).
+    option.textContent = token.label;
+    assetSelect.appendChild(option);
+  }
+  assetSelect.value = "ETH";
+}
+
+/**
+ * Fired when the send flow's token picker changes. For ETH, this is
+ * synchronous and immediate — no network round trip needed. For a token,
+ * this is the one and only place a send amount's decimals get fetched: a
+ * fresh `fetchTokenMetadata` call every time, never the cached value from
+ * `tokenMetadataCache` (that cache exists for the history display, which
+ * can tolerate slightly-stale metadata; an amount that's about to be signed
+ * and broadcast cannot).
+ */
+async function handleAssetSelectionChanged() {
+  const assetSelect = el<HTMLSelectElement>("send-asset-select");
+  const unitEl = el("send-amount-unit");
+  const errorEl = el("send-error");
+  const value = assetSelect.value;
+
+  if (value === "ETH") {
+    selectedAsset = null;
+    unitEl.textContent = "ETH";
+    return;
+  }
+
+  const tokenAddress = value as Address;
+  selectedAsset = null; // Cleared while (re-)fetching, so a stale selection can't be sent.
+  unitEl.textContent = "Loading…";
+  assetSelect.disabled = true;
+  errorEl.textContent = "";
+
+  const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
+  try {
+    const client = sepoliaClient(rpcUrl);
+    const metadata = await fetchTokenMetadata(client, tokenAddress);
+    tokenMetadataCache.set(tokenAddress, metadata);
+    // The selector may have changed again while this fetch was in flight;
+    // only apply the result if it's still what's selected.
+    if (el<HTMLSelectElement>("send-asset-select").value !== tokenAddress) {
+      return;
+    }
+    selectedAsset = { address: tokenAddress, symbol: metadata.symbol, decimals: metadata.decimals };
+    unitEl.textContent = metadata.symbol;
+  } catch (error) {
+    if (el<HTMLSelectElement>("send-asset-select").value !== tokenAddress) {
+      return;
+    }
+    unitEl.textContent = "";
+    errorEl.textContent = `Could not read token info: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    if (el<HTMLSelectElement>("send-asset-select").value === tokenAddress) {
+      assetSelect.disabled = false;
+    }
+  }
 }
 
 /**
@@ -849,22 +1053,41 @@ async function reviewSend() {
   const recipientSelect = el<HTMLSelectElement>("send-recipient-select");
   const recipient = recipientSelect.value as Address | "";
   const amountInput = el<HTMLInputElement>("send-amount").value.trim();
+  const asset = selectedAsset; // Snapshot: handleAssetSelectionChanged could change it while this runs.
 
   if (!recipient) {
     errorEl.textContent = "No destination account selected — try leaving and re-entering this screen.";
     return;
   }
-
-  let amountWei: bigint;
-  try {
-    amountWei = parseEtherStrict(amountInput);
-  } catch {
-    errorEl.textContent = "Enter a valid, positive amount in ETH.";
+  if (el<HTMLSelectElement>("send-asset-select").value !== "ETH" && !asset) {
+    errorEl.textContent = "Still loading token info — wait a moment and try again.";
     return;
   }
-  if (amountWei <= 0n) {
-    errorEl.textContent = "Amount must be greater than zero.";
-    return;
+
+  let amountWei = 0n; // Used for the ETH path only; stays zero for a token send (see sign_token_transfer_impl).
+  let amountRaw = 0n; // Used for the token path only.
+  if (asset === null) {
+    try {
+      amountWei = parseEtherStrict(amountInput);
+    } catch {
+      errorEl.textContent = "Enter a valid, positive amount in ETH.";
+      return;
+    }
+    if (amountWei <= 0n) {
+      errorEl.textContent = "Amount must be greater than zero.";
+      return;
+    }
+  } else {
+    try {
+      amountRaw = parseUnitsStrict(amountInput, asset.decimals);
+    } catch {
+      errorEl.textContent = `Enter a valid, positive amount in ${asset.symbol}.`;
+      return;
+    }
+    if (amountRaw <= 0n) {
+      errorEl.textContent = "Amount must be greater than zero.";
+      return;
+    }
   }
 
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
@@ -920,26 +1143,83 @@ async function reviewSend() {
     return;
   }
 
+  let gasLimit: bigint;
+  if (asset === null) {
+    // A protocol constant for this exact shape of transaction (see
+    // ETH_TRANSFER_GAS_LIMIT's own doc comment) -- nothing to estimate.
+    gasLimit = ETH_TRANSFER_GAS_LIMIT;
+  } else {
+    statusEl.textContent = "Estimating gas…";
+    try {
+      // A contract call costs meaningfully more than a plain transfer and
+      // varies by token implementation (e.g. whether the recipient's
+      // balance slot was previously zero), so this is a real estimate
+      // against the specific call being made -- not the fixed 21000 used
+      // for ETH. The calldata built here with viem's own encodeFunctionData
+      // is for this estimate only; the transaction that actually gets
+      // signed is encoded independently by the Rust backend (see
+      // encode_erc20_transfer in lib.rs) via alloy, not derived from this.
+      gasLimit = await client.estimateGas({
+        account: activeAccountAddress as Address,
+        to: asset.address,
+        data: encodeFunctionData({
+          abi: erc20Abi,
+          functionName: "transfer",
+          args: [recipient, amountRaw],
+        }),
+      });
+    } catch (error) {
+      statusEl.textContent = "";
+      reviewBtn.disabled = false;
+      errorEl.textContent = `Could not estimate gas: ${error instanceof Error ? error.message : String(error)}`;
+      return;
+    }
+  }
+
   statusEl.textContent = "";
   reviewBtn.disabled = false;
 
-  preparedSend = {
-    recipient,
-    amountWei,
-    amountEthDisplay: formatEther(amountWei),
-    nonce,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
-  };
-
+  const maxFeeTotal = maxFeePerGas * gasLimit;
   el("review-recipient").textContent = recipient;
-  el("review-amount").textContent = `${preparedSend.amountEthDisplay} ETH`;
-  const maxFeeTotal = maxFeePerGas * ETH_TRANSFER_GAS_LIMIT;
   el("review-fee").textContent =
     `${formatGwei(maxFeePerGas)} gwei max fee / ${formatGwei(maxPriorityFeePerGas)} gwei ` +
-    `max priority fee (gas limit ${ETH_TRANSFER_GAS_LIMIT})`;
-  el("review-total").textContent =
-    `${formatEther(amountWei + maxFeeTotal)} ETH (amount + worst-case fee; the actual fee charged is usually lower)`;
+    `max priority fee (gas limit ${gasLimit})`;
+
+  if (asset === null) {
+    preparedSend = {
+      kind: "eth",
+      recipient,
+      amountWei,
+      nonce,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasLimit,
+    };
+    el("review-amount").textContent = `${formatEther(amountWei)} ETH`;
+    el("review-total").textContent =
+      `${formatEther(amountWei + maxFeeTotal)} ETH (amount + worst-case fee; the actual fee charged is usually lower)`;
+  } else {
+    preparedSend = {
+      kind: "token",
+      tokenAddress: asset.address,
+      tokenSymbol: asset.symbol,
+      tokenDecimals: asset.decimals,
+      recipient,
+      amountRaw,
+      nonce,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasLimit,
+    };
+    el("review-amount").textContent = `${formatUnits(amountRaw, asset.decimals)} ${asset.symbol}`;
+    // No single meaningful "total" here -- the token amount and the ETH
+    // network fee are different assets and can't be summed. Shown
+    // separately instead of silently reusing the ETH-send phrasing (which
+    // would have summed a USDC amount with a wei figure into nonsense).
+    el("review-total").textContent =
+      `${formatEther(maxFeeTotal)} ETH network fee (worst case), separate from the ` +
+      `${formatUnits(amountRaw, asset.decimals)} ${asset.symbol} being sent`;
+  }
 
   el<HTMLInputElement>("send-ack-checkbox").checked = false;
   el<HTMLButtonElement>("send-confirm-btn").disabled = true;
@@ -962,6 +1242,7 @@ function parseEtherStrict(input: string): bigint {
   return BigInt(wholePart) * 10n ** 18n + BigInt(fractionPadded || "0");
 }
 
+
 /**
  * Sign (via the backend, which holds the key), broadcast, then poll for
  * the receipt. Each stage has its own distinct error message — signing,
@@ -972,7 +1253,7 @@ async function confirmSend() {
   if (!preparedSend) {
     return;
   }
-  const { recipient, amountWei, nonce, maxFeePerGas, maxPriorityFeePerGas } = preparedSend;
+  const send = preparedSend;
 
   const progressEl = el("send-progress");
   const finalErrorEl = el("send-final-error");
@@ -988,18 +1269,34 @@ async function confirmSend() {
   progressEl.textContent = "Signing…";
   let rawSignedHex: string;
   try {
-    rawSignedHex = await invoke<string>("sign_transaction", {
-      to: recipient,
-      valueWei: amountWei.toString(),
-      nonce,
-      maxFeePerGas: maxFeePerGas.toString(),
-      maxPriorityFeePerGas: maxPriorityFeePerGas.toString(),
-      gasLimit: Number(ETH_TRANSFER_GAS_LIMIT),
-      chainId: SEPOLIA_CHAIN_ID,
-      // Sign from whichever account is currently active, not a fixed
-      // account — the whole point of the account switcher.
-      fromIndex: activeAccountIndex,
-    });
+    // Which backend command signs this depends on the kind of send --
+    // sign_transaction for a plain ETH value transfer, sign_token_transfer
+    // for an ERC-20 call. Both derive from and sign as whichever account is
+    // currently active, not a fixed account — the whole point of the
+    // account switcher.
+    rawSignedHex =
+      send.kind === "eth"
+        ? await invoke<string>("sign_transaction", {
+            to: send.recipient,
+            valueWei: send.amountWei.toString(),
+            nonce: send.nonce,
+            maxFeePerGas: send.maxFeePerGas.toString(),
+            maxPriorityFeePerGas: send.maxPriorityFeePerGas.toString(),
+            gasLimit: Number(send.gasLimit),
+            chainId: SEPOLIA_CHAIN_ID,
+            fromIndex: activeAccountIndex,
+          })
+        : await invoke<string>("sign_token_transfer", {
+            tokenAddress: send.tokenAddress,
+            to: send.recipient,
+            amountRaw: send.amountRaw.toString(),
+            nonce: send.nonce,
+            maxFeePerGas: send.maxFeePerGas.toString(),
+            maxPriorityFeePerGas: send.maxPriorityFeePerGas.toString(),
+            gasLimit: Number(send.gasLimit),
+            chainId: SEPOLIA_CHAIN_ID,
+            fromIndex: activeAccountIndex,
+          });
   } catch (error) {
     if (isSessionLockedError(error)) {
       handleSessionLocked();
@@ -1130,6 +1427,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     clearSendState();
     showStep("unlocked");
   });
+  el("send-asset-select").addEventListener("change", () => void handleAssetSelectionChanged());
   el("send-review-btn").addEventListener("click", () => void reviewSend());
   el("send-back-btn").addEventListener("click", () => {
     el("send-confirm-error").textContent = "";

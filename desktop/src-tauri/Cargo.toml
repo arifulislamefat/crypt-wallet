@@ -48,10 +48,16 @@ rand_core = { version = "0.6", features = ["std", "getrandom"] }
 #                    used both in sign_transaction's own sanity check and
 #                    in the self-verifying signature-recovery test
 #   - "rlp"       -> the RLP/EIP-2718 encoding the "consensus" types build on
+#   - "sol-types" -> the `sol!` macro and `SolCall` trait, used to encode the
+#                    ERC-20 `transfer(address,uint256)` calldata for token
+#                    sends (see `encode_erc20_transfer`) — deliberately not
+#                    the much heavier "contract" feature, which pulls in a
+#                    full RPC-calling contract client this app doesn't use;
+#                    "sol-types" alone gives ABI encoding with none of that.
 #   - "std"       -> default-features carries "std" among other things
 #                    (reqwest, network I/O) this app doesn't want; re-added
 #                    explicitly rather than pulled in wholesale
-alloy = { version = "0.9", default-features = false, features = ["consensus", "eips", "k256", "rlp", "std"] }
+alloy = { version = "0.9", default-features = false, features = ["consensus", "eips", "k256", "rlp", "sol-types", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

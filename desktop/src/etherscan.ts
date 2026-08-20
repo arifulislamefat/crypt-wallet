@@ -69,6 +69,14 @@ export interface SepoliaTransaction {
   timestamp: number;
   /** `false` also covers the small share of very old pre-Byzantium txs Etherscan can't classify — treated as success, matching Etherscan's own website display. */
   failed: boolean;
+  /**
+   * Raw calldata, `"0x"` for a plain value transfer. Kept so the history
+   * view can detect and label an ERC-20 `transfer()` call distinctly
+   * instead of showing it as a plain ETH send of 0 ETH (see
+   * `describeTokenTransfer` in `main.ts`) — the one field this app reads
+   * beyond what earlier balance/history work needed.
+   */
+  input: `0x${string}`;
 }
 
 /**
@@ -170,10 +178,10 @@ function isEtherscanEnvelope(value: unknown): value is EtherscanEnvelope {
 }
 
 /**
- * A raw `txlist` result-array entry has many more fields than this app
- * uses (gas, nonce, input data, ...); only what's actually displayed is
- * validated and kept, so a shape change in the fields we ignore can't break
- * this.
+ * A raw `txlist` result-array entry has many more fields than this app uses
+ * (gas, nonce, method ID, ...); only what's actually displayed — now
+ * including `input`, needed to detect a token transfer — is validated and
+ * kept, so a shape change in the fields we still ignore can't break this.
  */
 function parseTransaction(raw: unknown): SepoliaTransaction {
   if (typeof raw !== "object" || raw === null) {
@@ -186,13 +194,15 @@ function parseTransaction(raw: unknown): SepoliaTransaction {
   const value = entry.value;
   const timeStamp = entry.timeStamp;
   const isError = entry.isError;
+  const input = entry.input;
 
   if (
     typeof hash !== "string" ||
     typeof from !== "string" ||
     typeof to !== "string" ||
     typeof value !== "string" ||
-    typeof timeStamp !== "string"
+    typeof timeStamp !== "string" ||
+    typeof input !== "string"
   ) {
     throw new EtherscanApiError("Etherscan returned a malformed transaction entry.");
   }
@@ -205,6 +215,7 @@ function parseTransaction(raw: unknown): SepoliaTransaction {
     valueWei: BigInt(value),
     timestamp: Number(timeStamp),
     failed: isError === "1",
+    input: (input === "" ? "0x" : input) as `0x${string}`,
   };
 }
 

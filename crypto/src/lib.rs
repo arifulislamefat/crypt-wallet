@@ -1,7 +1,10 @@
 //! `cryptwallet-crypto` — Phase 1 of Crypt Wallet's core.
 //!
 //! Scope of this crate, deliberately narrow: BIP-39 mnemonic generation and
-//! import, BIP-32/44 hierarchical derivation, and EVM address derivation.
+//! import, BIP-32/44 hierarchical derivation and EVM address derivation
+//! (`derivation.rs`/`evm.rs`), and SLIP-10 ed25519 derivation and Solana
+//! address derivation (`solana.rs`) — see that module's own doc comment for
+//! why it's a genuinely separate algorithm, not a variant of the EVM path.
 //!
 //! Explicitly OUT of scope for this crate (by design, not oversight):
 //! - Transaction construction, RLP encoding, and the EIP-1559/EIP-2718
@@ -34,7 +37,9 @@
 pub mod derivation;
 pub mod evm;
 pub mod mnemonic;
+pub mod solana;
 
 pub use derivation::{DerivationError, EvmAccountKey};
 pub use evm::Address;
 pub use mnemonic::{MnemonicError, Seed, SecretMnemonic, WordCount};
+pub use solana::{SolanaAccountKey, SolanaDerivationError};

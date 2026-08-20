@@ -67,5 +67,37 @@ rand_core = { version = "0.6", features = ["std"] }
 # invalid input itself).
 thiserror = "1.0"
 
+# --- SLIP-0010 ed25519 hierarchical derivation + Solana address encoding ---
+# There is no crates.io-established, widely-adopted SLIP-10 crate the way
+# `bip39`/`bip32` are established for their specs (the one candidate found,
+# `slip10_ed25519`, is a single-function, low-adoption crate not worth
+# trusting for this) -- so SLIP-10 ed25519 is implemented directly in
+# solana.rs from the published spec
+# (https://github.com/satoshilabs/slips/blob/master/slip-0010.md), using
+# only these two audited RustCrypto primitives (`hmac`+`sha2`), the same
+# "well-known primitives, not a hand-rolled protocol" bar the rest of this
+# crate holds to. Every value the implementation produces is checked against
+# the spec's own published test vector AND an independent from-scratch
+# computation done with Python's stdlib hmac/hashlib during this module's
+# development (see solana.rs's test module) -- not trusted from a single
+# source.
+hmac = "0.12"
+sha2 = "0.10"
+
+# ed25519-dalek — the reference-grade, widely-used pure-Rust ed25519
+# implementation (used by solana-sdk itself, among many others). `SigningKey`
+# takes exactly the 32-byte value SLIP-10 derivation produces as its `IL` and
+# performs the standard RFC 8032 seed-expansion internally -- verified
+# against this crate's own docs.rs page before adding.
+# NOTE: verify the exact resolved version against Cargo.lock/crates.io on
+# first `cargo build`, same caveat as bip32 above.
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+
+# bs58 — Base58 (Bitcoin-alphabet) encode/decode. A Solana address is exactly
+# the base58 encoding of a raw 32-byte ed25519 public key, with no checksum
+# or version byte (unlike Bitcoin's Base58Check) -- see solana.rs's `address`
+# doc comment.
+bs58 = "0.5"
+
 [dev-dependencies]
 hex = "0.4"

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { formatEther, formatGwei } from "viem";
 import {
   ALLOWED_RPC_ORIGINS,
@@ -7,6 +8,13 @@ import {
   sepoliaClient,
   type Address,
 } from "./sepolia";
+import {
+  EtherscanApiError,
+  EtherscanConfigError,
+  fetchSepoliaTransactions,
+  sepoliaExplorerTxUrl,
+  type SepoliaTransaction,
+} from "./etherscan";
 
 /**
  * Fixed intrinsic gas cost of a plain ETH transfer to an externally-owned
@@ -77,6 +85,13 @@ let unlockedAddress: Address | null = null;
  * shown as if it were current" failure mode this feature must avoid.
  */
 let balanceRequestId = 0;
+
+/**
+ * Same stale-response guard as `balanceRequestId`, for the transaction
+ * history fetch — a slow response from a previous fetch (or from before a
+ * lock/unlock cycle) must never land after, and overwrite, a newer one.
+ */
+let txHistoryRequestId = 0;
 
 /**
  * Send-flow state, gathered on "Review send" and consumed on "Confirm and
@@ -412,6 +427,142 @@ async function fetchBalance() {
 }
 
 /**
+ * Fetch and render `unlockedAddress`'s Sepolia transaction history.
+ *
+ * Three end states, kept visually distinct rather than collapsed into one
+ * blank-or-generic screen: a genuine empty history (new wallet, nothing
+ * sent or received yet), an error (API unreachable, rate-limited, or
+ * unconfigured), and the populated list.
+ */
+async function fetchTxHistory() {
+  const statusEl = el("tx-history-status");
+  const errorEl = el("tx-history-error");
+  const emptyEl = el("tx-history-empty");
+  const listEl = el("tx-history-list");
+  const refreshBtn = el<HTMLButtonElement>("refresh-tx-history-btn");
+
+  if (!unlockedAddress) {
+    return;
+  }
+
+  const requestId = ++txHistoryRequestId;
+  errorEl.textContent = "";
+  emptyEl.classList.add("hidden");
+  listEl.replaceChildren();
+  statusEl.textContent = "Loading transaction history…";
+  refreshBtn.disabled = true;
+
+  try {
+    const transactions = await fetchSepoliaTransactions(unlockedAddress);
+
+    if (requestId !== txHistoryRequestId) {
+      return; // Superseded by a newer request; drop this result.
+    }
+    statusEl.textContent = "";
+
+    if (transactions.length === 0) {
+      emptyEl.classList.remove("hidden");
+      return;
+    }
+    renderTxHistory(transactions);
+  } catch (error) {
+    if (requestId !== txHistoryRequestId) {
+      return;
+    }
+    statusEl.textContent = "";
+    if (error instanceof EtherscanConfigError) {
+      errorEl.textContent = `Transaction history is unavailable: ${error.message}`;
+    } else if (error instanceof EtherscanApiError) {
+      errorEl.textContent = `Could not load transaction history: ${error.message}`;
+    } else {
+      errorEl.textContent = `Could not load transaction history: ${String(error)}`;
+    }
+  } finally {
+    if (requestId === txHistoryRequestId) {
+      refreshBtn.disabled = false;
+    }
+  }
+}
+
+function renderTxHistory(transactions: SepoliaTransaction[]) {
+  const listEl = el("tx-history-list");
+  listEl.replaceChildren();
+
+  for (const tx of transactions) {
+    listEl.appendChild(renderTxHistoryItem(tx));
+  }
+}
+
+function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
+  const address = unlockedAddress as Address;
+  const isFromUs = tx.from.toLowerCase() === address.toLowerCase();
+  const isToUs = tx.to !== null && tx.to.toLowerCase() === address.toLowerCase();
+
+  // Self-sends (account 2 test transfers, e.g.) are both at once — labeled
+  // as their own case rather than picked arbitrarily as one or the other,
+  // since "sent" or "received" alone would each be half true.
+  let direction: string;
+  let otherParty: string;
+  if (isFromUs && isToUs) {
+    direction = "Self";
+    otherParty = address;
+  } else if (isFromUs) {
+    direction = "Sent";
+    otherParty = tx.to ?? "(contract creation)";
+  } else {
+    direction = "Received";
+    otherParty = tx.from;
+  }
+
+  const item = document.createElement("li");
+  item.className = "tx-history-item";
+
+  const summary = document.createElement("div");
+  summary.className = "tx-history-summary";
+
+  const directionEl = document.createElement("span");
+  directionEl.className = `tx-direction tx-direction-${direction.toLowerCase()}`;
+  directionEl.textContent = direction;
+  summary.appendChild(directionEl);
+
+  const amountEl = document.createElement("span");
+  amountEl.className = "tx-amount";
+  amountEl.textContent = `${formatEther(tx.valueWei)} ETH`;
+  summary.appendChild(amountEl);
+
+  const statusEl = document.createElement("span");
+  statusEl.className = `tx-status ${tx.failed ? "tx-status-failed" : "tx-status-success"}`;
+  statusEl.textContent = tx.failed ? "Failed" : "Success";
+  summary.appendChild(statusEl);
+
+  item.appendChild(summary);
+
+  const otherPartyEl = document.createElement("p");
+  otherPartyEl.className = "address tx-other-party";
+  otherPartyEl.textContent =
+    direction === "Self" ? "This wallet's own address" : otherParty;
+  item.appendChild(otherPartyEl);
+
+  const timeEl = document.createElement("p");
+  timeEl.className = "hint tx-timestamp";
+  timeEl.textContent = new Date(tx.timestamp * 1000).toLocaleString();
+  item.appendChild(timeEl);
+
+  const viewBtn = document.createElement("button");
+  viewBtn.type = "button";
+  viewBtn.textContent = "View on explorer";
+  viewBtn.addEventListener("click", () => {
+    // Opened in the system's default browser (Tauri's opener plugin), not
+    // an in-app view — the whole point is letting the user independently
+    // verify what this app shows them, on a page this app doesn't control.
+    void openUrl(sepoliaExplorerTxUrl(tx.hash));
+  });
+  item.appendChild(viewBtn);
+
+  return item;
+}
+
+/**
  * Enter the send flow: fetch account 2's address (an IPC call, no network)
  * and show the amount-entry screen.
  *
@@ -672,6 +823,7 @@ async function unlock() {
     el("unlocked-address").textContent = address;
     showStep("unlocked");
     void fetchBalance();
+    void fetchTxHistory();
   } catch (error) {
     errorEl.textContent = String(error);
   } finally {
@@ -687,10 +839,15 @@ async function lock() {
   await invoke("lock_wallet");
   unlockedAddress = null;
   balanceRequestId++; // Invalidate any balance fetch still in flight.
+  txHistoryRequestId++; // Invalidate any tx-history fetch still in flight.
   el("unlocked-address").textContent = "";
   el("balance-value").textContent = "";
   el("balance-value").classList.remove("loading");
   el("balance-error").textContent = "";
+  el("tx-history-status").textContent = "";
+  el("tx-history-error").textContent = "";
+  el("tx-history-empty").classList.add("hidden");
+  el("tx-history-list").replaceChildren();
   clearPassphraseInputs();
   clearPhraseFromMemory();
   clearSendState();
@@ -700,6 +857,7 @@ async function lock() {
 window.addEventListener("DOMContentLoaded", async () => {
   el<HTMLInputElement>("rpc-url").value = DEFAULT_SEPOLIA_RPC_URL;
   el("refresh-balance-btn").addEventListener("click", () => void fetchBalance());
+  el("refresh-tx-history-btn").addEventListener("click", () => void fetchTxHistory());
 
   el("generate-btn").addEventListener("click", generatePhrase);
   el("backup-done-btn").addEventListener("click", startConfirmation);

@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Etherscan API key (see .env.example)
+.env
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

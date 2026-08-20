@@ -51,6 +51,22 @@
           <input id="rpc-url" type="text" spellcheck="false" />
         </fieldset>
 
+        <fieldset class="tx-history-section">
+          <legend>Transaction history — Sepolia testnet</legend>
+
+          <div class="row">
+            <button id="refresh-tx-history-btn" type="button">Refresh history</button>
+          </div>
+
+          <p id="tx-history-status" class="hint" aria-live="polite"></p>
+          <p id="tx-history-error" class="error"></p>
+          <p id="tx-history-empty" class="hint hidden">
+            No transactions yet for this address on Sepolia.
+          </p>
+
+          <ul id="tx-history-list" class="tx-history-list" aria-live="polite"></ul>
+        </fieldset>
+
         <div class="row">
           <button id="send-nav-btn" type="button">Send</button>
           <button id="lock-btn" type="button">Lock wallet</button>

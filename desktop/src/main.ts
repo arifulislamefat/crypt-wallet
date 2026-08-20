@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { formatEther, formatGwei } from "viem";
+import { formatEther, formatGwei, formatUnits } from "viem";
 import {
   ALLOWED_RPC_ORIGINS,
   DEFAULT_SEPOLIA_RPC_URL,
@@ -8,6 +8,7 @@ import {
   sepoliaClient,
   type Address,
 } from "./sepolia";
+import { SEPOLIA_TOKENS, fetchTokenBalance } from "./tokens";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -92,6 +93,14 @@ let balanceRequestId = 0;
  * lock/unlock cycle) must never land after, and overwrite, a newer one.
  */
 let txHistoryRequestId = 0;
+
+/**
+ * Same stale-response guard as `balanceRequestId`, for the token-balance
+ * fetch. Bumped once per `fetchTokenBalances()` call (not once per token),
+ * so a lock/unlock or RPC-change mid-fetch invalidates every in-flight
+ * per-token read from that call together.
+ */
+let tokenBalanceRequestId = 0;
 
 /**
  * Send-flow state, gathered on "Review send" and consumed on "Confirm and
@@ -394,6 +403,11 @@ async function fetchBalance() {
   valueEl.classList.add("loading");
   refreshBtn.disabled = true;
 
+  // Independent of the ETH balance fetch below (its own request-id guard,
+  // its own per-token error handling) — a slow or failing token read must
+  // never block or blank out the ETH balance, and vice versa.
+  void fetchTokenBalances(rpcUrl);
+
   try {
     const balanceWei = await sepoliaClient(rpcUrl).getBalance({
       address: unlockedAddress,
@@ -424,6 +438,94 @@ async function fetchBalance() {
       refreshBtn.disabled = false;
     }
   }
+}
+
+/**
+ * Fetch and render each token in `SEPOLIA_TOKENS`'s balance for
+ * `unlockedAddress`, over `rpcUrl` (already validated by the caller —
+ * `fetchBalance` — against `ALLOWED_RPC_ORIGINS`, so this trusts it as-is
+ * rather than re-checking).
+ *
+ * Each token is fetched independently: a failing contract read (bad RPC
+ * response, a token temporarily returning garbage, whatever) shows an error
+ * on *that token's* row only, via `renderTokenRow`'s error branch — it
+ * never takes down the rest of the list. This is why the per-token
+ * `Promise` calls below are not wrapped in a single `Promise.all`.
+ */
+async function fetchTokenBalances(rpcUrl: string) {
+  const listEl = el("token-balance-list");
+
+  if (!unlockedAddress) {
+    return;
+  }
+  const owner = unlockedAddress;
+
+  const requestId = ++tokenBalanceRequestId;
+  listEl.replaceChildren();
+
+  const client = sepoliaClient(rpcUrl);
+
+  for (const tokenAddress of SEPOLIA_TOKENS) {
+    const row = renderTokenRow({ address: tokenAddress, state: "loading" });
+    listEl.appendChild(row);
+
+    fetchTokenBalance(client, tokenAddress, owner)
+      .then((result) => {
+        if (requestId !== tokenBalanceRequestId) {
+          return; // Superseded by a newer fetch (refresh, lock, RPC change).
+        }
+        row.replaceWith(renderTokenRow({ ...result, state: "loaded" }));
+      })
+      .catch((error) => {
+        if (requestId !== tokenBalanceRequestId) {
+          return;
+        }
+        row.replaceWith(
+          renderTokenRow({
+            address: tokenAddress,
+            state: "error",
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      });
+  }
+}
+
+type TokenRowState =
+  | { address: Address; state: "loading" }
+  | { address: Address; state: "error"; message: string }
+  | { address: Address; state: "loaded"; symbol: string; decimals: number; balance: bigint };
+
+function renderTokenRow(row: TokenRowState): HTMLLIElement {
+  const item = document.createElement("li");
+  item.className = "token-balance-item";
+
+  if (row.state === "loading") {
+    item.textContent = "Loading…";
+    item.classList.add("hint");
+    return item;
+  }
+
+  if (row.state === "error") {
+    item.classList.add("error");
+    item.textContent = `${row.address}: could not read balance (${row.message})`;
+    return item;
+  }
+
+  const symbolEl = document.createElement("span");
+  symbolEl.className = "token-symbol";
+  symbolEl.textContent = row.symbol;
+  item.appendChild(symbolEl);
+
+  const amountEl = document.createElement("span");
+  amountEl.className = "token-amount";
+  // formatUnits, not formatEther — formatEther is fixed to 18 decimals,
+  // which is wrong for a token whose *actual, contract-reported* decimals
+  // (never assumed — see tokens.ts) differ, as most non-ETH tokens do.
+  amountEl.textContent = ` ${formatUnits(row.balance, row.decimals)}`;
+  item.appendChild(amountEl);
+
+  return item;
 }
 
 /**
@@ -839,11 +941,13 @@ async function lock() {
   await invoke("lock_wallet");
   unlockedAddress = null;
   balanceRequestId++; // Invalidate any balance fetch still in flight.
+  tokenBalanceRequestId++; // Invalidate any token-balance fetches still in flight.
   txHistoryRequestId++; // Invalidate any tx-history fetch still in flight.
   el("unlocked-address").textContent = "";
   el("balance-value").textContent = "";
   el("balance-value").classList.remove("loading");
   el("balance-error").textContent = "";
+  el("token-balance-list").replaceChildren();
   el("tx-history-status").textContent = "";
   el("tx-history-error").textContent = "";
   el("tx-history-empty").classList.add("hidden");

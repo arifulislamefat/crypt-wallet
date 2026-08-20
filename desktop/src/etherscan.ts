@@ -21,16 +21,44 @@ import type { Address } from "./sepolia";
  * The key is read from `VITE_ETHERSCAN_API_KEY` (a Vite build-time env var,
  * see `vite-env.d.ts` and the repo's `.env.example`) rather than hardcoded,
  * so swapping in a real key later — or rotating one — never touches this
- * file. `fetchSepoliaTransactions` fails fast with a clear message when it's
- * unset, instead of sending a doomed request.
+ * file. `fetchSepoliaTransactions` and `fetchSepoliaTokenTransfers` both
+ * fail fast with a clear message when it's unset, instead of sending a
+ * doomed request.
+ *
+ * ## Two endpoints, two different views of the same activity
+ *
+ * `txlist` (module=account, action=txlist) covers plain transactions: ETH
+ * value transfers, and any contract call this wallet's address itself sent
+ * (including an ERC-20 `transfer()` call — but only as a 0-ETH call to a
+ * contract, with no token details). It does NOT include a token transfer
+ * this wallet only *received*: an incoming `transfer()` is a transaction
+ * between two OTHER addresses (the sender and the token contract), so
+ * `txlist` filtered by our address never surfaces it at all.
+ *
+ * `tokentx` (module=account, action=tokentx) is indexed from the token
+ * contracts' own `Transfer` event logs, not raw transactions — it covers
+ * every ERC-20 transfer where our address is either side, sent or
+ * received, and comes with the token's symbol/decimals already attached
+ * (Etherscan's own indexed read of the contract, not re-verified against a
+ * live `eth_call` here — see `main.ts`'s `renderTokenTransferItem`, which
+ * prefers the app's own contract-read `tokenMetadataCache` over these
+ * fields when it's available, and falls back to them otherwise). It does
+ * NOT include a *failed* token-transfer transaction: a reverted call emits
+ * no event, so there's nothing for `tokentx` to index — that case only
+ * shows up via `txlist`, correctly marked `isError`.
+ *
+ * `main.ts`'s `fetchTxHistory` fetches both and merges them, preferring
+ * `tokentx`'s richer data for any hash it covers and falling back to
+ * `txlist` for everything else (plain ETH activity, and the failed-token-
+ * transfer edge case above).
  */
 const ETHERSCAN_API_BASE_URL = "https://api.etherscan.io/v2/api";
 const SEPOLIA_CHAIN_ID = 11155111;
 
 /**
- * Most recent transactions to request per fetch. This is a read-only
- * history view, not a full ledger export — 100 covers "what did I just do"
- * for a wallet this young without needing pagination UI yet.
+ * Most recent entries to request per fetch, for either endpoint. This is a
+ * read-only history view, not a full ledger export — 100 covers "what did I
+ * just do" for a wallet this young without needing pagination UI yet.
  */
 const MAX_RESULTS = 100;
 
@@ -71,12 +99,29 @@ export interface SepoliaTransaction {
   failed: boolean;
   /**
    * Raw calldata, `"0x"` for a plain value transfer. Kept so the history
-   * view can detect and label an ERC-20 `transfer()` call distinctly
-   * instead of showing it as a plain ETH send of 0 ETH (see
-   * `describeTokenTransfer` in `main.ts`) — the one field this app reads
-   * beyond what earlier balance/history work needed.
+   * view can detect and label an ERC-20 `transfer()` call this endpoint
+   * alone would otherwise show as a plain ETH send of 0 ETH — relevant now
+   * only for the failed-token-transfer edge case `tokentx` can't cover (see
+   * this module's top-level doc comment), since a successful one is
+   * rendered from `fetchSepoliaTokenTransfers` instead.
    */
   input: `0x${string}`;
+}
+
+/** One ERC-20 `Transfer` event involving our address, from the `tokentx` endpoint. */
+export interface TokenTransferEvent {
+  hash: `0x${string}`;
+  from: Address;
+  to: Address;
+  tokenAddress: Address;
+  /** Etherscan's own indexed value — see this module's top-level doc comment on when this is, and isn't, re-verified. */
+  tokenSymbol: string;
+  /** Etherscan's own indexed value — see this module's top-level doc comment on when this is, and isn't, re-verified. */
+  tokenDecimals: number;
+  /** Raw on-chain amount, in the token's smallest unit. */
+  amountRaw: bigint;
+  /** Unix seconds. */
+  timestamp: number;
 }
 
 /**
@@ -95,6 +140,42 @@ export interface SepoliaTransaction {
 export async function fetchSepoliaTransactions(
   address: Address,
 ): Promise<SepoliaTransaction[]> {
+  const raw = await fetchEtherscanList("txlist", address);
+  const transactions = raw.map(parseTransaction);
+  // Newest first is also requested via `sort=desc`, but sorted again here
+  // rather than trusted blind — cheap, and it's the property the UI
+  // actually depends on.
+  transactions.sort((a, b) => b.timestamp - a.timestamp);
+  return transactions;
+}
+
+/**
+ * Fetch every ERC-20 `Transfer` event involving `address` (module=account,
+ * action=tokentx), sent or received, newest first. Same two failure shapes
+ * and same "no history isn't an error" handling as `fetchSepoliaTransactions`
+ * — both endpoints share `fetchEtherscanList` for exactly this reason.
+ */
+export async function fetchSepoliaTokenTransfers(
+  address: Address,
+): Promise<TokenTransferEvent[]> {
+  const raw = await fetchEtherscanList("tokentx", address);
+  const events = raw.map(parseTokenTransferEvent);
+  events.sort((a, b) => b.timestamp - a.timestamp);
+  return events;
+}
+
+/**
+ * Shared plumbing for both endpoints: build the request, enforce the
+ * timeout, and unwrap Etherscan's `{status, message, result}` envelope down
+ * to the raw `result` array — everything both `txlist` and `tokentx` share
+ * byte-for-byte except the `action` param and how each entry in `result` is
+ * parsed, which stay in `fetchSepoliaTransactions`/`fetchSepoliaTokenTransfers`
+ * and their respective per-entry parsers.
+ */
+async function fetchEtherscanList(
+  action: "txlist" | "tokentx",
+  address: Address,
+): Promise<unknown[]> {
   if (!hasEtherscanApiKey()) {
     throw new EtherscanConfigError(
       "No Etherscan API key is configured (set VITE_ETHERSCAN_API_KEY in .env).",
@@ -104,7 +185,7 @@ export async function fetchSepoliaTransactions(
   const url = new URL(ETHERSCAN_API_BASE_URL);
   url.searchParams.set("chainid", String(SEPOLIA_CHAIN_ID));
   url.searchParams.set("module", "account");
-  url.searchParams.set("action", "txlist");
+  url.searchParams.set("action", action);
   url.searchParams.set("address", address);
   url.searchParams.set("startblock", "0");
   url.searchParams.set("endblock", "99999999");
@@ -151,12 +232,7 @@ export async function fetchSepoliaTransactions(
     throw new EtherscanApiError("Etherscan returned an unrecognized response shape.");
   }
 
-  const transactions = body.result.map(parseTransaction);
-  // Newest first is also requested via `sort=desc`, but sorted again here
-  // rather than trusted blind — cheap, and it's the property the UI
-  // actually depends on.
-  transactions.sort((a, b) => b.timestamp - a.timestamp);
-  return transactions;
+  return body.result;
 }
 
 interface EtherscanEnvelope {
@@ -179,9 +255,10 @@ function isEtherscanEnvelope(value: unknown): value is EtherscanEnvelope {
 
 /**
  * A raw `txlist` result-array entry has many more fields than this app uses
- * (gas, nonce, method ID, ...); only what's actually displayed — now
- * including `input`, needed to detect a token transfer — is validated and
- * kept, so a shape change in the fields we still ignore can't break this.
+ * (gas, nonce, method ID, ...); only what's actually displayed — including
+ * `input`, needed to detect the failed-token-transfer edge case — is
+ * validated and kept, so a shape change in the fields we still ignore can't
+ * break this.
  */
 function parseTransaction(raw: unknown): SepoliaTransaction {
   if (typeof raw !== "object" || raw === null) {
@@ -216,6 +293,51 @@ function parseTransaction(raw: unknown): SepoliaTransaction {
     timestamp: Number(timeStamp),
     failed: isError === "1",
     input: (input === "" ? "0x" : input) as `0x${string}`,
+  };
+}
+
+/**
+ * A raw `tokentx` result-array entry, similarly trimmed to only the fields
+ * this app displays (contractAddress, value, tokenSymbol, tokenDecimal,
+ * from/to/hash/timeStamp) out of the many `tokentx` also returns (gas,
+ * nonce, confirmations, tokenName, ...).
+ */
+function parseTokenTransferEvent(raw: unknown): TokenTransferEvent {
+  if (typeof raw !== "object" || raw === null) {
+    throw new EtherscanApiError("Etherscan returned a malformed token-transfer entry.");
+  }
+  const entry = raw as Record<string, unknown>;
+  const hash = entry.hash;
+  const from = entry.from;
+  const to = entry.to;
+  const contractAddress = entry.contractAddress;
+  const value = entry.value;
+  const tokenSymbol = entry.tokenSymbol;
+  const tokenDecimal = entry.tokenDecimal;
+  const timeStamp = entry.timeStamp;
+
+  if (
+    typeof hash !== "string" ||
+    typeof from !== "string" ||
+    typeof to !== "string" ||
+    typeof contractAddress !== "string" ||
+    typeof value !== "string" ||
+    typeof tokenSymbol !== "string" ||
+    typeof tokenDecimal !== "string" ||
+    typeof timeStamp !== "string"
+  ) {
+    throw new EtherscanApiError("Etherscan returned a malformed token-transfer entry.");
+  }
+
+  return {
+    hash: hash as `0x${string}`,
+    from: from as Address,
+    to: to as Address,
+    tokenAddress: contractAddress as Address,
+    tokenSymbol,
+    tokenDecimals: Number(tokenDecimal),
+    amountRaw: BigInt(value),
+    timestamp: Number(timeStamp),
   };
 }
 

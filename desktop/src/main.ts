@@ -18,9 +18,11 @@ import {
 import {
   EtherscanApiError,
   EtherscanConfigError,
+  fetchSepoliaTokenTransfers,
   fetchSepoliaTransactions,
   sepoliaExplorerTxUrl,
   type SepoliaTransaction,
+  type TokenTransferEvent,
 } from "./etherscan";
 
 /**
@@ -686,13 +688,31 @@ function renderTokenRow(row: TokenRowState): HTMLLIElement {
   return item;
 }
 
+/** Turn a caught fetch error into the message this app shows for it, uniformly wherever history reports a failure. */
+function describeEtherscanError(error: unknown): string {
+  if (error instanceof EtherscanConfigError) {
+    return `unavailable: ${error.message}`;
+  }
+  if (error instanceof EtherscanApiError) {
+    return error.message;
+  }
+  return String(error);
+}
+
 /**
- * Fetch and render `activeAccountAddress`'s Sepolia transaction history.
+ * Fetch and render `activeAccountAddress`'s Sepolia transaction history,
+ * merging two Etherscan endpoints (see the top-level doc comment in
+ * `etherscan.ts` for why both are needed): `txlist` for plain ETH activity,
+ * `tokentx` for ERC-20 transfers sent OR received. The two are fetched
+ * concurrently and independently — one failing must not hide the other's
+ * data.
  *
  * Three end states, kept visually distinct rather than collapsed into one
  * blank-or-generic screen: a genuine empty history (new wallet, nothing
- * sent or received yet), an error (API unreachable, rate-limited, or
- * unconfigured), and the populated list.
+ * sent or received yet), an error (both sources unreachable, rate-limited,
+ * or unconfigured), and the populated list. A fourth, partial-failure case
+ * — one source loaded, the other didn't — still shows whatever data loaded,
+ * with a non-blocking note rather than hiding it behind a full error state.
  */
 async function fetchTxHistory() {
   const statusEl = el("tx-history-status");
@@ -704,6 +724,7 @@ async function fetchTxHistory() {
   if (!activeAccountAddress) {
     return;
   }
+  const address = activeAccountAddress;
 
   const requestId = ++txHistoryRequestId;
   errorEl.textContent = "";
@@ -712,10 +733,11 @@ async function fetchTxHistory() {
   statusEl.textContent = "Loading transaction history…";
   refreshBtn.disabled = true;
 
-  // Best-effort warm-up so a token-transfer row (see describeTokenTransfer)
-  // can usually render its real symbol/decimals without an extra fetch of
-  // its own. Never blocks or fails history loading: a rejected token-info
-  // read here just means those rows fall back to a raw-units display.
+  // Best-effort warm-up so a token-transfer row (from either source) can
+  // usually render its real symbol/decimals without an extra fetch of its
+  // own. Never blocks or fails history loading: a rejected token-info read
+  // here just means those rows fall back to a raw-units or Etherscan-
+  // reported display instead of this app's own contract-read one.
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
   if (rpcUrl) {
     const client = sepoliaClient(rpcUrl);
@@ -731,29 +753,39 @@ async function fetchTxHistory() {
   }
 
   try {
-    const transactions = await fetchSepoliaTransactions(activeAccountAddress);
+    const [txResult, tokenResult] = await Promise.allSettled([
+      fetchSepoliaTransactions(address),
+      fetchSepoliaTokenTransfers(address),
+    ]);
 
     if (requestId !== txHistoryRequestId) {
       return; // Superseded by a newer request; drop this result.
     }
     statusEl.textContent = "";
 
-    if (transactions.length === 0) {
+    if (txResult.status === "rejected" && tokenResult.status === "rejected") {
+      errorEl.textContent = `Could not load transaction history: ${describeEtherscanError(txResult.reason)}`;
+      return;
+    }
+
+    const transactions = txResult.status === "fulfilled" ? txResult.value : [];
+    const tokenTransfers = tokenResult.status === "fulfilled" ? tokenResult.value : [];
+    const merged = mergeHistory(transactions, tokenTransfers);
+
+    if (merged.length === 0) {
       emptyEl.classList.remove("hidden");
-      return;
-    }
-    renderTxHistory(transactions);
-  } catch (error) {
-    if (requestId !== txHistoryRequestId) {
-      return;
-    }
-    statusEl.textContent = "";
-    if (error instanceof EtherscanConfigError) {
-      errorEl.textContent = `Transaction history is unavailable: ${error.message}`;
-    } else if (error instanceof EtherscanApiError) {
-      errorEl.textContent = `Could not load transaction history: ${error.message}`;
     } else {
-      errorEl.textContent = `Could not load transaction history: ${String(error)}`;
+      renderTxHistory(merged);
+    }
+
+    // One source failed, the other didn't: the data that DID load is still
+    // shown above (or the empty state, if the successful source really was
+    // empty) — this is a note about possible incompleteness, not a reason
+    // to hide what loaded.
+    if (txResult.status === "rejected") {
+      errorEl.textContent = `Some history may be missing: ${describeEtherscanError(txResult.reason)}`;
+    } else if (tokenResult.status === "rejected") {
+      errorEl.textContent = `Token transfers may be missing: ${describeEtherscanError(tokenResult.reason)}`;
     }
   } finally {
     if (requestId === txHistoryRequestId) {
@@ -762,12 +794,57 @@ async function fetchTxHistory() {
   }
 }
 
-function renderTxHistory(transactions: SepoliaTransaction[]) {
+/** One row's worth of already-decided display data, independent of which Etherscan endpoint it came from. */
+interface HistoryItem {
+  hash: string;
+  timestamp: number;
+  render: () => HTMLLIElement;
+}
+
+/**
+ * Merge `txlist` and `tokentx` results into one newest-first list, with
+ * `tokentx` treated as authoritative for any hash it covers (per the task
+ * this feature implements: it has the real token details `txlist` alone
+ * can't provide) — so a `txlist` entry is dropped whenever its hash also
+ * appears in `tokentx`, to avoid showing the same transaction twice.
+ *
+ * This does NOT lose the failed-token-transfer edge case: a reverted
+ * `transfer()` call emits no `Transfer` event, so it never appears in
+ * `tokentx` at all, meaning its hash was never in `tokenHashes` to begin
+ * with — that entry passes through from `transactions` untouched and is
+ * still rendered by `renderTxHistoryItem`'s own `describeTokenTransfer`
+ * detection (see that function), just correctly marked "Failed" rather
+ * than misrepresented as a mystery 0-ETH send.
+ */
+function mergeHistory(
+  transactions: SepoliaTransaction[],
+  tokenTransfers: TokenTransferEvent[],
+): HistoryItem[] {
+  const tokenHashes = new Set(tokenTransfers.map((t) => t.hash.toLowerCase()));
+
+  const items: HistoryItem[] = tokenTransfers.map((event) => ({
+    hash: event.hash,
+    timestamp: event.timestamp,
+    render: () => renderTokenTransferItem(event),
+  }));
+
+  for (const tx of transactions) {
+    if (tokenHashes.has(tx.hash.toLowerCase())) {
+      continue; // tokentx already represents this hash, with the real token details.
+    }
+    items.push({ hash: tx.hash, timestamp: tx.timestamp, render: () => renderTxHistoryItem(tx) });
+  }
+
+  items.sort((a, b) => b.timestamp - a.timestamp);
+  return items;
+}
+
+function renderTxHistory(items: HistoryItem[]) {
   const listEl = el("tx-history-list");
   listEl.replaceChildren();
 
-  for (const tx of transactions) {
-    listEl.appendChild(renderTxHistoryItem(tx));
+  for (const item of items) {
+    listEl.appendChild(item.render());
   }
 }
 
@@ -783,15 +860,12 @@ interface TokenTransferDescription {
  * `null` (a plain value transfer, or a call to some other contract/function
  * this app doesn't render specially).
  *
- * Etherscan's `txlist` only ever returns a transaction shaped like this
- * for transfers **we sent**: its `to` is the token contract, never our own
- * address, so the only way such a row appears in our own history query is
- * `tx.from` being us. An incoming token transfer (someone else calling
- * `transfer()` with our address as the recipient) does NOT appear in
- * `txlist` at all — Etherscan only surfaces that via the separate `tokentx`
- * endpoint (indexed from the token's own `Transfer` event logs), which this
- * app doesn't query. Known, accepted gap: this detects and correctly labels
- * every token transfer this wallet sends, not ones it receives.
+ * By the time this runs, `mergeHistory` has already dropped every `txlist`
+ * entry whose hash is also in `tokentx` — so a token-shaped transaction
+ * reaching this function is specifically the case `tokentx` can't cover: a
+ * *failed* transfer() call, which reverted before emitting a `Transfer`
+ * event and so was never indexed there. A successful send is rendered via
+ * `renderTokenTransferItem` instead, from the richer `tokentx` data.
  */
 function describeTokenTransfer(tx: SepoliaTransaction): TokenTransferDescription | null {
   if (tx.to === null) {
@@ -813,13 +887,76 @@ function describeTokenTransfer(tx: SepoliaTransaction): TokenTransferDescription
   }
 }
 
+/**
+ * Shared DOM structure for one history row, independent of which Etherscan
+ * endpoint (or which branch of `renderTxHistoryItem`) produced its fields —
+ * one place building the summary/other-party/timestamp/explorer-link
+ * layout, so `renderTxHistoryItem` and `renderTokenTransferItem` can't
+ * silently drift into two different-looking row shapes.
+ */
+function renderHistoryRow(row: {
+  direction: string;
+  amountDisplay: string;
+  status: { label: string; failed: boolean };
+  otherPartyDisplay: string;
+  timestamp: number;
+  hash: string;
+}): HTMLLIElement {
+  const item = document.createElement("li");
+  item.className = "tx-history-item";
+
+  const summary = document.createElement("div");
+  summary.className = "tx-history-summary";
+
+  const directionEl = document.createElement("span");
+  directionEl.className = `tx-direction tx-direction-${row.direction.toLowerCase()}`;
+  directionEl.textContent = row.direction;
+  summary.appendChild(directionEl);
+
+  const amountEl = document.createElement("span");
+  amountEl.className = "tx-amount";
+  amountEl.textContent = row.amountDisplay;
+  summary.appendChild(amountEl);
+
+  const statusEl = document.createElement("span");
+  statusEl.className = `tx-status ${row.status.failed ? "tx-status-failed" : "tx-status-success"}`;
+  statusEl.textContent = row.status.label;
+  summary.appendChild(statusEl);
+
+  item.appendChild(summary);
+
+  const otherPartyEl = document.createElement("p");
+  otherPartyEl.className = "address tx-other-party";
+  otherPartyEl.textContent = row.otherPartyDisplay;
+  item.appendChild(otherPartyEl);
+
+  const timeEl = document.createElement("p");
+  timeEl.className = "hint tx-timestamp";
+  timeEl.textContent = new Date(row.timestamp * 1000).toLocaleString();
+  item.appendChild(timeEl);
+
+  const viewBtn = document.createElement("button");
+  viewBtn.type = "button";
+  viewBtn.textContent = "View on explorer";
+  viewBtn.addEventListener("click", () => {
+    // Opened in the system's default browser (Tauri's opener plugin), not
+    // an in-app view — the whole point is letting the user independently
+    // verify what this app shows them, on a page this app doesn't control.
+    void openUrl(sepoliaExplorerTxUrl(row.hash));
+  });
+  item.appendChild(viewBtn);
+
+  return item;
+}
+
 function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
   const address = activeAccountAddress as Address;
   const tokenTransfer = describeTokenTransfer(tx);
 
-  // A token-transfer row is always a send (see describeTokenTransfer's doc
-  // comment for why "received" can't happen here) — direction is decided
-  // before the general from/to comparison below even runs for this case.
+  // A token-transfer row reaching this function is always the
+  // failed-transfer edge case (see describeTokenTransfer's doc comment) —
+  // and a failed call, from this wallet's own account, is always a "Sent"
+  // in intent even though it never actually moved anything.
   let direction: string;
   let otherParty: string;
   let amountDisplay: string;
@@ -855,52 +992,61 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
     amountDisplay = `${formatEther(tx.valueWei)} ETH`;
   }
 
-  const item = document.createElement("li");
-  item.className = "tx-history-item";
-
-  const summary = document.createElement("div");
-  summary.className = "tx-history-summary";
-
-  const directionEl = document.createElement("span");
-  directionEl.className = `tx-direction tx-direction-${direction.toLowerCase()}`;
-  directionEl.textContent = direction;
-  summary.appendChild(directionEl);
-
-  const amountEl = document.createElement("span");
-  amountEl.className = "tx-amount";
-  amountEl.textContent = amountDisplay;
-  summary.appendChild(amountEl);
-
-  const statusEl = document.createElement("span");
-  statusEl.className = `tx-status ${tx.failed ? "tx-status-failed" : "tx-status-success"}`;
-  statusEl.textContent = tx.failed ? "Failed" : "Success";
-  summary.appendChild(statusEl);
-
-  item.appendChild(summary);
-
-  const otherPartyEl = document.createElement("p");
-  otherPartyEl.className = "address tx-other-party";
-  otherPartyEl.textContent =
-    direction === "Self" ? "This wallet's own address" : otherParty;
-  item.appendChild(otherPartyEl);
-
-  const timeEl = document.createElement("p");
-  timeEl.className = "hint tx-timestamp";
-  timeEl.textContent = new Date(tx.timestamp * 1000).toLocaleString();
-  item.appendChild(timeEl);
-
-  const viewBtn = document.createElement("button");
-  viewBtn.type = "button";
-  viewBtn.textContent = "View on explorer";
-  viewBtn.addEventListener("click", () => {
-    // Opened in the system's default browser (Tauri's opener plugin), not
-    // an in-app view — the whole point is letting the user independently
-    // verify what this app shows them, on a page this app doesn't control.
-    void openUrl(sepoliaExplorerTxUrl(tx.hash));
+  return renderHistoryRow({
+    direction,
+    amountDisplay,
+    status: { label: tx.failed ? "Failed" : "Success", failed: tx.failed },
+    otherPartyDisplay: direction === "Self" ? "This wallet's own address" : otherParty,
+    timestamp: tx.timestamp,
+    hash: tx.hash,
   });
-  item.appendChild(viewBtn);
+}
 
-  return item;
+/**
+ * Render one `tokentx`-sourced row — a successful ERC-20 transfer, sent OR
+ * received (unlike `renderTxHistoryItem`'s token-transfer branch, which can
+ * only ever be a failed send — see that function's doc comment). A
+ * `tokentx` entry has no separate failed/success state to report: a
+ * reverted call emits no `Transfer` event, so every event this endpoint
+ * returns already represents a transfer that genuinely happened.
+ */
+function renderTokenTransferItem(event: TokenTransferEvent): HTMLLIElement {
+  const address = activeAccountAddress as Address;
+  const isFromUs = event.from.toLowerCase() === address.toLowerCase();
+  const isToUs = event.to.toLowerCase() === address.toLowerCase();
+
+  let direction: string;
+  let otherParty: string;
+  if (isFromUs && isToUs) {
+    direction = "Self";
+    otherParty = address;
+  } else if (isFromUs) {
+    direction = "Sent";
+    otherParty = event.to;
+  } else {
+    direction = "Received";
+    otherParty = event.from;
+  }
+
+  // Prefers this app's own contract-read metadata (from balance fetches or
+  // the send flow's token selector) over Etherscan's self-reported
+  // tokenSymbol/tokenDecimal fields when available -- consistent with this
+  // codebase's rule of never trusting a single source for decimals where
+  // avoidable. Falls back to Etherscan's values rather than blocking
+  // render on a fetch of its own; see etherscan.ts's top-level doc comment
+  // on why that fallback is still reasonably trustworthy.
+  const metadata = tokenMetadataCache.get(event.tokenAddress);
+  const decimals = metadata?.decimals ?? event.tokenDecimals;
+  const symbol = metadata?.symbol ?? event.tokenSymbol;
+
+  return renderHistoryRow({
+    direction,
+    amountDisplay: `${formatUnits(event.amountRaw, decimals)} ${symbol}`,
+    status: { label: "Success", failed: false },
+    otherPartyDisplay: direction === "Self" ? "This wallet's own address" : otherParty,
+    timestamp: event.timestamp,
+    hash: event.hash,
+  });
 }
 
 /**

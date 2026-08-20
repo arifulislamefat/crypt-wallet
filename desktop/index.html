@@ -34,7 +34,10 @@
       <!-- Unlocked session -->
       <section id="step-unlocked" class="step hidden">
         <h2>Wallet unlocked</h2>
-        <p class="hint">Your first account address:</p>
+
+        <label for="account-select" class="hint">Active account</label>
+        <select id="account-select" class="account-select"></select>
+        <p id="account-list-error" class="error"></p>
         <p id="unlocked-address" class="address"></p>
 
         <fieldset class="balance-section">
@@ -76,16 +79,18 @@
         </div>
       </section>
 
-      <!-- Send step 1: amount, fixed recipient (account 2 of this wallet) -->
+      <!-- Send step 1: amount, destination restricted to the wallet's own other accounts -->
       <section id="step-send" class="step hidden">
         <h2>Send Sepolia ETH</h2>
         <p class="hint">
-          Sending to <strong>Account 2</strong> of this wallet — a second
-          address this wallet already controls, so this first real transfer
-          can't move funds anywhere the user doesn't already hold them.
-          Sending to any other address is a later step.
+          Choose which of your own accounts to send to — this wallet already
+          controls every address below, so this can't move funds anywhere
+          the user doesn't already hold them. Sending to any other address
+          is a later step, with its own address-entry validation UX.
         </p>
-        <p id="send-recipient" class="address"></p>
+
+        <label for="send-recipient-select" class="hint rpc-label">Destination account</label>
+        <select id="send-recipient-select" class="account-select"></select>
 
         <label for="send-amount" class="hint rpc-label">Amount (ETH)</label>
         <input id="send-amount" type="text" inputmode="decimal" spellcheck="false" placeholder="0.0" />

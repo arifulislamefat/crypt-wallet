@@ -117,7 +117,7 @@ fn shuffled_indices(len: usize) -> Vec<usize> {
 
 /// An unlocked wallet: the mnemonic plus when the session began.
 struct UnlockedSession {
-    // Read by get_second_account_address and sign_transaction to re-derive
+    // Read by get_account_address and sign_transaction to re-derive
     // account keys on demand, and held (rather than a derived key) for the
     // not-yet-built authenticated reveal/export flow (spec §D.5) too. The
     // idle timeout and window-event clears exist so that neither use finds
@@ -621,19 +621,27 @@ fn confirm_and_seal_impl(
     result
 }
 
-/// The address of EVM account index 1 ("Account 2") for the currently
-/// unlocked wallet — the fixed send destination for the first real-
-/// transaction test. Sending between two addresses this wallet itself
-/// controls means a signing or broadcast mistake can't move funds anywhere
-/// the user doesn't already hold them; free-form recipients are a later
-/// step with their own address-entry validation UX.
+/// The checksummed address for EVM account `index` of the currently
+/// unlocked wallet, powering the frontend's account switcher and its send-
+/// destination picker. Requires an unlocked session — an address derived
+/// from a mnemonic that isn't in memory can't be returned.
+///
+/// Bounds checking is deliberately NOT duplicated here: `EvmAccountKey::derive`
+/// already rejects `index >= 2^31` (the hardened-key range) with
+/// `DerivationError::IndexOutOfRange` — see `crypto/src/derivation.rs`. This
+/// command just maps that existing rejection to the same string-error
+/// convention every other command in this module uses. The frontend also
+/// caps how many indices it will ever ask for (`MAX_ACCOUNTS` in
+/// `main.ts`) — an open-ended "derive account #4 billion" isn't something
+/// the UI invites, even though this command would reject it safely on its
+/// own.
 #[tauri::command]
-fn get_second_account_address(unlocked: State<'_, UnlockedWallet>) -> Result<String, String> {
-    get_second_account_address_impl(&unlocked)
+fn get_account_address(index: u32, unlocked: State<'_, UnlockedWallet>) -> Result<String, String> {
+    get_account_address_impl(index, &unlocked)
 }
 
-/// The testable core of [`get_second_account_address`].
-fn get_second_account_address_impl(unlocked: &UnlockedWallet) -> Result<String, String> {
+/// The testable core of [`get_account_address`].
+fn get_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Result<String, String> {
     let guard = unlocked
         .0
         .lock()
@@ -641,14 +649,21 @@ fn get_second_account_address_impl(unlocked: &UnlockedWallet) -> Result<String, 
     let session = guard.as_ref().ok_or("wallet is locked")?;
 
     let seed = session.mnemonic.to_seed("");
-    let account = EvmAccountKey::derive(&seed, 1)
-        .map_err(|_| "failed to derive the second account".to_string())?;
+    let account = EvmAccountKey::derive(&seed, index)
+        .map_err(|_| "failed to derive the requested account".to_string())?;
     Ok(account.address().to_checksummed_hex())
 }
 
-/// Sign an EIP-1559 Sepolia transaction sending from account 0 of the
-/// currently-unlocked wallet, and return the raw signed transaction as a
+/// Sign an EIP-1559 Sepolia transaction sending from account `from_index` of
+/// the currently-unlocked wallet, and return the raw signed transaction as a
 /// `0x`-prefixed hex string, ready for `eth_sendRawTransaction`.
+///
+/// `from_index` is which of the wallet's own accounts the frontend's account
+/// switcher currently has active — this used to be hardcoded to account 0,
+/// back when only one account was ever exposed; now that the UI can select
+/// any derived account, signing has to follow it. Bounds checking is the
+/// same story as [`get_account_address`]: not duplicated here, because
+/// `EvmAccountKey::derive` below already rejects an out-of-range index.
 ///
 /// Does NOT broadcast. Signing and broadcasting are deliberately separate:
 /// the frontend already owns RPC communication via `viem`, and duplicating
@@ -679,6 +694,7 @@ fn sign_transaction(
     max_priority_fee_per_gas: String,
     gas_limit: u64,
     chain_id: u64,
+    from_index: u32,
     unlocked: State<'_, UnlockedWallet>,
 ) -> Result<String, String> {
     sign_transaction_impl(
@@ -690,6 +706,7 @@ fn sign_transaction(
         &max_priority_fee_per_gas,
         gas_limit,
         chain_id,
+        from_index,
     )
 }
 
@@ -704,6 +721,7 @@ fn sign_transaction_impl(
     max_priority_fee_per_gas: &str,
     gas_limit: u64,
     chain_id: u64,
+    from_index: u32,
 ) -> Result<String, String> {
     if chain_id != SEPOLIA_CHAIN_ID {
         return Err(format!(
@@ -747,7 +765,7 @@ fn sign_transaction_impl(
     let session = guard.as_ref().ok_or("wallet is locked")?;
 
     let seed = session.mnemonic.to_seed("");
-    let account = EvmAccountKey::derive(&seed, 0)
+    let account = EvmAccountKey::derive(&seed, from_index)
         .map_err(|_| "failed to derive the sending account".to_string())?;
 
     // Only the raw signed bytes leave this closure — the signing key
@@ -776,8 +794,8 @@ fn sign_transaction_impl(
 
         // Self-check before this ever leaves the process: recover the
         // signer from the signature this same call just produced, and
-        // confirm it's actually account 0. A signature that doesn't
-        // recover to the account that supposedly made it is not a
+        // confirm it's actually account `from_index`. A signature that
+        // doesn't recover to the account that supposedly made it is not a
         // transaction that should ever be returned for broadcast,
         // regardless of what upstream produced it.
         let recovered = alloy_signature
@@ -920,7 +938,7 @@ pub fn run() {
         wallet_exists,
         unlock_wallet,
         lock_wallet,
-        get_second_account_address,
+        get_account_address,
         sign_transaction
     ]);
     #[cfg(not(debug_assertions))]
@@ -930,7 +948,7 @@ pub fn run() {
         wallet_exists,
         unlock_wallet,
         lock_wallet,
-        get_second_account_address,
+        get_account_address,
         sign_transaction
     ]);
 
@@ -1022,7 +1040,7 @@ mod tests {
         // guaranteed well-formed and correctly checksummed by our own
         // (EIP-55-vector-tested) implementation, rather than a hand-typed
         // literal whose checksum casing this test would be trusting blind.
-        let recipient = get_second_account_address_impl(&unlocked).expect("derive account 1");
+        let recipient = get_account_address_impl(1, &unlocked).expect("derive account 1");
 
         let raw_hex = sign_transaction_impl(
             &unlocked,
@@ -1033,6 +1051,7 @@ mod tests {
             "1000000000",  // 1 gwei
             21000,
             SEPOLIA_CHAIN_ID,
+            0, // from account 0, matching `expected_address` above
         )
         .expect("signing should succeed");
 
@@ -1089,6 +1108,7 @@ mod tests {
             "0",
             21000,
             1, // Ethereum mainnet, not Sepolia -- must be refused
+            0,
         );
 
         let error = result.expect_err("a non-Sepolia chain id must be rejected");
@@ -1113,8 +1133,17 @@ mod tests {
             "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
         ];
         for bad in malformed {
-            let result =
-                sign_transaction_impl(&unlocked, bad, "0", 0, "0", "0", 21000, SEPOLIA_CHAIN_ID);
+            let result = sign_transaction_impl(
+                &unlocked,
+                bad,
+                "0",
+                0,
+                "0",
+                "0",
+                21000,
+                SEPOLIA_CHAIN_ID,
+                0,
+            );
             assert!(result.is_err(), "expected {bad:?} to be rejected");
         }
 
@@ -1133,11 +1162,49 @@ mod tests {
             "0",
             21000,
             SEPOLIA_CHAIN_ID,
+            0,
         );
         assert!(
             result.is_err(),
             "an unchecksummed (all-lowercase) address must be rejected, not silently accepted"
         );
+    }
+
+    #[test]
+    fn get_account_address_matches_direct_derivation_and_varies_by_index() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        let expected_0 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            EvmAccountKey::derive(&seed, 0)
+                .expect("derive account 0")
+                .address()
+                .to_checksummed_hex()
+        };
+
+        let account_0 = get_account_address_impl(0, &unlocked).expect("derive account 0");
+        let account_1 = get_account_address_impl(1, &unlocked).expect("derive account 1");
+
+        assert_eq!(account_0, expected_0, "must match direct derivation, not just be well-formed");
+        assert_ne!(account_0, account_1, "different indices must derive different addresses");
+    }
+
+    #[test]
+    fn get_account_address_requires_an_unlocked_session() {
+        let unlocked = UnlockedWallet::default();
+        let error = get_account_address_impl(0, &unlocked).expect_err("locked wallet must refuse");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn get_account_address_rejects_the_hardened_range() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        // Relies on the same bounds check `EvmAccountKey::derive` already
+        // enforces (see crypto/src/derivation.rs) rather than a second copy
+        // of the `>= 2^31` comparison here.
+        let result = get_account_address_impl(0x8000_0000, &unlocked);
+        assert!(result.is_err(), "hardened-range index must be rejected");
     }
 
     #[test]

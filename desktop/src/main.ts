@@ -20,7 +20,8 @@ import {
 /**
  * Fixed intrinsic gas cost of a plain ETH transfer to an externally-owned
  * account (no contract call, no calldata) — a protocol constant (EIP-2's
- * G_transaction base cost), not an estimate. Account 2 of this wallet is
+ * G_transaction base cost), not an estimate. Every send destination the UI
+ * currently offers is another derived account of this same wallet, i.e.
  * exactly that: a plain EOA. Nothing here calls `estimateGas`, because
  * there is nothing to estimate for this specific, fixed shape of
  * transaction.
@@ -72,10 +73,38 @@ let bank: number[] = [];
 let selectedSlots: number[] = [];
 
 /**
- * The unlocked wallet's account-0 address — public data, freely usable for
- * a read-only balance query. Set on unlock, cleared on lock.
+ * How many of the wallet's accounts the switcher derives and shows. Not a
+ * protocol limit — the backend's `get_account_address` accepts any
+ * non-hardened index — just a deliberate cap on what the UI exposes today,
+ * so an open-ended "derive account #4 billion" input isn't something a user
+ * can drive from here yet.
  */
-let unlockedAddress: Address | null = null;
+const MAX_ACCOUNTS = 5;
+
+interface WalletAccount {
+  index: number;
+  address: Address;
+}
+
+/**
+ * Every account the switcher currently knows about, derived once per
+ * unlock (see `loadAccounts`) via `MAX_ACCOUNTS` calls to
+ * `get_account_address` — not re-derived on every read, since derivation
+ * only depends on the mnemonic already in the backend's session and can't
+ * change mid-session.
+ */
+let accounts: WalletAccount[] = [];
+
+/** Which account in `accounts` is currently selected in the switcher. */
+let activeAccountIndex = 0;
+
+/**
+ * `accounts[activeAccountIndex].address` — public data, freely usable for
+ * a read-only balance query. Balance, token balances, and transaction
+ * history all follow this, not a fixed account. Set on unlock and on every
+ * switcher change, cleared on lock.
+ */
+let activeAccountAddress: Address | null = null;
 
 /**
  * Bumped at the start of every balance fetch; a response only gets applied
@@ -133,7 +162,7 @@ function clearSendState() {
 }
 
 /**
- * Exact error string the backend returns from `get_second_account_address`
+ * Exact error string the backend returns from `get_account_address`
  * and `sign_transaction` when `UnlockedWallet` has no session — kept in
  * sync by hand with `"wallet is locked"` in `desktop/src-tauri/src/lib.rs`.
  *
@@ -351,7 +380,81 @@ async function confirmAndSeal() {
 }
 
 /**
- * Fetch and render the Sepolia ETH balance for `unlockedAddress`, using
+ * Derive and render every account up to `MAX_ACCOUNTS`, called once right
+ * after `unlock_wallet` succeeds. Populates `accounts`, resets the switcher
+ * to account 0, and kicks off the first balance/history fetch for it.
+ *
+ * A failure partway through (a locked session — shouldn't happen this soon
+ * after unlocking, but the idle sweeper is a background thread and could in
+ * principle race it — or some other backend error) reports itself and
+ * leaves `accounts` as whatever was derived so far, rather than presenting
+ * a switcher with silently-missing entries.
+ */
+async function loadAccounts() {
+  const errorEl = el("account-list-error");
+  const select = el<HTMLSelectElement>("account-select");
+  errorEl.textContent = "";
+  accounts = [];
+  select.replaceChildren();
+  select.disabled = true;
+
+  try {
+    for (let index = 0; index < MAX_ACCOUNTS; index++) {
+      const address = await invoke<string>("get_account_address", { index });
+      accounts.push({ index, address: address as Address });
+    }
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    errorEl.textContent = `Could not derive accounts: ${String(error)}`;
+  } finally {
+    select.disabled = false;
+  }
+
+  if (accounts.length === 0) {
+    return;
+  }
+
+  renderAccountSelect();
+  switchActiveAccount(0);
+}
+
+function renderAccountSelect() {
+  const select = el<HTMLSelectElement>("account-select");
+  select.replaceChildren();
+  for (const account of accounts) {
+    const option = document.createElement("option");
+    option.value = String(account.index);
+    option.textContent = `Account ${account.index + 1} — ${account.address}`;
+    select.appendChild(option);
+  }
+}
+
+/**
+ * Make `index` the active account: updates `activeAccountIndex` and
+ * `activeAccountAddress`, reflects the choice in the switcher (in case this
+ * was called programmatically rather than from the switcher's own `change`
+ * event), and refreshes balance/token-balance/transaction-history for the
+ * newly active account — those three all key off `activeAccountAddress`
+ * already, so no separate "which account" plumbing is needed there.
+ */
+function switchActiveAccount(index: number) {
+  const account = accounts.find((a) => a.index === index);
+  if (!account) {
+    return;
+  }
+  activeAccountIndex = account.index;
+  activeAccountAddress = account.address;
+  el("unlocked-address").textContent = account.address;
+  el<HTMLSelectElement>("account-select").value = String(account.index);
+  void fetchBalance();
+  void fetchTxHistory();
+}
+
+/**
+ * Fetch and render the Sepolia ETH balance for `activeAccountAddress`, using
  * whatever RPC URL is currently in the override field.
  *
  * No secret material anywhere in this path: an address and a balance are
@@ -364,7 +467,7 @@ async function fetchBalance() {
   const refreshBtn = el<HTMLButtonElement>("refresh-balance-btn");
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
 
-  if (!unlockedAddress) {
+  if (!activeAccountAddress) {
     return;
   }
 
@@ -410,7 +513,7 @@ async function fetchBalance() {
 
   try {
     const balanceWei = await sepoliaClient(rpcUrl).getBalance({
-      address: unlockedAddress,
+      address: activeAccountAddress,
     });
 
     if (requestId !== balanceRequestId) {
@@ -442,7 +545,7 @@ async function fetchBalance() {
 
 /**
  * Fetch and render each token in `SEPOLIA_TOKENS`'s balance for
- * `unlockedAddress`, over `rpcUrl` (already validated by the caller —
+ * `activeAccountAddress`, over `rpcUrl` (already validated by the caller —
  * `fetchBalance` — against `ALLOWED_RPC_ORIGINS`, so this trusts it as-is
  * rather than re-checking).
  *
@@ -455,10 +558,10 @@ async function fetchBalance() {
 async function fetchTokenBalances(rpcUrl: string) {
   const listEl = el("token-balance-list");
 
-  if (!unlockedAddress) {
+  if (!activeAccountAddress) {
     return;
   }
-  const owner = unlockedAddress;
+  const owner = activeAccountAddress;
 
   const requestId = ++tokenBalanceRequestId;
   listEl.replaceChildren();
@@ -529,7 +632,7 @@ function renderTokenRow(row: TokenRowState): HTMLLIElement {
 }
 
 /**
- * Fetch and render `unlockedAddress`'s Sepolia transaction history.
+ * Fetch and render `activeAccountAddress`'s Sepolia transaction history.
  *
  * Three end states, kept visually distinct rather than collapsed into one
  * blank-or-generic screen: a genuine empty history (new wallet, nothing
@@ -543,7 +646,7 @@ async function fetchTxHistory() {
   const listEl = el("tx-history-list");
   const refreshBtn = el<HTMLButtonElement>("refresh-tx-history-btn");
 
-  if (!unlockedAddress) {
+  if (!activeAccountAddress) {
     return;
   }
 
@@ -555,7 +658,7 @@ async function fetchTxHistory() {
   refreshBtn.disabled = true;
 
   try {
-    const transactions = await fetchSepoliaTransactions(unlockedAddress);
+    const transactions = await fetchSepoliaTransactions(activeAccountAddress);
 
     if (requestId !== txHistoryRequestId) {
       return; // Superseded by a newer request; drop this result.
@@ -596,7 +699,7 @@ function renderTxHistory(transactions: SepoliaTransaction[]) {
 }
 
 function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
-  const address = unlockedAddress as Address;
+  const address = activeAccountAddress as Address;
   const isFromUs = tx.from.toLowerCase() === address.toLowerCase();
   const isToUs = tx.to !== null && tx.to.toLowerCase() === address.toLowerCase();
 
@@ -665,30 +768,40 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
 }
 
 /**
- * Enter the send flow: fetch account 2's address (an IPC call, no network)
- * and show the amount-entry screen.
+ * Enter the send flow: populate the destination picker with every derived
+ * account other than the currently-active one (no IPC call needed here —
+ * `accounts` was already derived by `loadAccounts` on unlock, and doesn't
+ * change mid-session), and show the amount-entry screen.
  *
- * `showStep("send")` runs BEFORE the fallible call, matching the pattern
- * every other function in this file uses (`confirmSend`, `unlock`) — so
- * that if the call fails, the error lands on a screen the user can
- * actually see. The previous version called `showStep` only on success,
- * which meant a failure wrote its message into `#send-error` while
- * `#step-send` was still `hidden`: the click appeared to do nothing at
- * all, indistinguishable from a broken button.
+ * Restricted to the wallet's own other accounts, not arbitrary addresses —
+ * free-form recipients are a later step with their own address-entry
+ * validation UX. The active account is excluded from its own destination
+ * list: sending an account to itself is a no-op the picker shouldn't offer.
+ *
+ * `showStep("send")` runs BEFORE populating the picker, matching the
+ * pattern every other function in this file uses (`confirmSend`, `unlock`)
+ * — so that if there's nothing to show (see the empty-destinations case
+ * below), the message lands on a screen the user can actually see instead
+ * of appearing to do nothing.
  */
-async function goToSend() {
+function goToSend() {
   clearSendState();
   showStep("send");
   const errorEl = el("send-error");
-  try {
-    const recipient = await invoke<string>("get_second_account_address");
-    el("send-recipient").textContent = recipient;
-  } catch (error) {
-    if (isSessionLockedError(error)) {
-      handleSessionLocked();
-      return;
-    }
-    errorEl.textContent = `Could not derive the recipient account: ${String(error)}`;
+  const select = el<HTMLSelectElement>("send-recipient-select");
+  select.replaceChildren();
+
+  const destinations = accounts.filter((a) => a.index !== activeAccountIndex);
+  if (destinations.length === 0) {
+    errorEl.textContent =
+      "No other account is available yet as a destination — this is the only derived account.";
+    return;
+  }
+  for (const account of destinations) {
+    const option = document.createElement("option");
+    option.value = account.address;
+    option.textContent = `Account ${account.index + 1} — ${account.address}`;
+    select.appendChild(option);
   }
 }
 
@@ -708,11 +821,12 @@ async function reviewSend() {
   const reviewBtn = el<HTMLButtonElement>("send-review-btn");
   errorEl.textContent = "";
 
-  const recipient = el("send-recipient").textContent as Address | "";
+  const recipientSelect = el<HTMLSelectElement>("send-recipient-select");
+  const recipient = recipientSelect.value as Address | "";
   const amountInput = el<HTMLInputElement>("send-amount").value.trim();
 
   if (!recipient) {
-    errorEl.textContent = "No recipient address — try leaving and re-entering this screen.";
+    errorEl.textContent = "No destination account selected — try leaving and re-entering this screen.";
     return;
   }
 
@@ -757,7 +871,7 @@ async function reviewSend() {
     // *new* transaction must account for anything already sitting in the
     // mempool for this account, not just what's confirmed on-chain.
     nonce = await client.getTransactionCount({
-      address: unlockedAddress as Address,
+      address: activeAccountAddress as Address,
       blockTag: "pending",
     });
   } catch (error) {
@@ -857,6 +971,9 @@ async function confirmSend() {
       maxPriorityFeePerGas: maxPriorityFeePerGas.toString(),
       gasLimit: Number(ETH_TRANSFER_GAS_LIMIT),
       chainId: SEPOLIA_CHAIN_ID,
+      // Sign from whichever account is currently active, not a fixed
+      // account — the whole point of the account switcher.
+      fromIndex: activeAccountIndex,
     });
   } catch (error) {
     if (isSessionLockedError(error)) {
@@ -918,14 +1035,11 @@ async function unlock() {
   unlockBtn.disabled = true;
 
   try {
-    const address = await invoke<string>("unlock_wallet", {
+    await invoke<string>("unlock_wallet", {
       password: el<HTMLInputElement>("unlock-password").value,
     });
-    unlockedAddress = address as Address;
-    el("unlocked-address").textContent = address;
     showStep("unlocked");
-    void fetchBalance();
-    void fetchTxHistory();
+    void loadAccounts();
   } catch (error) {
     errorEl.textContent = String(error);
   } finally {
@@ -939,10 +1053,14 @@ async function unlock() {
 
 async function lock() {
   await invoke("lock_wallet");
-  unlockedAddress = null;
+  accounts = [];
+  activeAccountIndex = 0;
+  activeAccountAddress = null;
   balanceRequestId++; // Invalidate any balance fetch still in flight.
   tokenBalanceRequestId++; // Invalidate any token-balance fetches still in flight.
   txHistoryRequestId++; // Invalidate any tx-history fetch still in flight.
+  el("account-list-error").textContent = "";
+  el<HTMLSelectElement>("account-select").replaceChildren();
   el("unlocked-address").textContent = "";
   el("balance-value").textContent = "";
   el("balance-value").classList.remove("loading");
@@ -962,6 +1080,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   el<HTMLInputElement>("rpc-url").value = DEFAULT_SEPOLIA_RPC_URL;
   el("refresh-balance-btn").addEventListener("click", () => void fetchBalance());
   el("refresh-tx-history-btn").addEventListener("click", () => void fetchTxHistory());
+  el<HTMLSelectElement>("account-select").addEventListener("change", (event) => {
+    switchActiveAccount(Number((event.target as HTMLSelectElement).value));
+  });
 
   el("generate-btn").addEventListener("click", generatePhrase);
   el("backup-done-btn").addEventListener("click", startConfirmation);

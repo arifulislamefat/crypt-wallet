@@ -1,10 +1,13 @@
 # cargo-deny configuration for the Crypt Wallet workspace.
 #
 # BASELINE SNAPSHOT — this file reflects the dependency tree as scanned on
-# 2026-08-16 (515 crates, `cargo-deny 0.20.2`, workspace at commit e88f943).
-# It is not "solved and done." In particular:
+# 2026-08-16 (515 crates, `cargo-deny 0.20.2`, workspace at commit e88f943),
+# plus one targeted addition on 2026-08-20 (see the `paste` entry below) —
+# that update was a single-advisory delta found during a `cargo audit`/
+# `cargo deny check` re-run, not a full re-scan of all 515 crates. It is not
+# "solved and done." In particular:
 #
-#   - The `[advisories].ignore` list below downgrades 17 *specific,
+#   - The `[advisories].ignore` list below downgrades 18 *specific,
 #     currently-known* advisories to notes, each with a reason recorded
 #     inline. It deliberately does NOT use a blanket rule (e.g. "allow all
 #     unmaintained advisories") — a brand-new advisory against any crate,
@@ -16,6 +19,25 @@
 #     upgrade to Tauri (which pulls in `muda` -> `gtk` on some platforms,
 #     and `urlpattern` -> `unic-*` as a build dep of `tauri-build`) can
 #     change which targets pull these crates in, or replace them outright.
+#   - One entry (`paste`, RUSTSEC-2024-0436) is exempted on different grounds
+#     from the other two clusters: it genuinely IS in the real Windows build
+#     graph (via `alloy`, which this wallet needs for transaction signing —
+#     not a wrong-platform or build-only situation at all). See that entry's
+#     own comment for why it's exempted anyway.
+#
+# Two `cargo-audit`-only findings from the same 2026-08-20 re-run are
+# DELIBERATELY NOT added here: `derivative` (RUSTSEC-2024-0388, reached via
+# `ark-ff`) and `proc-macro-error2` (RUSTSEC-2026-0173, reached via
+# `alloy-sol-macro`/`alloy-sol-macro-expander`). Both are present in
+# Cargo.lock (cargo-audit scans the lockfile unconditionally) but resolve to
+# nothing under `cargo tree -i <crate> --target all --workspace` — neither is
+# actually reachable in this workspace's real build graph under its current
+# feature selection (`[graph] all-features = false` below), so cargo-deny
+# correctly does not flag them and an ignore entry for either would be
+# exempting an advisory that was never actually failing anything. Re-check
+# with the same `cargo tree -i` command if either ever starts actually
+# resolving (e.g. if `alloy`'s `sol!`-macro feature or whatever pulls in
+# `ark-ff` gets enabled some day).
 #
 # RE-REVIEW THIS FILE whenever the Tauri version (or any dependency that
 # pulls in the crates named below) is upgraded. Re-run:
@@ -71,6 +93,25 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident, unmaintained; build-dependency only via tauri-build->tauri-utils->urlpattern, not shipped in the binary" },
+
+    # --- paste: unmaintained, but a real (non-platform-conditional) proc- ---
+    # macro dependency of `alloy`, which this wallet needs for EIP-1559
+    # transaction signing. Unlike every entry above, this one is NOT exempt
+    # because it's on the wrong platform or a build-only edge — `cargo tree
+    # -i paste --target x86_64-pc-windows-msvc` (2026-08-20) shows it's
+    # squarely in the real Windows build, via alloy-primitives.
+    #
+    # Exempted anyway because paste is a proc-macro crate: it runs only at
+    # compile time to generate identifier-concatenation code and contributes
+    # no logic to the shipped binary's runtime behavior (no network, no
+    # filesystem, nothing executing in the built app). The advisory is an
+    # "unmaintained" notice, not a vulnerability. There is no drop-in fix
+    # available from this side — `alloy` itself would need to move off
+    # `paste` (e.g. to its suggested fork `pastey`) for this dependency to
+    # go away. RE-REVIEW if `alloy` upgrades and no longer depends on paste,
+    # or if a real vulnerability (not just "unmaintained") is ever filed
+    # against it.
+    { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained proc-macro dependency of alloy (needed for tx signing); compile-time only, not shipped in the binary; no alternative until alloy moves off it" },
 ]
 
 [licenses]

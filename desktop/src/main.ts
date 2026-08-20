@@ -768,26 +768,51 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
 }
 
 /**
- * Enter the send flow: populate the destination picker with every derived
- * account other than the currently-active one (no IPC call needed here —
- * `accounts` was already derived by `loadAccounts` on unlock, and doesn't
- * change mid-session), and show the amount-entry screen.
+ * Enter the send flow: check the session is still unlocked, then populate
+ * the destination picker with every derived account other than the
+ * currently-active one, and show the amount-entry screen.
  *
  * Restricted to the wallet's own other accounts, not arbitrary addresses —
  * free-form recipients are a later step with their own address-entry
  * validation UX. The active account is excluded from its own destination
  * list: sending an account to itself is a no-op the picker shouldn't offer.
  *
- * `showStep("send")` runs BEFORE populating the picker, matching the
- * pattern every other function in this file uses (`confirmSend`, `unlock`)
- * — so that if there's nothing to show (see the empty-destinations case
- * below), the message lands on a screen the user can actually see instead
- * of appearing to do nothing.
+ * The lock check is deliberately real IPC (`get_account_address` for the
+ * active account, whose result is otherwise unused here — `accounts` was
+ * already derived by `loadAccounts` and doesn't change mid-session, so this
+ * call exists purely to force a round-trip to the backend), not something
+ * inferred from cached frontend state. This is a *second*, early copy of
+ * the same check `sign_transaction` already enforces in `confirmSend` — not
+ * a replacement for it: catching a locked session here means a user who's
+ * been idle finds out the moment they click "Send," rather than after
+ * filling out and reviewing an entire transaction only to be bounced at
+ * the very last step. `sign_transaction`'s check stays the authoritative
+ * backstop regardless, since this one — like any client-side check — could
+ * in principle race a lock that fires between this call succeeding and the
+ * final "Confirm and send" click.
+ *
+ * `showStep("send")` runs BEFORE the fallible call, matching the pattern
+ * every other function in this file uses (`confirmSend`, `unlock`) — so
+ * that if the call fails, the error lands on a screen the user can
+ * actually see, rather than in `#send-error` while `#step-send` is still
+ * `hidden`.
  */
-function goToSend() {
+async function goToSend() {
   clearSendState();
   showStep("send");
   const errorEl = el("send-error");
+
+  try {
+    await invoke<string>("get_account_address", { index: activeAccountIndex });
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    errorEl.textContent = `Could not verify the active account: ${String(error)}`;
+    return;
+  }
+
   const select = el<HTMLSelectElement>("send-recipient-select");
   select.replaceChildren();
 

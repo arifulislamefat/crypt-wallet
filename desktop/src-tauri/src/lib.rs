@@ -1165,13 +1165,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// duplicating RPC communication in Rust would just be two places that need
 /// to agree on how to talk to an endpoint, for no benefit.
 ///
-/// TEMPORARY, single-purpose scope: this is the one-off checkpoint send
-/// used to prove the signer works at all against real mainnet, before any
-/// general Solana send UI exists (see the project notes on why this comes
-/// before, not alongside, wiring a real send flow). `to`/`lamports`/
-/// `recent_blockhash` are untrusted frontend input and parsed strictly, the
-/// same discipline as every EVM signing command in this file — a malformed
-/// address or blockhash is rejected outright, never guessed at.
+/// Proven against real mainnet before any UI called it: a temporary,
+/// now-removed one-off checkpoint panel used this exact command to send a
+/// real, entire-balance transfer between two of this wallet's own Solana
+/// accounts, independently confirmed on-chain (signature, sender,
+/// recipient, and amount all cross-checked via direct RPC, not just the
+/// app's own success message) before the checkpoint panel was removed.
+/// This command itself is NOT temporary — it's the real signing primitive
+/// a general Solana send flow will call. `to`/`lamports`/`recent_blockhash`
+/// are untrusted frontend input and parsed strictly, the same discipline
+/// as every EVM signing command in this file — a malformed address or
+/// blockhash is rejected outright, never guessed at.
 #[tauri::command]
 fn sign_solana_transaction(
     to: String,

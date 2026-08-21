@@ -13,14 +13,7 @@ import {
   type NetworkConfig,
 } from "./networks";
 import { fetchTokenBalance, fetchTokenMetadata, parseUnitsStrict, type TokenMetadata } from "./tokens";
-import {
-  BASE_FEE_LAMPORTS_PER_SIGNATURE,
-  confirmSolanaTransaction,
-  fetchLatestBlockhash,
-  fetchSolanaBalanceLamports,
-  formatLamportsAsSol,
-  sendRawSolanaTransaction,
-} from "./solana";
+import { fetchSolanaBalanceLamports, formatLamportsAsSol } from "./solana";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -635,7 +628,6 @@ async function loadSolanaAccounts() {
 
   renderSolanaAccountList();
   void fetchSolanaBalance();
-  void refreshSolanaCheckpointRecipient();
   updateSolanaInterstitialAddress();
 }
 
@@ -761,107 +753,6 @@ async function fetchSolanaBalance() {
     if (requestId === solanaBalanceRequestId) {
       refreshBtn.disabled = false;
     }
-  }
-}
-
-/** Solscan's mainnet transaction URL — no cluster query param needed, mainnet is Solscan's default. */
-function solscanTxUrl(signature: string): string {
-  return `https://solscan.io/tx/${signature}`;
-}
-
-/**
- * Fetch and display Solana account 2 (index 1)'s address and balance in the
- * checkpoint-send panel — used both to show the recipient before sending,
- * and to confirm its balance actually changed after the checkpoint send
- * completes. Deliberately separate from the main `solanaAccounts` list
- * (`SOLANA_ACCOUNTS_TO_SHOW` is 1): this is scoped narrowly to the
- * checkpoint panel, not a general second-account feature.
- */
-async function refreshSolanaCheckpointRecipient(): Promise<{ address: string; lamports: bigint } | null> {
-  const el_ = el("solana-checkpoint-recipient");
-  try {
-    const address = await invoke<string>("get_solana_account_address", { index: 1 });
-    const lamports = await fetchSolanaBalanceLamports(address);
-    el_.textContent = `Recipient (Account 2): ${address} — ${formatLamportsAsSol(lamports)} SOL`;
-    return { address, lamports };
-  } catch (error) {
-    el_.textContent = `Could not load Account 2: ${error instanceof Error ? error.message : String(error)}`;
-    return null;
-  }
-}
-
-/**
- * The one-off checkpoint send: proves `sign_solana_transaction` actually
- * works against real mainnet before any general Solana send flow exists.
- * Sends account 0's entire balance, minus the fixed network fee, to this
- * same wallet's account 2 — restricted to a second address this wallet
- * itself controls, the same safety property the EVM send flow already
- * enforces for its own destinations, not an arbitrary external address.
- *
- * TEMPORARY by design (see this panel's own warning text in index.html) —
- * remove this function and its button once the checkpoint send has been
- * confirmed on-chain, per the project's explicit "prove the signer once,
- * then build the real flow separately" plan.
- */
-async function runSolanaCheckpointSend() {
-  const statusEl = el("solana-checkpoint-status");
-  const errorEl = el("solana-checkpoint-error");
-  const sendBtn = el<HTMLButtonElement>("solana-checkpoint-send-btn");
-  const account = solanaAccounts.find((a) => a.index === 0);
-
-  errorEl.textContent = "";
-  statusEl.textContent = "";
-
-  if (!account) {
-    errorEl.textContent = "Account 0 has not been derived yet.";
-    return;
-  }
-
-  sendBtn.disabled = true;
-  try {
-    statusEl.textContent = "Checking balance…";
-    const balanceLamports = await fetchSolanaBalanceLamports(account.address);
-    if (balanceLamports <= BASE_FEE_LAMPORTS_PER_SIGNATURE) {
-      errorEl.textContent =
-        `Balance (${formatLamportsAsSol(balanceLamports)} SOL) is too small to cover the ` +
-        `${formatLamportsAsSol(BASE_FEE_LAMPORTS_PER_SIGNATURE)} SOL network fee.`;
-      return;
-    }
-    const lamportsToSend = balanceLamports - BASE_FEE_LAMPORTS_PER_SIGNATURE;
-
-    statusEl.textContent = "Fetching recipient…";
-    const recipient = await invoke<string>("get_solana_account_address", { index: 1 });
-
-    statusEl.textContent = "Fetching recent blockhash…";
-    const recentBlockhash = await fetchLatestBlockhash();
-
-    statusEl.textContent = "Signing…";
-    // `lamportsToSend` is well within Number's safe integer range for any
-    // realistic balance here (a trivial, human-funded test amount) — see
-    // the checkpoint panel's own warning text; this command is not meant
-    // for large balances.
-    const signedBase64 = await invoke<string>("sign_solana_transaction", {
-      to: recipient,
-      lamports: Number(lamportsToSend),
-      recentBlockhash,
-      fromIndex: 0,
-    });
-
-    statusEl.textContent = "Broadcasting…";
-    const signature = await sendRawSolanaTransaction(signedBase64);
-    statusEl.textContent = `Broadcast. Signature: ${signature} — ${solscanTxUrl(signature)} — waiting for confirmation…`;
-
-    const confirmation = await confirmSolanaTransaction(signature);
-    statusEl.textContent =
-      `Signature: ${signature}\n${solscanTxUrl(signature)}\nStatus: ${confirmation}\n` +
-      `Sent ${formatLamportsAsSol(lamportsToSend)} SOL to ${recipient}`;
-
-    void fetchSolanaBalance();
-    void refreshSolanaCheckpointRecipient();
-  } catch (error) {
-    errorEl.textContent = `Checkpoint send failed: ${error instanceof Error ? error.message : String(error)}`;
-  } finally {
-    sendBtn.disabled = false;
   }
 }
 
@@ -2209,9 +2100,6 @@ async function lock() {
   el("solana-balance-value").textContent = "";
   el("solana-balance-value").classList.remove("loading");
   el("solana-balance-error").textContent = "";
-  el("solana-checkpoint-recipient").textContent = "";
-  el("solana-checkpoint-status").textContent = "";
-  el("solana-checkpoint-error").textContent = "";
   solanaInterstitialAcknowledged = false;
   el("solana-interstitial-address").textContent = "";
   switchChainFamily("evm");
@@ -2249,8 +2137,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     el("solana-interstitial").classList.add("hidden");
     el("solana-chain-content").classList.remove("hidden");
   });
-  el("solana-checkpoint-send-btn").addEventListener("click", () => void runSolanaCheckpointSend());
-  el("solana-checkpoint-refresh-recipient-btn").addEventListener("click", () => void refreshSolanaCheckpointRecipient());
   el("refresh-tx-history-btn").addEventListener("click", () => void fetchTxHistory());
   el<HTMLSelectElement>("account-select").addEventListener("change", (event) => {
     switchActiveAccount(Number((event.target as HTMLSelectElement).value));

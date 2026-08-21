@@ -178,31 +178,6 @@
               <div class="row">
                 <button id="refresh-solana-balance-btn" type="button">Refresh SOL balance</button>
               </div>
-
-              <fieldset id="solana-checkpoint-send" class="solana-checkpoint-send">
-                <legend>TEMPORARY — signer verification only</legend>
-                <p class="warning">
-                  One-off checkpoint, not the real send flow: sends this
-                  account's ENTIRE balance (minus the fixed 5000-lamport
-                  network fee) to this same wallet's Solana account 2. Real
-                  mainnet funds. Do this only once, to prove the signer works,
-                  before it is removed and replaced by a proper send screen.
-                </p>
-                <div class="row">
-                  <button id="solana-checkpoint-send-btn" type="button">
-                    Send entire balance to Account 2 (checkpoint test)
-                  </button>
-                  <button id="solana-checkpoint-refresh-recipient-btn" type="button">
-                    Refresh Account 2 balance
-                  </button>
-                </div>
-                <p class="hint">
-                  <span class="chain-badge chain-badge-solana">SOL</span>
-                  <span id="solana-checkpoint-recipient"></span>
-                </p>
-                <p id="solana-checkpoint-status" class="hint" aria-live="polite"></p>
-                <p id="solana-checkpoint-error" class="error"></p>
-              </fieldset>
             </fieldset>
           </div>
         </div>

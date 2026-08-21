@@ -325,18 +325,6 @@ fieldset input[type="password"] {
   word-break: break-all;
 }
 
-.solana-checkpoint-send {
-  border-color: #d9822b;
-}
-
-#solana-checkpoint-recipient,
-#solana-checkpoint-status {
-  font-family: ui-monospace, monospace;
-  font-size: 0.85em;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
 /*
  * Chain-family badge: the always-on half of the address-safety pair (the
  * other half is the interstitial in switchChainFamily). Deliberately

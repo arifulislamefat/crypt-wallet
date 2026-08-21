@@ -101,6 +101,12 @@ bincode = "1"
 # base64 input format (Solana's currently-recommended encoding for that
 # call, over the legacy base58 option).
 base64 = "0.22"
+# Base58-encodes an exported Solana private key -- the format Phantom,
+# Solflare, and the Solana CLI all expect for "import private key" (see
+# `export_solana_private_key`). Same crate and version constraint
+# `cryptwallet-crypto` already pins for the same reason as ed25519-dalek
+# above: one resolved version, not a coincidentally-compatible second copy.
+bs58 = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

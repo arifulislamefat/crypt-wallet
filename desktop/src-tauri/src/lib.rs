@@ -542,6 +542,42 @@ fn unlock_impl(
     failures_path: &Path,
     delay: impl Fn(Duration),
 ) -> Result<String, String> {
+    let mnemonic = open_vault_with_password(password, vault_path, failures_path, delay)?;
+
+    // Seed is re-derived from the phrase rather than stored — deterministic,
+    // so nothing is lost by not persisting it.
+    let address = EvmAccountKey::derive(&mnemonic.to_seed(""), 0)
+        .map_err(|_| "failed to derive an account from the recovery phrase".to_string())?
+        .address()
+        .to_checksummed_hex();
+
+    let mut guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    *guard = Some(UnlockedSession {
+        mnemonic,
+        unlocked_at: Instant::now(),
+    });
+
+    Ok(address)
+}
+
+/// Open the sealed vault fresh, right now, given `password` — the shared
+/// core of both [`unlock_impl`] (which additionally starts a session) and
+/// every reveal/export command below (which use this as a re-authentication
+/// gate: proof the caller knows the passphrase *at this moment*, independent
+/// of whether a session happens to be unlocked already). Deliberately one
+/// implementation, not a copy per caller — the rate-limiting behavior below
+/// is the actual brute-force defense, and a second, slightly-different copy
+/// would be exactly the kind of drift that quietly weakens it for whichever
+/// caller has the weaker copy.
+fn open_vault_with_password(
+    password: &str,
+    vault_path: &Path,
+    failures_path: &Path,
+    delay: impl Fn(Duration),
+) -> Result<SecretMnemonic, String> {
     let bytes = fs::read(vault_path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => "no wallet exists on this device yet".to_string(),
         _ => "could not read the wallet file".to_string(),
@@ -572,7 +608,10 @@ fn unlock_impl(
     // can also delete this counter file to reset the throttle. It is not
     // claimed to stop that attacker — it stops the in-app "kill and relaunch
     // to reset an in-memory counter" loop the review described, which a
-    // memory-only counter would not.
+    // memory-only counter would not. Shared across unlock AND every
+    // reveal/export command: a reveal/export command is just as much a
+    // passphrase-guessing surface as unlock itself, and must never have
+    // weaker throttling.
     let failures = read_unlock_failures(failures_path);
     delay(unlock_delay(failures));
 
@@ -596,26 +635,142 @@ fn unlock_impl(
     let mnemonic = SecretMnemonic::import(phrase)
         .map_err(|_| "the wallet file's contents are not a valid recovery phrase".to_string())?;
 
-    // Seed is re-derived from the phrase rather than stored — deterministic,
-    // so nothing is lost by not persisting it.
-    let address = EvmAccountKey::derive(&mnemonic.to_seed(""), 0)
-        .map_err(|_| "failed to derive an account from the recovery phrase".to_string())?
-        .address()
-        .to_checksummed_hex();
-
     // Success resets the throttle.
     let _ = fs::remove_file(failures_path);
 
-    let mut guard = unlocked
-        .0
-        .lock()
-        .map_err(|_| "wallet session state is unavailable")?;
-    *guard = Some(UnlockedSession {
-        mnemonic,
-        unlocked_at: Instant::now(),
-    });
+    Ok(mnemonic)
+}
 
-    Ok(address)
+/// Reveal the wallet's recovery phrase. Requires a session to already be
+/// unlocked (this is reached from inside the unlocked-wallet UI, never from
+/// the lock screen) AND a fresh, successful re-entry of the passphrase via
+/// [`open_vault_with_password`] — an already-unlocked session is NOT by
+/// itself sufficient to reveal the phrase, since the whole point is
+/// confirming the person at the keyboard right now knows it, not that they
+/// (or anyone else) unlocked the app at some earlier point.
+///
+/// The phrase crosses the IPC bridge exactly once per reveal, the same rule
+/// [`generate_new_mnemonic`] follows for the initial backup screen — nothing
+/// about this command's exposure is looser than that one.
+#[tauri::command]
+fn reveal_mnemonic(
+    password: String,
+    app: AppHandle,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    let password = Zeroizing::new(password);
+    let path = vault_path(&app)?;
+    let failures = failures_path(&app)?;
+    reveal_mnemonic_impl(&unlocked, &password, &path, &failures, sleep_for)
+}
+
+/// The testable core of [`reveal_mnemonic`].
+fn reveal_mnemonic_impl(
+    unlocked: &UnlockedWallet,
+    password: &str,
+    vault_path: &Path,
+    failures_path: &Path,
+    delay: impl Fn(Duration),
+) -> Result<String, String> {
+    {
+        let guard = unlocked.0.lock().map_err(|_| "wallet session state is unavailable")?;
+        guard.as_ref().ok_or("wallet is locked")?;
+    }
+
+    let mnemonic = open_vault_with_password(password, vault_path, failures_path, delay)?;
+    Ok(mnemonic.expose_secret(|phrase| phrase.to_string()))
+}
+
+/// Export EVM account `index`'s raw secp256k1 private key, as a
+/// `0x`-prefixed 32-byte hex string — the format MetaMask and every other
+/// EVM wallet's "import account" expects. Deliberately one key per account
+/// *index*, not one per chain: this app's whole EVM model (see
+/// `crypto/src/derivation.rs`) is one address/key per index shared across
+/// every EVM-compatible network, so there is nothing chain-specific to
+/// export here even in principle. The frontend must label this
+/// accordingly — see index.html's export panel.
+///
+/// Same re-authentication requirement as [`reveal_mnemonic`]: a session
+/// must already be unlocked, AND the passphrase must be freshly re-entered
+/// for this specific export.
+#[tauri::command]
+fn export_evm_private_key(
+    password: String,
+    index: u32,
+    app: AppHandle,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    let password = Zeroizing::new(password);
+    let path = vault_path(&app)?;
+    let failures = failures_path(&app)?;
+    export_evm_private_key_impl(&unlocked, &password, index, &path, &failures, sleep_for)
+}
+
+/// The testable core of [`export_evm_private_key`].
+fn export_evm_private_key_impl(
+    unlocked: &UnlockedWallet,
+    password: &str,
+    index: u32,
+    vault_path: &Path,
+    failures_path: &Path,
+    delay: impl Fn(Duration),
+) -> Result<String, String> {
+    {
+        let guard = unlocked.0.lock().map_err(|_| "wallet session state is unavailable")?;
+        guard.as_ref().ok_or("wallet is locked")?;
+    }
+
+    let mnemonic = open_vault_with_password(password, vault_path, failures_path, delay)?;
+    let seed = mnemonic.to_seed("");
+    let account =
+        EvmAccountKey::derive(&seed, index).map_err(|_| "failed to derive the requested account".to_string())?;
+
+    Ok(account.expose_secret(|signing_key| format!("0x{}", hex_encode(&signing_key.to_bytes()))))
+}
+
+/// Export Solana account `index`'s ed25519 keypair bytes, Base58-encoded —
+/// the 64-byte `secret(32) || public(32)` layout Phantom, Solflare, and the
+/// Solana CLI all use for "import private key" (matches
+/// `ed25519_dalek::SigningKey::to_keypair_bytes`'s own documented layout,
+/// which Solana's ecosystem adopted directly). One key per account index,
+/// entirely separate key material from the EVM export above — see
+/// `crypto/src/solana.rs`'s module doc comment for why Solana derivation
+/// shares nothing with EVM's. The frontend must label this accordingly.
+///
+/// Same re-authentication requirement as [`reveal_mnemonic`].
+#[tauri::command]
+fn export_solana_private_key(
+    password: String,
+    index: u32,
+    app: AppHandle,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    let password = Zeroizing::new(password);
+    let path = vault_path(&app)?;
+    let failures = failures_path(&app)?;
+    export_solana_private_key_impl(&unlocked, &password, index, &path, &failures, sleep_for)
+}
+
+/// The testable core of [`export_solana_private_key`].
+fn export_solana_private_key_impl(
+    unlocked: &UnlockedWallet,
+    password: &str,
+    index: u32,
+    vault_path: &Path,
+    failures_path: &Path,
+    delay: impl Fn(Duration),
+) -> Result<String, String> {
+    {
+        let guard = unlocked.0.lock().map_err(|_| "wallet session state is unavailable")?;
+        guard.as_ref().ok_or("wallet is locked")?;
+    }
+
+    let mnemonic = open_vault_with_password(password, vault_path, failures_path, delay)?;
+    let seed = mnemonic.to_seed("");
+    let account =
+        SolanaAccountKey::derive(&seed, index).map_err(|_| "failed to derive the requested account".to_string())?;
+
+    Ok(account.expose_secret(|signing_key| bs58::encode(signing_key.to_keypair_bytes()).into_string()))
 }
 
 /// Verify the user's word ordering against the pending mnemonic, then seal
@@ -1352,7 +1507,10 @@ pub fn run() {
         get_solana_account_address,
         sign_transaction,
         sign_token_transfer,
-        sign_solana_transaction
+        sign_solana_transaction,
+        reveal_mnemonic,
+        export_evm_private_key,
+        export_solana_private_key
     ]);
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1365,7 +1523,10 @@ pub fn run() {
         get_solana_account_address,
         sign_transaction,
         sign_token_transfer,
-        sign_solana_transaction
+        sign_solana_transaction,
+        reveal_mnemonic,
+        export_evm_private_key,
+        export_solana_private_key
     ]);
 
     builder
@@ -2084,6 +2245,156 @@ mod tests {
         );
         // And what was sealed really is the phrase the user wrote down.
         assert_eq!(phrase.split_whitespace().collect::<Vec<_>>(), words);
+    }
+
+    /// Seal a fresh vault, unlock it (so both an on-disk vault and an
+    /// unlocked in-memory session exist -- the real sequence reveal/export
+    /// always follows), and return everything a reveal/export test needs:
+    /// the wallet's own state, the vault path, the failures-counter path
+    /// beside it, and the exact phrase words that were sealed (for
+    /// asserting a reveal returns them verbatim).
+    fn sealed_and_unlocked_wallet() -> (UnlockedWallet, PathBuf, PathBuf, Vec<String>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let failures = path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        let (pending, words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        let unlocked = UnlockedWallet::default();
+        try_unlock(&unlocked, TEST_PASSWORD, &path).expect("unlock with the just-set password");
+
+        (unlocked, path, failures, words, dir)
+    }
+
+    #[test]
+    fn reveal_mnemonic_returns_the_exact_sealed_phrase() {
+        let (unlocked, path, failures, words, _dir) = sealed_and_unlocked_wallet();
+
+        let revealed = reveal_mnemonic_impl(&unlocked, TEST_PASSWORD, &path, &failures, |_| {})
+            .expect("reveal should succeed with the correct password");
+
+        assert_eq!(revealed.split_whitespace().collect::<Vec<_>>(), words);
+    }
+
+    #[test]
+    fn reveal_mnemonic_requires_an_unlocked_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let failures = path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        // Deliberately never unlocked -- reveal must refuse even though the
+        // vault on disk is real and the password below is correct for it.
+        let unlocked = UnlockedWallet::default();
+        let error = reveal_mnemonic_impl(&unlocked, TEST_PASSWORD, &path, &failures, |_| {})
+            .expect_err("a locked session must refuse to reveal, regardless of password correctness");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn reveal_mnemonic_rejects_the_wrong_password_even_with_a_session_unlocked() {
+        let (unlocked, path, failures, _words, _dir) = sealed_and_unlocked_wallet();
+
+        // An unlocked session is not sufficient on its own -- this is the
+        // property the whole re-authentication requirement exists for.
+        let error = reveal_mnemonic_impl(&unlocked, "the-wrong-passphrase", &path, &failures, |_| {})
+            .expect_err("wrong password must be rejected even with an active session");
+        assert_eq!(error, "could not unlock the wallet: check your passphrase");
+    }
+
+    #[test]
+    fn reveal_mnemonic_wrong_password_increments_the_same_failure_counter_as_unlock() {
+        let (unlocked, path, failures, _words, _dir) = sealed_and_unlocked_wallet();
+        // `sealed_and_unlocked_wallet` already unlocked successfully once,
+        // which resets the counter -- start from a known zero.
+        assert_eq!(read_unlock_failures(&failures), 0);
+
+        let _ = reveal_mnemonic_impl(&unlocked, "wrong", &path, &failures, |_| {});
+        assert_eq!(
+            read_unlock_failures(&failures),
+            1,
+            "a failed reveal must count against the same throttle a failed unlock does -- \
+             it is just as much a passphrase-guessing surface"
+        );
+    }
+
+    #[test]
+    fn export_evm_private_key_matches_direct_derivation_and_varies_by_index() {
+        let (unlocked, path, failures, _words, _dir) = sealed_and_unlocked_wallet();
+
+        let expected_0 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            EvmAccountKey::derive(&seed, 0)
+                .expect("derive account 0")
+                .expose_secret(|k| format!("0x{}", hex_encode(&k.to_bytes())))
+        };
+
+        let exported_0 = export_evm_private_key_impl(&unlocked, TEST_PASSWORD, 0, &path, &failures, |_| {})
+            .expect("export should succeed");
+        let exported_1 = export_evm_private_key_impl(&unlocked, TEST_PASSWORD, 1, &path, &failures, |_| {})
+            .expect("export should succeed");
+
+        assert_eq!(exported_0, expected_0, "must match direct derivation, not just be well-formed");
+        assert!(exported_0.starts_with("0x"));
+        assert_eq!(exported_0.len(), 66, "0x + 64 hex chars (32 bytes)");
+        assert_ne!(exported_0, exported_1, "different indices must derive different keys");
+    }
+
+    #[test]
+    fn export_evm_private_key_requires_an_unlocked_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let failures = path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        let unlocked = UnlockedWallet::default();
+        let error = export_evm_private_key_impl(&unlocked, TEST_PASSWORD, 0, &path, &failures, |_| {})
+            .expect_err("a locked session must refuse to export");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn export_solana_private_key_matches_direct_derivation_and_varies_by_index() {
+        let (unlocked, path, failures, _words, _dir) = sealed_and_unlocked_wallet();
+
+        let expected_0 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            SolanaAccountKey::derive(&seed, 0)
+                .expect("derive account 0")
+                .expose_secret(|k| bs58::encode(k.to_keypair_bytes()).into_string())
+        };
+
+        let exported_0 = export_solana_private_key_impl(&unlocked, TEST_PASSWORD, 0, &path, &failures, |_| {})
+            .expect("export should succeed");
+        let exported_1 = export_solana_private_key_impl(&unlocked, TEST_PASSWORD, 1, &path, &failures, |_| {})
+            .expect("export should succeed");
+
+        assert_eq!(exported_0, expected_0, "must match direct derivation, not just be well-formed");
+        assert_ne!(exported_0, exported_1, "different indices must derive different keys");
+        // A different key space entirely from the EVM export above, not
+        // merely a different value -- proves this isn't accidentally
+        // exporting the same underlying key material through two encoders.
+        let evm_0 = export_evm_private_key_impl(&unlocked, TEST_PASSWORD, 0, &path, &failures, |_| {})
+            .expect("export should succeed");
+        assert_ne!(exported_0, evm_0);
+    }
+
+    #[test]
+    fn export_solana_private_key_requires_an_unlocked_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(VAULT_FILENAME);
+        let failures = path.with_file_name(UNLOCK_FAILURES_FILENAME);
+        let (pending, _words, correct_slots) = pending_with_mnemonic();
+        confirm_and_seal_impl(&pending, &correct_slots, TEST_PASSWORD, &path).expect("seal succeeds");
+
+        let unlocked = UnlockedWallet::default();
+        let error = export_solana_private_key_impl(&unlocked, TEST_PASSWORD, 0, &path, &failures, |_| {})
+            .expect_err("a locked session must refuse to export");
+        assert_eq!(error, "wallet is locked");
     }
 
     #[test]

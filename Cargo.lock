@@ -1877,6 +1877,7 @@ dependencies = [
  "alloy",
  "base64 0.22.1",
  "bincode",
+ "bs58",
  "cryptwallet-crypto",
  "cryptwallet-vault",
  "ed25519-dalek",

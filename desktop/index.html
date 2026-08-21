@@ -183,6 +183,7 @@
         </div>
 
         <div class="row">
+          <button id="reveal-nav-btn" type="button">Reveal recovery phrase / export keys</button>
           <button id="lock-btn" type="button">Lock wallet</button>
         </div>
       </section>
@@ -268,6 +269,90 @@
           <button id="send-done-btn" type="button" class="hidden">
             Back to wallet
           </button>
+        </div>
+      </section>
+
+      <!-- Reveal recovery phrase / export private keys: high-stakes, re-auth gated -->
+      <section id="step-reveal" class="step hidden">
+        <h2>Reveal recovery phrase &amp; export private keys</h2>
+        <p class="warning">
+          Anyone who sees these controls your funds. Make sure no one can
+          see your screen. Never screenshot, photograph, or paste any of
+          this anywhere. Each reveal below asks for your passphrase again,
+          every time — an already-unlocked wallet is not by itself enough
+          to show any of this.
+        </p>
+
+        <fieldset>
+          <legend>Recovery phrase</legend>
+          <div class="row">
+            <button id="reveal-phrase-btn" type="button">Reveal recovery phrase</button>
+          </div>
+          <div id="reveal-phrase-auth" class="hidden">
+            <label for="reveal-phrase-password" class="hint rpc-label">Passphrase</label>
+            <input
+              id="reveal-phrase-password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="Passphrase"
+            />
+            <div class="row">
+              <button id="reveal-phrase-confirm-btn" type="button">Confirm</button>
+              <button id="reveal-phrase-cancel-btn" type="button">Cancel</button>
+            </div>
+          </div>
+          <ol id="reveal-phrase-words" class="phrase hidden"></ol>
+          <p id="reveal-phrase-error" class="error"></p>
+          <div class="row">
+            <button id="reveal-phrase-hide-btn" type="button" class="hidden">Hide</button>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Export a private key</legend>
+          <p class="hint">
+            One key per account number, shared across every chain in that
+            family — an EVM key is the SAME key on Ethereum, Polygon,
+            Optimism, BNB Smart Chain, Arbitrum, and Base, not six separate
+            keys. A Solana key is entirely separate key material and works
+            on Solana only.
+          </p>
+
+          <label for="export-chain-family" class="hint rpc-label">Chain</label>
+          <select id="export-chain-family">
+            <option value="evm">EVM (Ethereum, Polygon, Optimism, BNB Smart Chain, Arbitrum, Base)</option>
+            <option value="solana">Solana</option>
+          </select>
+
+          <label for="export-account-index" class="hint rpc-label">Account number</label>
+          <input id="export-account-index" type="number" inputmode="numeric" min="1" step="1" value="1" />
+
+          <div class="row">
+            <button id="export-key-btn" type="button">Reveal private key</button>
+          </div>
+          <div id="export-key-auth" class="hidden">
+            <label for="export-key-password" class="hint rpc-label">Passphrase</label>
+            <input
+              id="export-key-password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="Passphrase"
+            />
+            <div class="row">
+              <button id="export-key-confirm-btn" type="button">Confirm</button>
+              <button id="export-key-cancel-btn" type="button">Cancel</button>
+            </div>
+          </div>
+          <p id="export-key-label" class="hint hidden"></p>
+          <p id="export-key-value" class="address hidden"></p>
+          <p id="export-key-error" class="error"></p>
+          <div class="row">
+            <button id="export-key-hide-btn" type="button" class="hidden">Hide</button>
+          </div>
+        </fieldset>
+
+        <div class="row">
+          <button id="reveal-back-btn" type="button">Back to wallet</button>
         </div>
       </section>
 

@@ -53,7 +53,8 @@ type Step =
   | "done"
   | "send"
   | "send-confirm"
-  | "send-status";
+  | "send-status"
+  | "reveal";
 
 const ALL_STEPS: Step[] = [
   "unlock",
@@ -65,6 +66,7 @@ const ALL_STEPS: Step[] = [
   "send",
   "send-confirm",
   "send-status",
+  "reveal",
 ];
 
 /**
@@ -390,6 +392,16 @@ function showStep(step: Step) {
   for (const name of ALL_STEPS) {
     el(`step-${name}`).classList.toggle("hidden", name !== step);
   }
+  // Navigating away from the reveal/export screen (to anywhere, including
+  // itself) always scrubs whatever secret it was showing — see
+  // `clearRevealSecrets`'s own doc comment for why this is unconditional
+  // rather than only on an explicit "Hide"/"Back" click. This must run
+  // for every step transition in the app, not just the ones the reveal
+  // screen's own buttons trigger — lock(), lost focus, an error path
+  // elsewhere, all funnel through this one function.
+  if (step !== "reveal") {
+    clearRevealSecrets();
+  }
 }
 
 /**
@@ -419,6 +431,112 @@ function clearPhraseFromMemory() {
   el("phrase-list").replaceChildren();
   el("word-bank").replaceChildren();
   el("selected-words").replaceChildren();
+}
+
+/**
+ * Scrub everything the reveal/export screen may currently be showing:
+ * the revealed phrase, the revealed private key, and both passphrase
+ * inputs on that screen. Called unconditionally on every navigation away
+ * from "reveal" (see `showStep`) — not just from this screen's own
+ * "Hide"/"Back" buttons — so there is no path (an error elsewhere, a
+ * lock() from idle timeout, a window-blur handler) that leaves a phrase
+ * or key rendered in the DOM after the user has left this screen.
+ *
+ * Same caveat as `clearPhraseFromMemory`: this bounds how long the UI
+ * *displays* the secret, not a claim that the underlying JS string memory
+ * is actually zeroized — that guarantee only exists on the Rust side.
+ */
+function clearRevealSecrets() {
+  el("reveal-phrase-words").replaceChildren();
+  el("reveal-phrase-words").classList.add("hidden");
+  el("reveal-phrase-hide-btn").classList.add("hidden");
+  el("reveal-phrase-auth").classList.add("hidden");
+  el<HTMLInputElement>("reveal-phrase-password").value = "";
+  el("reveal-phrase-error").textContent = "";
+
+  el("export-key-value").textContent = "";
+  el("export-key-value").classList.add("hidden");
+  el("export-key-label").textContent = "";
+  el("export-key-label").classList.add("hidden");
+  el("export-key-hide-btn").classList.add("hidden");
+  el("export-key-auth").classList.add("hidden");
+  el<HTMLInputElement>("export-key-password").value = "";
+  el("export-key-error").textContent = "";
+}
+
+/** Which chains an exported key from `chainFamily` is valid on — shown next to the revealed value so it can never be mistaken for chain-specific. */
+function exportKeyValidityLabel(chainFamily: "evm" | "solana"): string {
+  return chainFamily === "evm"
+    ? "Valid on: Ethereum Mainnet, Polygon, Optimism, BNB Smart Chain, Arbitrum One, Base — the SAME key on all of these, not one key per chain."
+    : "Valid on: Solana Mainnet only. This key does NOT work on any EVM chain.";
+}
+
+async function handleRevealPhraseConfirm() {
+  const passwordEl = el<HTMLInputElement>("reveal-phrase-password");
+  const errorEl = el("reveal-phrase-error");
+  const confirmBtn = el<HTMLButtonElement>("reveal-phrase-confirm-btn");
+  errorEl.textContent = "";
+
+  confirmBtn.disabled = true;
+  try {
+    const phrase = await invoke<string>("reveal_mnemonic", { password: passwordEl.value });
+    const words = phrase.split(/\s+/);
+
+    const list = el("reveal-phrase-words");
+    list.replaceChildren();
+    for (const word of words) {
+      const item = document.createElement("li");
+      item.textContent = word;
+      list.appendChild(item);
+    }
+    list.classList.remove("hidden");
+    el("reveal-phrase-hide-btn").classList.remove("hidden");
+    el("reveal-phrase-auth").classList.add("hidden");
+  } catch (error) {
+    errorEl.textContent = String(error);
+  } finally {
+    passwordEl.value = "";
+    confirmBtn.disabled = false;
+  }
+}
+
+async function handleExportKeyConfirm() {
+  const passwordEl = el<HTMLInputElement>("export-key-password");
+  const errorEl = el("export-key-error");
+  const confirmBtn = el<HTMLButtonElement>("export-key-confirm-btn");
+  const chainFamily = el<HTMLSelectElement>("export-chain-family").value as "evm" | "solana";
+  const indexInput = el<HTMLInputElement>("export-account-index").value;
+  errorEl.textContent = "";
+
+  // 1-based in the UI (matching "Account 1"/"Account 2" everywhere else in
+  // this app), converted to the 0-based index every derive() function
+  // actually takes. Validated strictly -- a malformed or out-of-range
+  // value is rejected here rather than sent to the backend to reject less
+  // clearly.
+  const accountNumber = Number(indexInput);
+  if (!Number.isInteger(accountNumber) || accountNumber < 1) {
+    errorEl.textContent = "Account number must be a whole number, 1 or greater.";
+    return;
+  }
+  const index = accountNumber - 1;
+
+  confirmBtn.disabled = true;
+  try {
+    const command = chainFamily === "evm" ? "export_evm_private_key" : "export_solana_private_key";
+    const key = await invoke<string>(command, { password: passwordEl.value, index });
+
+    el("export-key-label").textContent = exportKeyValidityLabel(chainFamily);
+    el("export-key-label").classList.remove("hidden");
+    el("export-key-value").textContent = key;
+    el("export-key-value").classList.remove("hidden");
+    el("export-key-hide-btn").classList.remove("hidden");
+    el("export-key-auth").classList.add("hidden");
+  } catch (error) {
+    errorEl.textContent = String(error);
+  } finally {
+    passwordEl.value = "";
+    confirmBtn.disabled = false;
+  }
 }
 
 interface NewMnemonic {
@@ -2152,6 +2270,38 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   el("unlock-btn").addEventListener("click", unlock);
   el("lock-btn").addEventListener("click", lock);
+  el("reveal-nav-btn").addEventListener("click", () => showStep("reveal"));
+  el("reveal-back-btn").addEventListener("click", () => showStep("unlocked"));
+  el("reveal-phrase-btn").addEventListener("click", () => {
+    el("reveal-phrase-auth").classList.remove("hidden");
+  });
+  el("reveal-phrase-cancel-btn").addEventListener("click", () => {
+    el("reveal-phrase-auth").classList.add("hidden");
+    el<HTMLInputElement>("reveal-phrase-password").value = "";
+    el("reveal-phrase-error").textContent = "";
+  });
+  el("reveal-phrase-confirm-btn").addEventListener("click", () => void handleRevealPhraseConfirm());
+  el("reveal-phrase-hide-btn").addEventListener("click", () => {
+    el("reveal-phrase-words").replaceChildren();
+    el("reveal-phrase-words").classList.add("hidden");
+    el("reveal-phrase-hide-btn").classList.add("hidden");
+  });
+  el("export-key-btn").addEventListener("click", () => {
+    el("export-key-auth").classList.remove("hidden");
+  });
+  el("export-key-cancel-btn").addEventListener("click", () => {
+    el("export-key-auth").classList.add("hidden");
+    el<HTMLInputElement>("export-key-password").value = "";
+    el("export-key-error").textContent = "";
+  });
+  el("export-key-confirm-btn").addEventListener("click", () => void handleExportKeyConfirm());
+  el("export-key-hide-btn").addEventListener("click", () => {
+    el("export-key-value").textContent = "";
+    el("export-key-value").classList.add("hidden");
+    el("export-key-label").textContent = "";
+    el("export-key-label").classList.add("hidden");
+    el("export-key-hide-btn").classList.add("hidden");
+  });
   el("to-unlock-btn").addEventListener("click", () => {
     clearPhraseFromMemory();
     clearPassphraseInputs();

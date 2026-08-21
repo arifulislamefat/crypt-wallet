@@ -2,26 +2,32 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { decodeFunctionData, encodeFunctionData, erc20Abi, formatEther, formatGwei, formatUnits } from "viem";
 import {
-  ALLOWED_RPC_ORIGINS,
-  DEFAULT_SEPOLIA_RPC_URL,
-  SEPOLIA_CHAIN_ID,
-  sepoliaClient,
+  DEFAULT_NETWORK,
+  NETWORKS,
+  allowedRpcOrigin,
+  buildCustomNetworkConfig,
+  rpcClient,
+  validateCustomNetworkInput,
   type Address,
-} from "./sepolia";
+  type CustomNetworkFormInput,
+  type NetworkConfig,
+} from "./networks";
+import { fetchTokenBalance, fetchTokenMetadata, parseUnitsStrict, type TokenMetadata } from "./tokens";
 import {
-  SEPOLIA_TOKENS,
-  fetchTokenBalance,
-  fetchTokenMetadata,
-  parseUnitsStrict,
-  type TokenMetadata,
-} from "./tokens";
+  BASE_FEE_LAMPORTS_PER_SIGNATURE,
+  confirmSolanaTransaction,
+  fetchLatestBlockhash,
+  fetchSolanaBalanceLamports,
+  formatLamportsAsSol,
+  sendRawSolanaTransaction,
+} from "./solana";
 import {
   EtherscanApiError,
   EtherscanConfigError,
-  fetchSepoliaTokenTransfers,
-  fetchSepoliaTransactions,
-  sepoliaExplorerTxUrl,
-  type SepoliaTransaction,
+  explorerTxUrl,
+  fetchTokenTransfers,
+  fetchTransactions,
+  type EthTransaction,
   type TokenTransferEvent,
 } from "./etherscan";
 
@@ -81,6 +87,75 @@ let bank: number[] = [];
 let selectedSlots: number[] = [];
 
 /**
+ * Which network is currently active — a built-in `NetworkId`, or a custom
+ * network's generated id (see `customNetworks`, just below). Widened to
+ * plain `string` rather than kept as `NetworkId` for exactly that reason:
+ * this has to be able to hold either. Drives every RPC/Etherscan call and
+ * the send flow's availability — see `switchNetwork` for what changes when
+ * this does, and `networks.ts`/`customNetworks` for the per-network config
+ * this indexes into. A UI preference, not secret-related state, so unlike
+ * `accounts`/`activeAccountAddress` this is deliberately NOT reset by
+ * `lock()` — the user's chosen network survives a lock/unlock cycle.
+ */
+let activeNetworkId: string = DEFAULT_NETWORK;
+
+/**
+ * Whether the "this is a different address" interstitial has already been
+ * shown and dismissed once this session. Reset on lock — a fresh unlock
+ * (even of the same wallet) is treated as a fresh session for this
+ * purpose, since the whole point is catching a user who might not be
+ * paying attention right now, not tracking whether they've *ever* seen it.
+ */
+let solanaInterstitialAcknowledged = false;
+
+/**
+ * Networks the user has added this session, keyed by their generated id
+ * (`custom-1`, `custom-2`, ...). In-memory only, by design (see
+ * `handleAddCustomNetwork`'s doc comment) — lost on restart, no persistence
+ * attempted here; that's a separate future step once this app has a real
+ * config storage format, not something to bolt on for this feature.
+ */
+const customNetworks = new Map<string, NetworkConfig>();
+let nextCustomNetworkSeq = 1;
+
+/** Look up `activeNetworkId` in either the built-in table or `customNetworks` — the one place both are treated as one namespace. */
+function activeNetwork(): NetworkConfig {
+  const network = getNetworkConfig(activeNetworkId);
+  if (!network) {
+    // Shouldn't happen: activeNetworkId is only ever set by switchNetwork,
+    // to an id that was just confirmed to exist in one of these two
+    // places. Falling back to the app's default rather than throwing keeps
+    // a coding mistake here from crashing the whole UI.
+    return NETWORKS[DEFAULT_NETWORK];
+  }
+  return network;
+}
+
+function getNetworkConfig(id: string): NetworkConfig | undefined {
+  return (NETWORKS as Record<string, NetworkConfig>)[id] ?? customNetworks.get(id);
+}
+
+/**
+ * The message shown instead of attempting a real request on a custom
+ * network — see `NetworkConfig.isCustom`'s doc comment for why this is a
+ * hard, immediate short-circuit rather than letting the request run and
+ * fail: a custom RPC origin is never in `tauri.conf.json`'s static CSP
+ * `connect-src`, so the webview would otherwise block it with no usable
+ * error surfaced to a `catch` block at all (same underlying async-timing
+ * reason `allowedRpcOrigin`'s own doc comment describes for the built-in
+ * origin check). Checked at the very top of `fetchBalance`/`reviewSend`/
+ * `confirmSend`, before any loading state is even shown, since the outcome
+ * is already known.
+ */
+function customNetworkRpcBlockedMessage(network: NetworkConfig): string {
+  return (
+    `"${network.label}" is a custom network — its RPC endpoint isn't in this app's security ` +
+    `policy allowlist, so requests to it are blocked. This is a known limitation for custom ` +
+    `networks in this build, not a network problem.`
+  );
+}
+
+/**
  * How many of the wallet's accounts the switcher derives and shows. Not a
  * protocol limit — the backend's `get_account_address` accepts any
  * non-hardened index — just a deliberate cap on what the UI exposes today,
@@ -103,6 +178,40 @@ interface WalletAccount {
  */
 let accounts: WalletAccount[] = [];
 
+/**
+ * A derived Solana account, display-only at this phase — see
+ * `SOLANA_ACCOUNTS_TO_SHOW`'s doc comment. Deliberately its own type, not a
+ * variant of `WalletAccount`: a Solana address isn't `Address` (EVM's
+ * `0x`-prefixed, EIP-55-checksummed hex type — see `networks.ts`), it's a
+ * plain Base58 string, and conflating the two would let a Solana address
+ * slip into an EVM-typed slot (a send-destination field, an EVM RPC call)
+ * undetected by the type system.
+ */
+interface SolanaWalletAccount {
+  index: number;
+  address: string;
+}
+
+/**
+ * How many Solana accounts to derive and display. Fixed at 1 (just account
+ * 0) rather than mirroring EVM's `MAX_ACCOUNTS` switcher: this phase is
+ * display-only, proving the derivation module is wired into the app's
+ * account architecture — not yet a real multi-account Solana experience
+ * (there's no Solana account switcher, no balance, no send). Revisit this
+ * constant once Solana balance fetching (the next planned phase) makes more
+ * than one visible account actually useful to show.
+ */
+const SOLANA_ACCOUNTS_TO_SHOW = 1;
+
+/**
+ * Every Solana account currently displayed, derived once per unlock (see
+ * `loadAccounts`) alongside the EVM accounts. Read-only display list — see
+ * this array's own doc comment on `SolanaWalletAccount` for why Solana
+ * addresses are never allowed to flow into any EVM-typed code path from
+ * here.
+ */
+let solanaAccounts: SolanaWalletAccount[] = [];
+
 /** Which account in `accounts` is currently selected in the switcher. */
 let activeAccountIndex = 0;
 
@@ -124,6 +233,9 @@ let activeAccountAddress: Address | null = null;
  */
 let balanceRequestId = 0;
 
+/** Same stale-response guard as `balanceRequestId`, for the Solana SOL balance fetch. */
+let solanaBalanceRequestId = 0;
+
 /**
  * Same stale-response guard as `balanceRequestId`, for the transaction
  * history fetch — a slow response from a previous fetch (or from before a
@@ -141,7 +253,11 @@ let tokenBalanceRequestId = 0;
 
 /**
  * Cache of each token's real, contract-read symbol/decimals, keyed by
- * address. Populated opportunistically whenever either the balance display
+ * `${chainId}:${address}` — NOT just address: a CREATE2-deployed contract
+ * can legitimately sit at the identical address on two different chains
+ * while being two unrelated tokens, so collapsing the key to address alone
+ * would risk one network's cached metadata leaking into another's display.
+ * Populated opportunistically whenever either the balance display
  * (`fetchTokenBalances`) or the send flow's token selector fetches a
  * token's metadata, and read by the transaction-history renderer so it can
  * label a token-transfer row without a fetch (and, on a cache miss, fall
@@ -150,13 +266,17 @@ let tokenBalanceRequestId = 0;
  * every actual send re-fetches decimals fresh (see `handleAssetSelectionChanged`)
  * rather than trusting whatever happens to be cached.
  */
-const tokenMetadataCache = new Map<Address, TokenMetadata>();
+const tokenMetadataCache = new Map<string, TokenMetadata>();
+
+function tokenCacheKey(chainId: number, address: Address): string {
+  return `${chainId}:${address.toLowerCase()}`;
+}
 
 /**
  * The asset currently selected in the send flow's token picker. `null`
  * means ETH (a plain value transfer); otherwise the specific token being
  * sent, with its real, freshly-fetched decimals/symbol — never the cosmetic
- * `label` from `SEPOLIA_TOKENS`.
+ * `label` from the active network's token list (`NetworkConfig.tokens`).
  */
 type SelectedAsset = { address: Address; symbol: string; decimals: number } | null;
 let selectedAsset: SelectedAsset = null;
@@ -198,11 +318,21 @@ interface PreparedTokenSend {
 type PreparedSend = PreparedEthSend | PreparedTokenSend;
 let preparedSend: PreparedSend | null = null;
 
+/**
+ * The send-asset selector's option value for "the chain's own native
+ * currency" (ETH, BNB, ...), as opposed to a specific token address.
+ * Deliberately NOT the literal display symbol (that varies per network —
+ * see `NetworkConfig.nativeCurrencySymbol`) — this sentinel is constant
+ * across every network, so code that checks "is native currency selected"
+ * doesn't need to know which network is active to do it.
+ */
+const NATIVE_ASSET_VALUE = "native";
+
 function clearSendState() {
   preparedSend = null;
   selectedAsset = null;
-  el<HTMLSelectElement>("send-asset-select").value = "ETH";
-  el("send-amount-unit").textContent = "ETH";
+  el<HTMLSelectElement>("send-asset-select").value = NATIVE_ASSET_VALUE;
+  el("send-amount-unit").textContent = activeNetwork().nativeCurrencySymbol;
   el<HTMLInputElement>("send-amount").value = "";
   el<HTMLInputElement>("send-ack-checkbox").checked = false;
   el("send-status").textContent = "";
@@ -472,6 +602,267 @@ async function loadAccounts() {
 
   renderAccountSelect();
   switchActiveAccount(0);
+  void loadSolanaAccounts();
+}
+
+/**
+ * Derive and render the display-only Solana account list — see
+ * `SolanaWalletAccount`'s doc comment for this phase's scope. Deliberately
+ * a separate function/failure path from `loadAccounts`'s EVM derivation,
+ * not folded into that loop: a Solana derivation failure must never abort
+ * or blank out the EVM account switcher the rest of the app depends on, and
+ * vice versa — the two are independent derivations over independent code
+ * paths (see `crypto/src/solana.rs`'s module doc comment), so a bug in one
+ * has no reason to take down the other.
+ */
+async function loadSolanaAccounts() {
+  const errorEl = el("solana-account-error");
+  errorEl.textContent = "";
+  solanaAccounts = [];
+
+  try {
+    for (let index = 0; index < SOLANA_ACCOUNTS_TO_SHOW; index++) {
+      const address = await invoke<string>("get_solana_account_address", { index });
+      solanaAccounts.push({ index, address });
+    }
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    errorEl.textContent = `Could not derive Solana accounts: ${String(error)}`;
+  }
+
+  renderSolanaAccountList();
+  void fetchSolanaBalance();
+  void refreshSolanaCheckpointRecipient();
+  updateSolanaInterstitialAddress();
+}
+
+/**
+ * Render the display-only Solana account list. No `<select>`, no click
+ * handler, no active-account concept — unlike `renderAccountSelect`, there
+ * is nothing here yet for a user to *do* with these addresses (see
+ * `SOLANA_ACCOUNTS_TO_SHOW`'s doc comment on why this phase is display
+ * only), so a plain list is the honest UI for what this is.
+ *
+ * Each row carries its own chain-family badge (see `.chain-badge` in
+ * styles.css) — built with `createElement`/`append`, not a template
+ * string assigned to `textContent`, specifically so the badge is a real
+ * sibling element rather than text that could drift out of sync with it.
+ */
+function renderSolanaAccountList() {
+  const list = el("solana-account-list");
+  list.replaceChildren();
+  for (const account of solanaAccounts) {
+    const item = document.createElement("li");
+    item.className = "solana-account-item";
+
+    const badge = document.createElement("span");
+    badge.className = "chain-badge chain-badge-solana";
+    badge.textContent = "SOL";
+
+    const text = document.createElement("span");
+    text.textContent = `Account ${account.index + 1} — ${account.address}`;
+
+    item.append(badge, text);
+    list.appendChild(item);
+  }
+}
+
+/**
+ * Keep the "different address" interstitial's own address line current —
+ * called both when Solana accounts finish (re)loading and when the
+ * interstitial is about to be shown, so it's never stuck on a stale or
+ * empty value regardless of which happens first.
+ */
+function updateSolanaInterstitialAddress() {
+  const account = solanaAccounts.find((a) => a.index === 0);
+  el("solana-interstitial-address").textContent = account ? account.address : "Loading…";
+}
+
+/**
+ * Switch which curve family's panel is in view. This is the one place
+ * that decides whether the "different address" interstitial is shown —
+ * see `solanaInterstitialAcknowledged`'s own doc comment for why it's
+ * once-per-session, not once-per-switch: re-showing it on every single
+ * toggle back to Solana would train users to click through it without
+ * reading, which defeats the point.
+ *
+ * Switching TO "evm" never shows an interstitial of its own. The risk
+ * this whole mechanism exists for is specifically "a different, unrelated
+ * address silently replaced the one you were just looking at" — EVM is
+ * this app's default, always-first-seen address space, and every EVM
+ * network already shares one address (see `network-banner`'s existing
+ * mainnet/testnet distinction for that, a separate and already-solved
+ * problem).
+ */
+function switchChainFamily(family: "evm" | "solana") {
+  el("chain-family-evm-btn").classList.toggle("active", family === "evm");
+  el("chain-family-evm-btn").setAttribute("aria-pressed", String(family === "evm"));
+  el("chain-family-solana-btn").classList.toggle("active", family === "solana");
+  el("chain-family-solana-btn").setAttribute("aria-pressed", String(family === "solana"));
+
+  el("evm-chain-panel").classList.toggle("hidden", family !== "evm");
+  el("solana-chain-panel").classList.toggle("hidden", family !== "solana");
+
+  if (family === "solana") {
+    updateSolanaInterstitialAddress();
+    const showInterstitial = !solanaInterstitialAcknowledged;
+    el("solana-interstitial").classList.toggle("hidden", !showInterstitial);
+    el("solana-chain-content").classList.toggle("hidden", showInterstitial);
+  }
+}
+
+/**
+ * Fetch and render account 0's real SOL mainnet balance — see `solana.ts`'s
+ * module doc comment for the RPC endpoint's own verification. Mirrors
+ * `fetchBalance`'s stale-response guard (`solanaBalanceRequestId`) for the
+ * same reason: a slow response from a superseded request (double-click
+ * refresh, or a lock/unlock in between) must never land after a newer one
+ * and get shown as current.
+ *
+ * Account 0 only, matching `SOLANA_ACCOUNTS_TO_SHOW` — there is only ever
+ * one Solana account displayed at this phase.
+ */
+async function fetchSolanaBalance() {
+  const valueEl = el("solana-balance-value");
+  const errorEl = el("solana-balance-error");
+  const refreshBtn = el<HTMLButtonElement>("refresh-solana-balance-btn");
+  const account = solanaAccounts.find((a) => a.index === 0);
+
+  const requestId = ++solanaBalanceRequestId;
+  errorEl.textContent = "";
+
+  if (!account) {
+    valueEl.textContent = "";
+    return;
+  }
+
+  valueEl.textContent = "Loading balance…";
+  valueEl.classList.add("loading");
+  refreshBtn.disabled = true;
+
+  try {
+    const lamports = await fetchSolanaBalanceLamports(account.address);
+    if (requestId !== solanaBalanceRequestId) {
+      return; // Superseded by a newer request; drop this result.
+    }
+    valueEl.textContent = `${formatLamportsAsSol(lamports)} SOL`;
+    valueEl.classList.remove("loading");
+  } catch (error) {
+    if (requestId !== solanaBalanceRequestId) {
+      return;
+    }
+    valueEl.textContent = "";
+    valueEl.classList.remove("loading");
+    errorEl.textContent = `Could not fetch SOL balance: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    if (requestId === solanaBalanceRequestId) {
+      refreshBtn.disabled = false;
+    }
+  }
+}
+
+/** Solscan's mainnet transaction URL — no cluster query param needed, mainnet is Solscan's default. */
+function solscanTxUrl(signature: string): string {
+  return `https://solscan.io/tx/${signature}`;
+}
+
+/**
+ * Fetch and display Solana account 2 (index 1)'s address and balance in the
+ * checkpoint-send panel — used both to show the recipient before sending,
+ * and to confirm its balance actually changed after the checkpoint send
+ * completes. Deliberately separate from the main `solanaAccounts` list
+ * (`SOLANA_ACCOUNTS_TO_SHOW` is 1): this is scoped narrowly to the
+ * checkpoint panel, not a general second-account feature.
+ */
+async function refreshSolanaCheckpointRecipient(): Promise<{ address: string; lamports: bigint } | null> {
+  const el_ = el("solana-checkpoint-recipient");
+  try {
+    const address = await invoke<string>("get_solana_account_address", { index: 1 });
+    const lamports = await fetchSolanaBalanceLamports(address);
+    el_.textContent = `Recipient (Account 2): ${address} — ${formatLamportsAsSol(lamports)} SOL`;
+    return { address, lamports };
+  } catch (error) {
+    el_.textContent = `Could not load Account 2: ${error instanceof Error ? error.message : String(error)}`;
+    return null;
+  }
+}
+
+/**
+ * The one-off checkpoint send: proves `sign_solana_transaction` actually
+ * works against real mainnet before any general Solana send flow exists.
+ * Sends account 0's entire balance, minus the fixed network fee, to this
+ * same wallet's account 2 — restricted to a second address this wallet
+ * itself controls, the same safety property the EVM send flow already
+ * enforces for its own destinations, not an arbitrary external address.
+ *
+ * TEMPORARY by design (see this panel's own warning text in index.html) —
+ * remove this function and its button once the checkpoint send has been
+ * confirmed on-chain, per the project's explicit "prove the signer once,
+ * then build the real flow separately" plan.
+ */
+async function runSolanaCheckpointSend() {
+  const statusEl = el("solana-checkpoint-status");
+  const errorEl = el("solana-checkpoint-error");
+  const sendBtn = el<HTMLButtonElement>("solana-checkpoint-send-btn");
+  const account = solanaAccounts.find((a) => a.index === 0);
+
+  errorEl.textContent = "";
+  statusEl.textContent = "";
+
+  if (!account) {
+    errorEl.textContent = "Account 0 has not been derived yet.";
+    return;
+  }
+
+  sendBtn.disabled = true;
+  try {
+    statusEl.textContent = "Checking balance…";
+    const balanceLamports = await fetchSolanaBalanceLamports(account.address);
+    if (balanceLamports <= BASE_FEE_LAMPORTS_PER_SIGNATURE) {
+      errorEl.textContent =
+        `Balance (${formatLamportsAsSol(balanceLamports)} SOL) is too small to cover the ` +
+        `${formatLamportsAsSol(BASE_FEE_LAMPORTS_PER_SIGNATURE)} SOL network fee.`;
+      return;
+    }
+    const lamportsToSend = balanceLamports - BASE_FEE_LAMPORTS_PER_SIGNATURE;
+
+    statusEl.textContent = "Fetching recipient…";
+    const recipient = await invoke<string>("get_solana_account_address", { index: 1 });
+
+    statusEl.textContent = "Fetching recent blockhash…";
+    const recentBlockhash = await fetchLatestBlockhash();
+
+    statusEl.textContent = "Signing…";
+    // `lamportsToSend` is well within Number's safe integer range for any
+    // realistic balance here (a trivial, human-funded test amount) — see
+    // the checkpoint panel's own warning text; this command is not meant
+    // for large balances.
+    const signedBase64 = await invoke<string>("sign_solana_transaction", {
+      to: recipient,
+      lamports: Number(lamportsToSend),
+      recentBlockhash,
+      fromIndex: 0,
+    });
+
+    statusEl.textContent = "Broadcasting…";
+    const signature = await sendRawSolanaTransaction(signedBase64);
+    statusEl.textContent = `Broadcast. Signature: ${signature} — ${solscanTxUrl(signature)} — waiting for confirmation…`;
+
+    const confirmation = await confirmSolanaTransaction(signature);
+    statusEl.textContent =
+      `Signature: ${signature}\n${solscanTxUrl(signature)}\nStatus: ${confirmation}\n` +
+      `Sent ${formatLamportsAsSol(lamportsToSend)} SOL to ${recipient}`;
+
+    void fetchSolanaBalance();
+    void refreshSolanaCheckpointRecipient();
+  } catch (error) {
+    errorEl.textContent = `Checkpoint send failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    sendBtn.disabled = false;
+  }
 }
 
 function renderAccountSelect() {
@@ -507,8 +898,206 @@ function switchActiveAccount(index: number) {
 }
 
 /**
- * Fetch and render the Sepolia ETH balance for `activeAccountAddress`, using
- * whatever RPC URL is currently in the override field.
+ * Populate the network selector from `NETWORKS` plus `customNetworks` — one
+ * line to add a *built-in* network here, same as everywhere else this
+ * refactor touches; a custom network needs no code change at all, since
+ * `customNetworks` is read directly.
+ *
+ * Grouped into "Mainnets" / "Custom" `<optgroup>`s rather than one flat
+ * list, so a user-added network is never mistaken for one of this app's own
+ * pre-verified built-ins. Testnets are deliberately excluded from this
+ * selector entirely — see `NETWORKS`/`DEFAULT_NETWORK`'s own doc comments:
+ * this app is mainnet-only in its user-facing surface, though the testnet
+ * configs and `SENDABLE_CHAIN_IDS` allowlist remain in the codebase for
+ * internal send-flow testing. Custom networks are always shown; this app
+ * doesn't classify a user-entered chain as testnet or mainnet at all (see
+ * `NetworkConfig.isCustom`'s own doc comment).
+ *
+ * Never filters out the currently active network, even if some future code
+ * path ends up with a testnet active — see the "blank page" incident this
+ * function's git history records: an earlier version force-switched away
+ * from a hidden-but-active network via `switchNetwork(DEFAULT_NETWORK)`,
+ * and when `DEFAULT_NETWORK` itself was a hidden testnet, that recursed
+ * infinitely before the app ever rendered past its static heading. Keeping
+ * the active network unconditionally visible avoids reintroducing that
+ * class of bug even though `DEFAULT_NETWORK` is a mainnet today.
+ */
+function renderNetworkSelect() {
+  const select = el<HTMLSelectElement>("network-select");
+  select.replaceChildren();
+
+  const mainnetGroup = document.createElement("optgroup");
+  mainnetGroup.label = "Mainnets";
+  const customGroup = document.createElement("optgroup");
+  customGroup.label = "Custom";
+
+  for (const network of Object.values(NETWORKS)) {
+    if (network.isTestnet && network.id !== activeNetworkId) {
+      continue;
+    }
+    const option = document.createElement("option");
+    option.value = network.id;
+    option.textContent = network.isTestnet ? `${network.label} · TEST` : network.label;
+    mainnetGroup.appendChild(option);
+  }
+  for (const network of customNetworks.values()) {
+    const option = document.createElement("option");
+    option.value = network.id;
+    option.textContent = network.label;
+    customGroup.appendChild(option);
+  }
+
+  select.appendChild(mainnetGroup);
+  if (customGroup.childElementCount > 0) {
+    select.appendChild(customGroup);
+  }
+  select.value = activeNetworkId;
+}
+
+/**
+ * Make `networkId` the active network: points the RPC-url field at that
+ * network's own verified default (never carries over the previous
+ * network's override — leaving one network's RPC URL sitting in the field
+ * while the banner says another is exactly the confused-about-which-
+ * network-I'm-looking-at state this feature has to avoid), refreshes the
+ * network selector/banner/send-availability, and re-fetches
+ * balance/token-balances/history for the newly active network. Account
+ * addresses themselves don't change across networks (same derivation,
+ * same address format on every EVM chain) — only what's fetched about them
+ * does, so `accounts`/`activeAccountIndex` are untouched here.
+ */
+function switchNetwork(networkId: string) {
+  if (!getNetworkConfig(networkId)) {
+    return;
+  }
+  activeNetworkId = networkId;
+  const network = activeNetwork();
+  el<HTMLInputElement>("rpc-url").value = network.defaultRpcUrl;
+  renderNetworkSelect();
+  renderNetworkBanner();
+  updateSendAvailability();
+  if (activeAccountAddress) {
+    void fetchBalance();
+    void fetchTxHistory();
+  }
+}
+
+/**
+ * Make it visually unmistakable which network is active — required
+ * reading before trusting any balance shown below it, since every mainnet
+ * here shows real value and every testnet doesn't. Distinct color/wording
+ * per network *kind* (`isTestnet`, not `sendSupported` — even though the
+ * two happen to correlate for every built-in network today, see
+ * `NetworkConfig.isTestnet`'s own doc comment on why they're deliberately
+ * separate flags) rather than just swapping a label: a color change is
+ * legible at a glance, in a way plain text sitting next to a dropdown is
+ * not.
+ *
+ * Also renders the separate, persistent "not vetted" warning for a custom
+ * network — required reading distinct from the mainnet/testnet banner
+ * itself, since it's a different kind of caution (unverified RPC source,
+ * not "real funds").
+ */
+function renderNetworkBanner() {
+  const network = activeNetwork();
+  const bannerEl = el("network-banner");
+  bannerEl.textContent = network.isTestnet
+    ? network.label
+    : `${network.label} — real funds${network.sendSupported ? "" : ", read-only (sending not supported yet)"}`;
+  bannerEl.classList.toggle("network-banner-mainnet", !network.isTestnet);
+  bannerEl.classList.toggle("network-banner-testnet", network.isTestnet);
+
+  const warningEl = el("custom-network-warning");
+  warningEl.classList.toggle("hidden", !network.isCustom);
+  if (network.isCustom) {
+    warningEl.textContent =
+      `"${network.label}" is a custom network. Its RPC endpoint has not been vetted by this app — ` +
+      `unlike the built-in networks, it could theoretically serve incorrect balances or history. ` +
+      `Balance and send requests to it are also blocked by this app's security policy for now (see below).`;
+  }
+}
+
+/**
+ * Reflect the active network's `sendSupported` flag in the Send button
+ * itself — disabled with an explanatory hint, so a user on an unsupported
+ * network sees the restriction before entering the send flow at all, not
+ * after filling out a form and clicking through to review. `goToSend`
+ * still checks this too (defense in depth against a stale disabled state),
+ * but the button being disabled is what actually satisfies "show this
+ * clearly up front."
+ */
+function updateSendAvailability() {
+  const network = activeNetwork();
+  el<HTMLButtonElement>("send-nav-btn").disabled = !network.sendSupported;
+  el("send-nav-hint").textContent = network.sendSupported
+    ? ""
+    : `Sending is not supported on ${network.label} yet.`;
+}
+
+function readCustomNetworkFormInput(): CustomNetworkFormInput {
+  return {
+    label: el<HTMLInputElement>("custom-network-name").value,
+    rpcUrl: el<HTMLInputElement>("custom-network-rpc-url").value,
+    chainIdInput: el<HTMLInputElement>("custom-network-chain-id").value,
+    nativeCurrencySymbol: el<HTMLInputElement>("custom-network-currency").value,
+    explorerBaseUrlInput: el<HTMLInputElement>("custom-network-explorer-url").value,
+  };
+}
+
+function clearCustomNetworkForm() {
+  el<HTMLInputElement>("custom-network-name").value = "";
+  el<HTMLInputElement>("custom-network-rpc-url").value = "";
+  el<HTMLInputElement>("custom-network-chain-id").value = "";
+  el<HTMLInputElement>("custom-network-currency").value = "";
+  el<HTMLInputElement>("custom-network-explorer-url").value = "";
+  el("custom-network-error").textContent = "";
+}
+
+function showCustomNetworkForm() {
+  clearCustomNetworkForm();
+  el("custom-network-form").classList.remove("hidden");
+}
+
+function hideCustomNetworkForm() {
+  el("custom-network-form").classList.add("hidden");
+  clearCustomNetworkForm();
+}
+
+/**
+ * Validate the custom-network form and, on success, add it to
+ * `customNetworks` and switch to it immediately — so the newly-added
+ * network's persistent "not vetted" warning (see `renderNetworkBanner`) is
+ * the very next thing the user sees, not something they'd have to go find
+ * in the selector afterward.
+ *
+ * In-memory only, by design: `customNetworks` is a plain `Map`, not
+ * written anywhere on disk. Losing custom networks on restart is the
+ * accepted, deliberate scope of this feature for now — real persistence
+ * needs its own config storage format decision, not something to bolt on
+ * here just because it would be easy to `JSON.stringify` a `Map`.
+ */
+function handleAddCustomNetwork() {
+  const errorEl = el("custom-network-error");
+  errorEl.textContent = "";
+
+  const existingNetworks = [...Object.values(NETWORKS), ...customNetworks.values()];
+  const result = validateCustomNetworkInput(readCustomNetworkFormInput(), existingNetworks);
+  if (!result.ok) {
+    errorEl.textContent = result.error;
+    return;
+  }
+
+  const id = `custom-${nextCustomNetworkSeq++}`;
+  customNetworks.set(id, buildCustomNetworkConfig(id, result.value));
+
+  hideCustomNetworkForm();
+  switchNetwork(id);
+}
+
+/**
+ * Fetch and render the active network's native-currency balance (ETH, BNB,
+ * ... — see `NetworkConfig.nativeCurrencySymbol`) for `activeAccountAddress`,
+ * using whatever RPC URL is currently in the override field.
  *
  * No secret material anywhere in this path: an address and a balance are
  * both public. This function never touches `invoke`, the vault, or any
@@ -519,6 +1108,7 @@ async function fetchBalance() {
   const errorEl = el("balance-error");
   const refreshBtn = el<HTMLButtonElement>("refresh-balance-btn");
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
+  const network = activeNetwork();
 
   if (!activeAccountAddress) {
     return;
@@ -527,13 +1117,18 @@ async function fetchBalance() {
   const requestId = ++balanceRequestId;
   errorEl.textContent = "";
 
+  if (network.isCustom) {
+    errorEl.textContent = customNetworkRpcBlockedMessage(network);
+    return;
+  }
+
   if (!rpcUrl) {
     errorEl.textContent = "Enter an RPC endpoint URL.";
     return;
   }
 
   // Checked before touching the network at all — not by reacting to a CSP
-  // violation after the fact. See ALLOWED_RPC_ORIGINS's doc comment: a
+  // violation after the fact. See `allowedRpcOrigin`'s doc comment: a
   // securitypolicyviolation event does fire for a blocked connect-src
   // request, but confirmed (empirically, not assumed) to always arrive
   // after a fetch's rejection is already handled, so it cannot be used to
@@ -545,10 +1140,10 @@ async function fetchBalance() {
     errorEl.textContent = `"${rpcUrl}" is not a valid URL.`;
     return;
   }
-  if (!ALLOWED_RPC_ORIGINS.has(origin)) {
+  if (origin !== allowedRpcOrigin(network)) {
     errorEl.textContent =
-      `This app's security policy only allows the default Sepolia endpoint ` +
-      `(${DEFAULT_SEPOLIA_RPC_URL}) right now. "${rpcUrl}" would be blocked.`;
+      `This app's security policy only allows ${network.label}'s default endpoint ` +
+      `(${network.defaultRpcUrl}) right now. "${rpcUrl}" would be blocked.`;
     return;
   }
 
@@ -562,17 +1157,17 @@ async function fetchBalance() {
   // Independent of the ETH balance fetch below (its own request-id guard,
   // its own per-token error handling) — a slow or failing token read must
   // never block or blank out the ETH balance, and vice versa.
-  void fetchTokenBalances(rpcUrl);
+  void fetchTokenBalances(network, rpcUrl);
 
   try {
-    const balanceWei = await sepoliaClient(rpcUrl).getBalance({
+    const balanceWei = await rpcClient(network, rpcUrl).getBalance({
       address: activeAccountAddress,
     });
 
     if (requestId !== balanceRequestId) {
       return; // Superseded by a newer request; drop this result.
     }
-    valueEl.textContent = `${formatEther(balanceWei)} ETH`;
+    valueEl.textContent = `${formatEther(balanceWei)} ${network.nativeCurrencySymbol}`;
     valueEl.classList.remove("loading");
   } catch (error) {
     if (requestId !== balanceRequestId) {
@@ -585,7 +1180,7 @@ async function fetchBalance() {
     valueEl.classList.remove("loading");
 
     // A CSP block can no longer reach here — it's caught by the
-    // ALLOWED_RPC_ORIGINS check above before this try block starts. This is
+    // allowedRpcOrigin check above before this try block starts. This is
     // a genuine network/RPC failure: unreachable host, timeout, bad
     // response, etc.
     errorEl.textContent = `Could not fetch balance: ${error instanceof Error ? error.message : String(error)}`;
@@ -597,10 +1192,10 @@ async function fetchBalance() {
 }
 
 /**
- * Fetch and render each token in `SEPOLIA_TOKENS`'s balance for
+ * Fetch and render each of `network`'s tokens' balance for
  * `activeAccountAddress`, over `rpcUrl` (already validated by the caller —
- * `fetchBalance` — against `ALLOWED_RPC_ORIGINS`, so this trusts it as-is
- * rather than re-checking).
+ * `fetchBalance` — against `allowedRpcOrigin(network)`, so this trusts it
+ * as-is rather than re-checking).
  *
  * Each token is fetched independently: a failing contract read (bad RPC
  * response, a token temporarily returning garbage, whatever) shows an error
@@ -608,7 +1203,7 @@ async function fetchBalance() {
  * never takes down the rest of the list. This is why the per-token
  * `Promise` calls below are not wrapped in a single `Promise.all`.
  */
-async function fetchTokenBalances(rpcUrl: string) {
+async function fetchTokenBalances(network: NetworkConfig, rpcUrl: string) {
   const listEl = el("token-balance-list");
 
   if (!activeAccountAddress) {
@@ -619,9 +1214,9 @@ async function fetchTokenBalances(rpcUrl: string) {
   const requestId = ++tokenBalanceRequestId;
   listEl.replaceChildren();
 
-  const client = sepoliaClient(rpcUrl);
+  const client = rpcClient(network, rpcUrl);
 
-  for (const { address: tokenAddress } of SEPOLIA_TOKENS) {
+  for (const { address: tokenAddress } of network.tokens) {
     const row = renderTokenRow({ address: tokenAddress, state: "loading" });
     listEl.appendChild(row);
 
@@ -630,7 +1225,10 @@ async function fetchTokenBalances(rpcUrl: string) {
         // Opportunistically warms the cache the transaction-history
         // renderer reads to label a token-transfer row -- this fetch was
         // happening anyway, so there's no extra request for that benefit.
-        tokenMetadataCache.set(tokenAddress, { symbol: result.symbol, decimals: result.decimals });
+        tokenMetadataCache.set(tokenCacheKey(network.chainId, tokenAddress), {
+          symbol: result.symbol,
+          decimals: result.decimals,
+        });
         if (requestId !== tokenBalanceRequestId) {
           return; // Superseded by a newer fetch (refresh, lock, RPC change).
         }
@@ -700,12 +1298,12 @@ function describeEtherscanError(error: unknown): string {
 }
 
 /**
- * Fetch and render `activeAccountAddress`'s Sepolia transaction history,
- * merging two Etherscan endpoints (see the top-level doc comment in
- * `etherscan.ts` for why both are needed): `txlist` for plain ETH activity,
- * `tokentx` for ERC-20 transfers sent OR received. The two are fetched
- * concurrently and independently — one failing must not hide the other's
- * data.
+ * Fetch and render `activeAccountAddress`'s transaction history on the
+ * active network, merging two Etherscan endpoints (see the top-level doc
+ * comment in `etherscan.ts` for why both are needed): `txlist` for plain
+ * ETH activity, `tokentx` for ERC-20 transfers sent OR received. The two
+ * are fetched concurrently and independently — one failing must not hide
+ * the other's data.
  *
  * Three end states, kept visually distinct rather than collapsed into one
  * blank-or-generic screen: a genuine empty history (new wallet, nothing
@@ -725,6 +1323,7 @@ async function fetchTxHistory() {
     return;
   }
   const address = activeAccountAddress;
+  const network = activeNetwork();
 
   const requestId = ++txHistoryRequestId;
   errorEl.textContent = "";
@@ -740,22 +1339,27 @@ async function fetchTxHistory() {
   // reported display instead of this app's own contract-read one.
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
   if (rpcUrl) {
-    const client = sepoliaClient(rpcUrl);
+    const client = rpcClient(network, rpcUrl);
     void Promise.all(
-      SEPOLIA_TOKENS.filter((t) => !tokenMetadataCache.has(t.address)).map(async (t) => {
-        try {
-          tokenMetadataCache.set(t.address, await fetchTokenMetadata(client, t.address));
-        } catch {
-          // See comment above: best-effort only.
-        }
-      }),
+      network.tokens
+        .filter((t) => !tokenMetadataCache.has(tokenCacheKey(network.chainId, t.address)))
+        .map(async (t) => {
+          try {
+            tokenMetadataCache.set(
+              tokenCacheKey(network.chainId, t.address),
+              await fetchTokenMetadata(client, t.address),
+            );
+          } catch {
+            // See comment above: best-effort only.
+          }
+        }),
     );
   }
 
   try {
     const [txResult, tokenResult] = await Promise.allSettled([
-      fetchSepoliaTransactions(address),
-      fetchSepoliaTokenTransfers(address),
+      fetchTransactions(network.chainId, address),
+      fetchTokenTransfers(network.chainId, address),
     ]);
 
     if (requestId !== txHistoryRequestId) {
@@ -770,7 +1374,7 @@ async function fetchTxHistory() {
 
     const transactions = txResult.status === "fulfilled" ? txResult.value : [];
     const tokenTransfers = tokenResult.status === "fulfilled" ? tokenResult.value : [];
-    const merged = mergeHistory(transactions, tokenTransfers);
+    const merged = mergeHistory(network, transactions, tokenTransfers);
 
     if (merged.length === 0) {
       emptyEl.classList.remove("hidden");
@@ -817,7 +1421,8 @@ interface HistoryItem {
  * than misrepresented as a mystery 0-ETH send.
  */
 function mergeHistory(
-  transactions: SepoliaTransaction[],
+  network: NetworkConfig,
+  transactions: EthTransaction[],
   tokenTransfers: TokenTransferEvent[],
 ): HistoryItem[] {
   const tokenHashes = new Set(tokenTransfers.map((t) => t.hash.toLowerCase()));
@@ -825,14 +1430,18 @@ function mergeHistory(
   const items: HistoryItem[] = tokenTransfers.map((event) => ({
     hash: event.hash,
     timestamp: event.timestamp,
-    render: () => renderTokenTransferItem(event),
+    render: () => renderTokenTransferItem(network, event),
   }));
 
   for (const tx of transactions) {
     if (tokenHashes.has(tx.hash.toLowerCase())) {
       continue; // tokentx already represents this hash, with the real token details.
     }
-    items.push({ hash: tx.hash, timestamp: tx.timestamp, render: () => renderTxHistoryItem(tx) });
+    items.push({
+      hash: tx.hash,
+      timestamp: tx.timestamp,
+      render: () => renderTxHistoryItem(network, tx),
+    });
   }
 
   items.sort((a, b) => b.timestamp - a.timestamp);
@@ -855,10 +1464,10 @@ interface TokenTransferDescription {
 }
 
 /**
- * If `tx` calls `transfer(address,uint256)` on a token this app knows about
- * (`SEPOLIA_TOKENS`), decode the real recipient and amount; otherwise
- * `null` (a plain value transfer, or a call to some other contract/function
- * this app doesn't render specially).
+ * If `tx` calls `transfer(address,uint256)` on a token `network` knows
+ * about (`network.tokens`), decode the real recipient and amount;
+ * otherwise `null` (a plain value transfer, or a call to some other
+ * contract/function this app doesn't render specially).
  *
  * By the time this runs, `mergeHistory` has already dropped every `txlist`
  * entry whose hash is also in `tokentx` — so a token-shaped transaction
@@ -867,11 +1476,14 @@ interface TokenTransferDescription {
  * event and so was never indexed there. A successful send is rendered via
  * `renderTokenTransferItem` instead, from the richer `tokentx` data.
  */
-function describeTokenTransfer(tx: SepoliaTransaction): TokenTransferDescription | null {
+function describeTokenTransfer(
+  network: NetworkConfig,
+  tx: EthTransaction,
+): TokenTransferDescription | null {
   if (tx.to === null) {
     return null;
   }
-  const token = SEPOLIA_TOKENS.find((t) => t.address.toLowerCase() === tx.to?.toLowerCase());
+  const token = network.tokens.find((t) => t.address.toLowerCase() === tx.to?.toLowerCase());
   if (!token) {
     return null;
   }
@@ -901,6 +1513,7 @@ function renderHistoryRow(row: {
   otherPartyDisplay: string;
   timestamp: number;
   hash: string;
+  explorerBaseUrl: string;
 }): HTMLLIElement {
   const item = document.createElement("li");
   item.className = "tx-history-item";
@@ -935,23 +1548,28 @@ function renderHistoryRow(row: {
   timeEl.textContent = new Date(row.timestamp * 1000).toLocaleString();
   item.appendChild(timeEl);
 
-  const viewBtn = document.createElement("button");
-  viewBtn.type = "button";
-  viewBtn.textContent = "View on explorer";
-  viewBtn.addEventListener("click", () => {
-    // Opened in the system's default browser (Tauri's opener plugin), not
-    // an in-app view — the whole point is letting the user independently
-    // verify what this app shows them, on a page this app doesn't control.
-    void openUrl(sepoliaExplorerTxUrl(row.hash));
-  });
-  item.appendChild(viewBtn);
+  // A custom network with no explorer URL entered has nothing to link to
+  // (see NetworkConfig.explorerBaseUrl's doc comment) -- no button at all,
+  // rather than one that opens a broken URL.
+  if (row.explorerBaseUrl) {
+    const viewBtn = document.createElement("button");
+    viewBtn.type = "button";
+    viewBtn.textContent = "View on explorer";
+    viewBtn.addEventListener("click", () => {
+      // Opened in the system's default browser (Tauri's opener plugin), not
+      // an in-app view — the whole point is letting the user independently
+      // verify what this app shows them, on a page this app doesn't control.
+      void openUrl(explorerTxUrl(row.explorerBaseUrl, row.hash));
+    });
+    item.appendChild(viewBtn);
+  }
 
   return item;
 }
 
-function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
+function renderTxHistoryItem(network: NetworkConfig, tx: EthTransaction): HTMLLIElement {
   const address = activeAccountAddress as Address;
-  const tokenTransfer = describeTokenTransfer(tx);
+  const tokenTransfer = describeTokenTransfer(network, tx);
 
   // A token-transfer row reaching this function is always the
   // failed-transfer edge case (see describeTokenTransfer's doc comment) —
@@ -964,7 +1582,7 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
   if (tokenTransfer) {
     direction = "Sent";
     otherParty = tokenTransfer.recipient;
-    const metadata = tokenMetadataCache.get(tokenTransfer.tokenAddress);
+    const metadata = tokenMetadataCache.get(tokenCacheKey(network.chainId, tokenTransfer.tokenAddress));
     amountDisplay = metadata
       ? `${formatUnits(tokenTransfer.amountRaw, metadata.decimals)} ${metadata.symbol}`
       // Cache miss (rare -- see fetchTxHistory's warm-up): still correctly
@@ -989,7 +1607,7 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
       direction = "Received";
       otherParty = tx.from;
     }
-    amountDisplay = `${formatEther(tx.valueWei)} ETH`;
+    amountDisplay = `${formatEther(tx.valueWei)} ${network.nativeCurrencySymbol}`;
   }
 
   return renderHistoryRow({
@@ -999,6 +1617,7 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
     otherPartyDisplay: direction === "Self" ? "This wallet's own address" : otherParty,
     timestamp: tx.timestamp,
     hash: tx.hash,
+    explorerBaseUrl: network.explorerBaseUrl,
   });
 }
 
@@ -1010,7 +1629,7 @@ function renderTxHistoryItem(tx: SepoliaTransaction): HTMLLIElement {
  * reverted call emits no `Transfer` event, so every event this endpoint
  * returns already represents a transfer that genuinely happened.
  */
-function renderTokenTransferItem(event: TokenTransferEvent): HTMLLIElement {
+function renderTokenTransferItem(network: NetworkConfig, event: TokenTransferEvent): HTMLLIElement {
   const address = activeAccountAddress as Address;
   const isFromUs = event.from.toLowerCase() === address.toLowerCase();
   const isToUs = event.to.toLowerCase() === address.toLowerCase();
@@ -1035,7 +1654,7 @@ function renderTokenTransferItem(event: TokenTransferEvent): HTMLLIElement {
   // avoidable. Falls back to Etherscan's values rather than blocking
   // render on a fetch of its own; see etherscan.ts's top-level doc comment
   // on why that fallback is still reasonably trustworthy.
-  const metadata = tokenMetadataCache.get(event.tokenAddress);
+  const metadata = tokenMetadataCache.get(tokenCacheKey(network.chainId, event.tokenAddress));
   const decimals = metadata?.decimals ?? event.tokenDecimals;
   const symbol = metadata?.symbol ?? event.tokenSymbol;
 
@@ -1046,6 +1665,7 @@ function renderTokenTransferItem(event: TokenTransferEvent): HTMLLIElement {
     otherPartyDisplay: direction === "Self" ? "This wallet's own address" : otherParty,
     timestamp: event.timestamp,
     hash: event.hash,
+    explorerBaseUrl: network.explorerBaseUrl,
   });
 }
 
@@ -1078,11 +1698,26 @@ function renderTokenTransferItem(event: TokenTransferEvent): HTMLLIElement {
  * that if the call fails, the error lands on a screen the user can
  * actually see, rather than in `#send-error` while `#step-send` is still
  * `hidden`.
+ *
+ * Also checks the active network's `sendSupported` flag before anything
+ * else. `updateSendAvailability` already disables the nav button that gets
+ * here, so this is defense in depth against a stale/bypassed disabled
+ * state, not the primary way a user encounters the restriction — but it
+ * still runs first, before the destination list or a single form field is
+ * populated, so if it's ever the path that catches it, the message is
+ * still the first thing shown, not something reached after filling out a
+ * form.
  */
 async function goToSend() {
   clearSendState();
   showStep("send");
   const errorEl = el("send-error");
+  const network = activeNetwork();
+
+  if (!network.sendSupported) {
+    errorEl.textContent = `Sending is not supported on ${network.label} yet.`;
+    return;
+  }
 
   try {
     await invoke<string>("get_account_address", { index: activeAccountIndex });
@@ -1113,11 +1748,11 @@ async function goToSend() {
 
   const assetSelect = el<HTMLSelectElement>("send-asset-select");
   assetSelect.replaceChildren();
-  const ethOption = document.createElement("option");
-  ethOption.value = "ETH";
-  ethOption.textContent = "ETH";
-  assetSelect.appendChild(ethOption);
-  for (const token of SEPOLIA_TOKENS) {
+  const nativeOption = document.createElement("option");
+  nativeOption.value = NATIVE_ASSET_VALUE;
+  nativeOption.textContent = network.nativeCurrencySymbol;
+  assetSelect.appendChild(nativeOption);
+  for (const token of network.tokens) {
     const option = document.createElement("option");
     option.value = token.address;
     // The list's cosmetic label, not a fetched symbol -- selecting this
@@ -1125,7 +1760,7 @@ async function goToSend() {
     option.textContent = token.label;
     assetSelect.appendChild(option);
   }
-  assetSelect.value = "ETH";
+  assetSelect.value = NATIVE_ASSET_VALUE;
 }
 
 /**
@@ -1143,9 +1778,9 @@ async function handleAssetSelectionChanged() {
   const errorEl = el("send-error");
   const value = assetSelect.value;
 
-  if (value === "ETH") {
+  if (value === NATIVE_ASSET_VALUE) {
     selectedAsset = null;
-    unitEl.textContent = "ETH";
+    unitEl.textContent = activeNetwork().nativeCurrencySymbol;
     return;
   }
 
@@ -1156,10 +1791,11 @@ async function handleAssetSelectionChanged() {
   errorEl.textContent = "";
 
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
+  const network = activeNetwork();
   try {
-    const client = sepoliaClient(rpcUrl);
+    const client = rpcClient(network, rpcUrl);
     const metadata = await fetchTokenMetadata(client, tokenAddress);
-    tokenMetadataCache.set(tokenAddress, metadata);
+    tokenMetadataCache.set(tokenCacheKey(network.chainId, tokenAddress), metadata);
     // The selector may have changed again while this fetch was in flight;
     // only apply the result if it's still what's selected.
     if (el<HTMLSelectElement>("send-asset-select").value !== tokenAddress) {
@@ -1196,6 +1832,23 @@ async function reviewSend() {
   const reviewBtn = el<HTMLButtonElement>("send-review-btn");
   errorEl.textContent = "";
 
+  const network = activeNetwork();
+  // Same defense-in-depth reasoning as goToSend's own check: the nav button
+  // and goToSend both already gate this, but a network switch mid-flow
+  // (send screen left open, network changed, back to this screen) is a real
+  // path that could reach here with a now-unsupported network active.
+  if (!network.sendSupported) {
+    errorEl.textContent = `Sending is not supported on ${network.label} yet.`;
+    return;
+  }
+  // Custom networks are `sendSupported: true` by default (per this
+  // feature's spec) but still can't actually send anything -- see
+  // `customNetworkRpcBlockedMessage`'s doc comment.
+  if (network.isCustom) {
+    errorEl.textContent = customNetworkRpcBlockedMessage(network);
+    return;
+  }
+
   const recipientSelect = el<HTMLSelectElement>("send-recipient-select");
   const recipient = recipientSelect.value as Address | "";
   const amountInput = el<HTMLInputElement>("send-amount").value.trim();
@@ -1205,7 +1858,7 @@ async function reviewSend() {
     errorEl.textContent = "No destination account selected — try leaving and re-entering this screen.";
     return;
   }
-  if (el<HTMLSelectElement>("send-asset-select").value !== "ETH" && !asset) {
+  if (el<HTMLSelectElement>("send-asset-select").value !== NATIVE_ASSET_VALUE && !asset) {
     errorEl.textContent = "Still loading token info — wait a moment and try again.";
     return;
   }
@@ -1248,15 +1901,15 @@ async function reviewSend() {
     errorEl.textContent = `"${rpcUrl}" is not a valid URL.`;
     return;
   }
-  if (!ALLOWED_RPC_ORIGINS.has(origin)) {
+  if (origin !== allowedRpcOrigin(network)) {
     errorEl.textContent =
-      `This app's security policy only allows the default Sepolia endpoint ` +
-      `(${DEFAULT_SEPOLIA_RPC_URL}) right now.`;
+      `This app's security policy only allows ${network.label}'s default endpoint ` +
+      `(${network.defaultRpcUrl}) right now.`;
     return;
   }
 
   reviewBtn.disabled = true;
-  const client = sepoliaClient(rpcUrl);
+  const client = rpcClient(network, rpcUrl);
 
   let nonce: number;
   statusEl.textContent = "Fetching nonce…";
@@ -1327,6 +1980,7 @@ async function reviewSend() {
 
   const maxFeeTotal = maxFeePerGas * gasLimit;
   el("review-recipient").textContent = recipient;
+  el("review-network").textContent = `${network.label} (chain ID ${network.chainId})`;
   el("review-fee").textContent =
     `${formatGwei(maxFeePerGas)} gwei max fee / ${formatGwei(maxPriorityFeePerGas)} gwei ` +
     `max priority fee (gas limit ${gasLimit})`;
@@ -1341,9 +1995,10 @@ async function reviewSend() {
       maxPriorityFeePerGas,
       gasLimit,
     };
-    el("review-amount").textContent = `${formatEther(amountWei)} ETH`;
+    el("review-amount").textContent = `${formatEther(amountWei)} ${network.nativeCurrencySymbol}`;
     el("review-total").textContent =
-      `${formatEther(amountWei + maxFeeTotal)} ETH (amount + worst-case fee; the actual fee charged is usually lower)`;
+      `${formatEther(amountWei + maxFeeTotal)} ${network.nativeCurrencySymbol} ` +
+      `(amount + worst-case fee; the actual fee charged is usually lower)`;
   } else {
     preparedSend = {
       kind: "token",
@@ -1358,12 +2013,13 @@ async function reviewSend() {
       gasLimit,
     };
     el("review-amount").textContent = `${formatUnits(amountRaw, asset.decimals)} ${asset.symbol}`;
-    // No single meaningful "total" here -- the token amount and the ETH
-    // network fee are different assets and can't be summed. Shown
-    // separately instead of silently reusing the ETH-send phrasing (which
-    // would have summed a USDC amount with a wei figure into nonsense).
+    // No single meaningful "total" here -- the token amount and the native-
+    // currency network fee are different assets and can't be summed. Shown
+    // separately instead of silently reusing the native-send phrasing
+    // (which would have summed a USDC amount with a wei figure into
+    // nonsense).
     el("review-total").textContent =
-      `${formatEther(maxFeeTotal)} ETH network fee (worst case), separate from the ` +
+      `${formatEther(maxFeeTotal)} ${network.nativeCurrencySymbol} network fee (worst case), separate from the ` +
       `${formatUnits(amountRaw, asset.decimals)} ${asset.symbol} being sent`;
   }
 
@@ -1410,16 +2066,32 @@ async function confirmSend() {
   showStep("send-status");
 
   const rpcUrl = el<HTMLInputElement>("rpc-url").value.trim();
-  const client = sepoliaClient(rpcUrl);
+  const network = activeNetwork();
+  // Not normally reachable (reviewSend already refuses to prepare a send
+  // for a custom network), but checked again here too, same defense-in-
+  // depth reasoning as the sendSupported checks elsewhere in this flow.
+  if (network.isCustom) {
+    finalErrorEl.textContent = customNetworkRpcBlockedMessage(network);
+    el("send-done-btn").classList.remove("hidden");
+    return;
+  }
+  const client = rpcClient(network, rpcUrl);
 
   progressEl.textContent = "Signing…";
   let rawSignedHex: string;
   try {
     // Which backend command signs this depends on the kind of send --
-    // sign_transaction for a plain ETH value transfer, sign_token_transfer
-    // for an ERC-20 call. Both derive from and sign as whichever account is
-    // currently active, not a fixed account — the whole point of the
-    // account switcher.
+    // sign_transaction for a plain native-currency transfer,
+    // sign_token_transfer for an ERC-20 call. Both derive from and sign as
+    // whichever account is currently active, not a fixed account — the
+    // whole point of the account switcher. `chainId` is the active
+    // network's real chain ID, not a hardcoded constant -- the backend's
+    // own require_supported_chain_id + require_sendable_chain_id checks
+    // are the actual enforcement that a non-sendable network is refused;
+    // this value is just reporting the truth to that check, not what makes
+    // the restriction hold (the frontend's `network.sendSupported` gate
+    // upstream, in goToSend/reviewSend, is what normally prevents reaching
+    // this call at all for a mainnet).
     rawSignedHex =
       send.kind === "eth"
         ? await invoke<string>("sign_transaction", {
@@ -1429,7 +2101,7 @@ async function confirmSend() {
             maxFeePerGas: send.maxFeePerGas.toString(),
             maxPriorityFeePerGas: send.maxPriorityFeePerGas.toString(),
             gasLimit: Number(send.gasLimit),
-            chainId: SEPOLIA_CHAIN_ID,
+            chainId: network.chainId,
             fromIndex: activeAccountIndex,
           })
         : await invoke<string>("sign_token_transfer", {
@@ -1440,7 +2112,7 @@ async function confirmSend() {
             maxFeePerGas: send.maxFeePerGas.toString(),
             maxPriorityFeePerGas: send.maxPriorityFeePerGas.toString(),
             gasLimit: Number(send.gasLimit),
-            chainId: SEPOLIA_CHAIN_ID,
+            chainId: network.chainId,
             fromIndex: activeAccountIndex,
           });
   } catch (error) {
@@ -1530,6 +2202,19 @@ async function lock() {
   el("account-list-error").textContent = "";
   el<HTMLSelectElement>("account-select").replaceChildren();
   el("unlocked-address").textContent = "";
+  solanaAccounts = [];
+  el("solana-account-error").textContent = "";
+  el("solana-account-list").replaceChildren();
+  solanaBalanceRequestId++; // Invalidate any Solana balance fetch still in flight.
+  el("solana-balance-value").textContent = "";
+  el("solana-balance-value").classList.remove("loading");
+  el("solana-balance-error").textContent = "";
+  el("solana-checkpoint-recipient").textContent = "";
+  el("solana-checkpoint-status").textContent = "";
+  el("solana-checkpoint-error").textContent = "";
+  solanaInterstitialAcknowledged = false;
+  el("solana-interstitial-address").textContent = "";
+  switchChainFamily("evm");
   el("balance-value").textContent = "";
   el("balance-value").classList.remove("loading");
   el("balance-error").textContent = "";
@@ -1545,8 +2230,27 @@ async function lock() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  el<HTMLInputElement>("rpc-url").value = DEFAULT_SEPOLIA_RPC_URL;
+  renderNetworkSelect();
+  el<HTMLInputElement>("rpc-url").value = activeNetwork().defaultRpcUrl;
+  renderNetworkBanner();
+  updateSendAvailability();
+  el<HTMLSelectElement>("network-select").addEventListener("change", (event) => {
+    switchNetwork((event.target as HTMLSelectElement).value);
+  });
+  el("add-custom-network-btn").addEventListener("click", showCustomNetworkForm);
+  el("custom-network-cancel-btn").addEventListener("click", hideCustomNetworkForm);
+  el("custom-network-add-btn").addEventListener("click", handleAddCustomNetwork);
   el("refresh-balance-btn").addEventListener("click", () => void fetchBalance());
+  el("refresh-solana-balance-btn").addEventListener("click", () => void fetchSolanaBalance());
+  el("chain-family-evm-btn").addEventListener("click", () => switchChainFamily("evm"));
+  el("chain-family-solana-btn").addEventListener("click", () => switchChainFamily("solana"));
+  el("solana-interstitial-continue-btn").addEventListener("click", () => {
+    solanaInterstitialAcknowledged = true;
+    el("solana-interstitial").classList.add("hidden");
+    el("solana-chain-content").classList.remove("hidden");
+  });
+  el("solana-checkpoint-send-btn").addEventListener("click", () => void runSolanaCheckpointSend());
+  el("solana-checkpoint-refresh-recipient-btn").addEventListener("click", () => void refreshSolanaCheckpointRecipient());
   el("refresh-tx-history-btn").addEventListener("click", () => void fetchTxHistory());
   el<HTMLSelectElement>("account-select").addEventListener("change", (event) => {
     switchActiveAccount(Number((event.target as HTMLSelectElement).value));

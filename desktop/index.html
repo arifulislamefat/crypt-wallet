@@ -35,53 +35,186 @@
       <section id="step-unlocked" class="step hidden">
         <h2>Wallet unlocked</h2>
 
-        <label for="account-select" class="hint">Active account</label>
-        <select id="account-select" class="account-select"></select>
-        <p id="account-list-error" class="error"></p>
-        <p id="unlocked-address" class="address"></p>
+        <!--
+          Chain-family switch: which of the two structurally-unrelated
+          address spaces this wallet holds (EVM's shared secp256k1 address,
+          Solana's own ed25519 address) is currently in view. Deliberately
+          a real, discrete switch action — not two panels shown at once —
+          so "you're now looking at a different address" is something that
+          happens at one clear moment, not something a user must notice
+          passively. See `switchChainFamily` in main.ts.
+        -->
+        <div class="row chain-family-toggle">
+          <button id="chain-family-evm-btn" type="button" class="chain-family-btn active" aria-pressed="true">
+            EVM
+          </button>
+          <button id="chain-family-solana-btn" type="button" class="chain-family-btn" aria-pressed="false">
+            Solana
+          </button>
+        </div>
 
-        <fieldset class="balance-section">
-          <legend>Balance — Sepolia testnet</legend>
-
-          <p id="balance-value" class="balance-value" aria-live="polite"></p>
-          <p id="balance-error" class="error"></p>
+        <div id="evm-chain-panel">
+          <label for="network-select" class="hint">Network</label>
+          <select id="network-select" class="account-select"></select>
+          <p id="network-banner" class="network-banner"></p>
+          <p id="custom-network-warning" class="warning hidden"></p>
 
           <div class="row">
-            <button id="refresh-balance-btn" type="button">Refresh balance</button>
+            <button id="add-custom-network-btn" type="button">Add custom network</button>
           </div>
 
-          <label for="rpc-url" class="hint rpc-label">RPC endpoint (this session only)</label>
-          <input id="rpc-url" type="text" spellcheck="false" />
+          <fieldset id="custom-network-form" class="hidden">
+            <legend>Add a custom EVM network</legend>
+            <p class="hint">
+              Its RPC endpoint is not vetted by this app, unlike the built-in
+              networks above. Balance and send requests to it are blocked by
+              this app's security policy for now — this only saves the
+              configuration.
+            </p>
 
-          <p class="hint token-balances-label">Token balances</p>
-          <ul id="token-balance-list" class="token-balance-list" aria-live="polite"></ul>
-        </fieldset>
+            <label for="custom-network-name" class="hint rpc-label">Network name</label>
+            <input id="custom-network-name" type="text" spellcheck="false" placeholder="e.g. My Devnet" />
 
-        <fieldset class="tx-history-section">
-          <legend>Transaction history — Sepolia testnet</legend>
+            <label for="custom-network-rpc-url" class="hint rpc-label">RPC URL</label>
+            <input id="custom-network-rpc-url" type="text" spellcheck="false" placeholder="https://…" />
 
-          <div class="row">
-            <button id="refresh-tx-history-btn" type="button">Refresh history</button>
-          </div>
+            <label for="custom-network-chain-id" class="hint rpc-label">Chain ID</label>
+            <input id="custom-network-chain-id" type="text" inputmode="numeric" spellcheck="false" placeholder="e.g. 1337" />
 
-          <p id="tx-history-status" class="hint" aria-live="polite"></p>
-          <p id="tx-history-error" class="error"></p>
-          <p id="tx-history-empty" class="hint hidden">
-            No transactions yet for this address on Sepolia.
+            <label for="custom-network-currency" class="hint rpc-label">Native currency symbol</label>
+            <input id="custom-network-currency" type="text" spellcheck="false" placeholder="e.g. ETH" />
+
+            <label for="custom-network-explorer-url" class="hint rpc-label">Block explorer URL (optional)</label>
+            <input id="custom-network-explorer-url" type="text" spellcheck="false" placeholder="https://…" />
+
+            <div class="row">
+              <button id="custom-network-cancel-btn" type="button">Cancel</button>
+              <button id="custom-network-add-btn" type="button">Add network</button>
+            </div>
+            <p id="custom-network-error" class="error"></p>
+          </fieldset>
+
+          <label for="account-select" class="hint">Active account</label>
+          <select id="account-select" class="account-select"></select>
+          <p id="account-list-error" class="error"></p>
+          <p class="address-row">
+            <span class="chain-badge chain-badge-evm">EVM</span>
+            <span id="unlocked-address" class="address"></span>
           </p>
 
-          <ul id="tx-history-list" class="tx-history-list" aria-live="polite"></ul>
-        </fieldset>
+          <fieldset class="balance-section">
+            <legend>Balance</legend>
+
+            <p id="balance-value" class="balance-value" aria-live="polite"></p>
+            <p id="balance-error" class="error"></p>
+
+            <div class="row">
+              <button id="refresh-balance-btn" type="button">Refresh balance</button>
+            </div>
+
+            <label for="rpc-url" class="hint rpc-label">RPC endpoint (this session only)</label>
+            <input id="rpc-url" type="text" spellcheck="false" />
+
+            <p class="hint token-balances-label">Token balances</p>
+            <ul id="token-balance-list" class="token-balance-list" aria-live="polite"></ul>
+          </fieldset>
+
+          <fieldset class="tx-history-section">
+            <legend>Transaction history</legend>
+
+            <div class="row">
+              <button id="refresh-tx-history-btn" type="button">Refresh history</button>
+            </div>
+
+            <p id="tx-history-status" class="hint" aria-live="polite"></p>
+            <p id="tx-history-error" class="error"></p>
+            <p id="tx-history-empty" class="hint hidden">
+              No transactions yet for this address on this network.
+            </p>
+
+            <ul id="tx-history-list" class="tx-history-list" aria-live="polite"></ul>
+          </fieldset>
+
+          <div class="row">
+            <button id="send-nav-btn" type="button">Send</button>
+          </div>
+          <p id="send-nav-hint" class="hint"></p>
+        </div>
+
+        <div id="solana-chain-panel" class="hidden">
+          <!--
+            First-switch-this-session interstitial: must be dismissed once,
+            deliberately, before the real Solana address/balance content is
+            shown. Every subsequent switch back to Solana this session skips
+            straight to the real content -- see `switchChainFamily`.
+          -->
+          <fieldset id="solana-interstitial" class="warning">
+            <legend>Different address — read before continuing</legend>
+            <p>
+              Solana uses a completely different address than your EVM
+              accounts above (different cryptography, not just a different
+              network). Sending to the wrong one loses funds. Your Solana
+              address for this wallet:
+            </p>
+            <p class="address-row">
+              <span class="chain-badge chain-badge-solana">SOL</span>
+              <span id="solana-interstitial-address" class="address"></span>
+            </p>
+            <div class="row">
+              <button id="solana-interstitial-continue-btn" type="button">Continue</button>
+            </div>
+          </fieldset>
+
+          <div id="solana-chain-content" class="hidden">
+            <fieldset class="solana-accounts-section">
+              <legend>Solana (mainnet, view only)</legend>
+              <p class="hint">
+                Real SOL mainnet balance. No general send flow yet.
+              </p>
+              <ul id="solana-account-list" class="solana-account-list" aria-live="polite"></ul>
+              <p id="solana-account-error" class="error"></p>
+              <p id="solana-balance-value" class="balance-value" aria-live="polite"></p>
+              <p id="solana-balance-error" class="error"></p>
+              <div class="row">
+                <button id="refresh-solana-balance-btn" type="button">Refresh SOL balance</button>
+              </div>
+
+              <fieldset id="solana-checkpoint-send" class="solana-checkpoint-send">
+                <legend>TEMPORARY — signer verification only</legend>
+                <p class="warning">
+                  One-off checkpoint, not the real send flow: sends this
+                  account's ENTIRE balance (minus the fixed 5000-lamport
+                  network fee) to this same wallet's Solana account 2. Real
+                  mainnet funds. Do this only once, to prove the signer works,
+                  before it is removed and replaced by a proper send screen.
+                </p>
+                <div class="row">
+                  <button id="solana-checkpoint-send-btn" type="button">
+                    Send entire balance to Account 2 (checkpoint test)
+                  </button>
+                  <button id="solana-checkpoint-refresh-recipient-btn" type="button">
+                    Refresh Account 2 balance
+                  </button>
+                </div>
+                <p class="hint">
+                  <span class="chain-badge chain-badge-solana">SOL</span>
+                  <span id="solana-checkpoint-recipient"></span>
+                </p>
+                <p id="solana-checkpoint-status" class="hint" aria-live="polite"></p>
+                <p id="solana-checkpoint-error" class="error"></p>
+              </fieldset>
+            </fieldset>
+          </div>
+        </div>
 
         <div class="row">
-          <button id="send-nav-btn" type="button">Send</button>
           <button id="lock-btn" type="button">Lock wallet</button>
         </div>
       </section>
 
       <!-- Send step 1: asset, amount, destination restricted to the wallet's own other accounts -->
       <section id="step-send" class="step hidden">
-        <h2>Send on Sepolia</h2>
+        <h2>Send</h2>
         <p class="hint">
           Choose which of your own accounts to send to — this wallet already
           controls every address below, so this can't move funds anywhere
@@ -113,17 +246,20 @@
       <section id="step-send-confirm" class="step hidden">
         <h2>Confirm this transaction</h2>
         <p class="warning">
-          This sends a real transaction on the Sepolia test network and
-          cannot be undone once broadcast. Review every field below.
+          This sends a real transaction and cannot be undone once broadcast.
+          Review every field below.
         </p>
 
         <dl class="review-list">
           <dt>Recipient</dt>
-          <dd id="review-recipient" class="address"></dd>
+          <dd class="address-row">
+            <span class="chain-badge chain-badge-evm">EVM</span>
+            <span id="review-recipient" class="address"></span>
+          </dd>
           <dt>Amount</dt>
           <dd id="review-amount"></dd>
           <dt>Network</dt>
-          <dd>Sepolia (chain ID 11155111)</dd>
+          <dd id="review-network"></dd>
           <dt>Estimated fee</dt>
           <dd id="review-fee"></dd>
           <dt>Estimated maximum total</dt>

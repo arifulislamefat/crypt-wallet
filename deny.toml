@@ -126,6 +126,38 @@ ignore = [
     # against it.
     { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained proc-macro dependency of alloy (needed for tx signing); compile-time only, not shipped in the binary; no alternative until alloy moves off it" },
 
+    # --- bincode 1.3.3: unmaintained, but NOT compile-time-only like paste/ ---
+    # proc-macro-error2 above — this one genuinely ships and runs at runtime
+    # (see `sign_solana_transaction_impl` in desktop/src-tauri/src/lib.rs,
+    # added 2026-08-21 for Solana transaction wire-encoding). Flagging that
+    # distinction explicitly rather than reusing the "compile-time only"
+    # justification, which would not be honest here.
+    #
+    # Exempted anyway, for three reasons: (1) `cargo tree -i bincode
+    # --target x86_64-pc-windows-msvc` (2026-08-21) shows it is pulled in
+    # transitively by solana-sdk itself (via solana-account,
+    # solana-instruction, solana-message, solana-transaction) regardless of
+    # this crate's own direct use — it is not currently possible to depend
+    # on solana-sdk 4.x at all without this dependency landing in the
+    # binary. (2) The advisory is "unmaintained" (the bincode maintainer
+    # stopped after a harassment incident; the team itself calls 1.3.3
+    # "complete... not in need of any updates"), not a disclosed
+    # vulnerability — RUSTSEC-2025-0141 lists no CVE and no known exploit.
+    # (3) This app's only use of it is narrow and one-directional: encoding
+    # our own already-constructed, already-validated `Transaction` struct
+    # for broadcast. It never calls `bincode::deserialize` on untrusted
+    # network input at runtime — the deserialize call in this codebase
+    # exists only in a test, decoding output this same process just
+    # produced. Bincode's historically-reported risk class (denial-of-
+    # service or panics from deserializing adversarial input) does not
+    # apply to a serialize-only, own-data-only usage. RE-REVIEW if a real
+    # vulnerability (not just "unmaintained") is ever filed against
+    # bincode 1.x, or if solana-sdk moves off it (the advisory names
+    # `wincode` as a maintained alternative, and solana-transaction's own
+    # docs already reference a `wincode` feature — worth revisiting once
+    # that stabilizes).
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3, unmaintained; required transitively by solana-sdk (Solana tx wire encoding); this app only serializes its own already-signed transactions, never deserializes untrusted input with it" },
+
     # --- proc-macro-error2: unmaintained, real dependency of alloy's ---
     # sol-types feature (added 2026-08-20 for ERC-20 transfer-calldata
     # encoding via the `sol!` macro, see desktop/src-tauri/Cargo.toml and

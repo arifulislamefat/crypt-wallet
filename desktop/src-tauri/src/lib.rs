@@ -23,10 +23,19 @@ use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::primitives::{Address as AlloyAddress, Bytes as AlloyBytes, PrimitiveSignature, TxKind, U256};
 use alloy::eips::eip2930::AccessList;
 use alloy::sol_types::SolCall;
-use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, WordCount};
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
+use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, SolanaAccountKey, WordCount};
 use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
+use ed25519_dalek::Signer as _;
+use ed25519_dalek::Signature as Ed25519Signature;
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
+use solana_hash::Hash as SolanaHash;
+use solana_pubkey::Pubkey as SolanaPubkey;
+use solana_sdk::message::legacy::Message as SolanaMessage;
+use solana_sdk::signature::Signature as SolanaSignature;
+use solana_sdk::transaction::Transaction as SolanaTransaction;
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use zeroize::Zeroizing;
 
@@ -40,10 +49,106 @@ alloy::sol! {
     }
 }
 
-/// Sepolia's chain ID. `sign_transaction` refuses to sign for anything
-/// else — see that function's doc comment for why this check exists at
-/// all despite the frontend already only ever sending this value.
+/// Chain IDs for every network this app recognizes at all, for the network
+/// switcher. Each has a short doc comment recording exactly how its chain
+/// ID was verified (matches `desktop/src/networks.ts`'s own verification
+/// notes, which is the frontend's copy of this same source-of-truth list —
+/// kept in sync by hand, since Rust and TypeScript can't literally share a
+/// constant).
+///
+/// Deliberately NOT the same list as "chains we can sign for" — see
+/// `SENDABLE_CHAIN_IDS`, below, which is a separate, narrower list. Adding
+/// a network to `SUPPORTED_CHAIN_IDS` enables read-only balance/history
+/// viewing for it and nothing else; enabling it to actually SIGN is a
+/// separate, deliberate addition to `SENDABLE_CHAIN_IDS`, never a side
+/// effect of this list growing. That split is what let this app add
+/// Ethereum mainnet as view-only without silently also enabling mainnet
+/// sending.
 const SEPOLIA_CHAIN_ID: u64 = 11155111;
+const MAINNET_CHAIN_ID: u64 = 1;
+/// Verified 2026-08-27 against https://chainlist.org/chain/56 directly.
+const BSC_CHAIN_ID: u64 = 56;
+/// Confirmed by the user directly (not independently re-verified in this
+/// pass, per their explicit note when requesting this network).
+const BSC_TESTNET_CHAIN_ID: u64 = 97;
+/// Verified 2026-08-27 against https://chainlist.org/chain/42161 directly.
+const ARBITRUM_CHAIN_ID: u64 = 42161;
+/// Verified 2026-08-27 against https://chainlist.org/chain/421614 directly.
+const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421614;
+/// Verified 2026-08-27 against https://chainlist.org/chain/8453 directly.
+const BASE_CHAIN_ID: u64 = 8453;
+/// Verified 2026-08-27 against https://chainlist.org/chain/84532 directly.
+const BASE_SEPOLIA_CHAIN_ID: u64 = 84532;
+/// Verified 2026-08-20 against https://chainlist.org/chain/137 directly
+/// (page displays "Polygon Mainnet", chain ID 137 / 0x89), and independently
+/// against a direct eth_chainId call to this app's RPC default, which
+/// echoed back the same 0x89.
+const POLYGON_CHAIN_ID: u64 = 137;
+/// Verified 2026-08-20 against https://chainlist.org/chain/10 directly
+/// (page displays "OP Mainnet", chain ID 10 / 0xa), and independently
+/// against a direct eth_chainId call to this app's RPC default, which
+/// echoed back the same 0xa.
+const OPTIMISM_CHAIN_ID: u64 = 10;
+
+const SUPPORTED_CHAIN_IDS: [u64; 10] = [
+    SEPOLIA_CHAIN_ID,
+    MAINNET_CHAIN_ID,
+    BSC_CHAIN_ID,
+    BSC_TESTNET_CHAIN_ID,
+    ARBITRUM_CHAIN_ID,
+    ARBITRUM_SEPOLIA_CHAIN_ID,
+    BASE_CHAIN_ID,
+    BASE_SEPOLIA_CHAIN_ID,
+    POLYGON_CHAIN_ID,
+    OPTIMISM_CHAIN_ID,
+];
+
+/// Chain IDs this app will actually sign a transaction for — every testnet
+/// above, and none of the mainnets. This is the real enforcement behind
+/// each mainnet's "view-only" restriction (see `sign_transaction_impl`'s
+/// and `sign_token_transfer_impl`'s own chain-id checks, which are what
+/// actually consult this list); `networks.ts`'s `sendSupported` flag is
+/// only the frontend's copy of the same decision, there to give a good
+/// experience (block the send flow before a form is filled out) rather
+/// than to be the boundary itself.
+///
+/// Mainnet sending is out of scope for this app across every chain here,
+/// not evaluated per-chain: real-fund sending is a deliberate, separately-
+/// reviewed decision this list does not make by omission.
+const SENDABLE_CHAIN_IDS: [u64; 4] = [
+    SEPOLIA_CHAIN_ID,
+    BSC_TESTNET_CHAIN_ID,
+    ARBITRUM_SEPOLIA_CHAIN_ID,
+    BASE_SEPOLIA_CHAIN_ID,
+];
+
+/// `Err` if `chain_id` isn't one of `SUPPORTED_CHAIN_IDS` at all. Shared by
+/// both signing commands so the allowlist has exactly one implementation —
+/// see each call site for the additional, narrower "must actually be
+/// sendable" check (`require_sendable_chain_id`) layered on top of this
+/// one.
+fn require_supported_chain_id(chain_id: u64) -> Result<(), String> {
+    if !SUPPORTED_CHAIN_IDS.contains(&chain_id) {
+        return Err(format!(
+            "unsupported chain ID {chain_id} — this app currently recognizes: {SUPPORTED_CHAIN_IDS:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// `Err` if `chain_id` is a recognized network (already passed
+/// `require_supported_chain_id`) but isn't one this app will sign for —
+/// i.e. it's a mainnet. Deliberately a fixed, generic message rather than
+/// naming the specific chain: with four sendable networks now, "only
+/// Sepolia" would itself be wrong, and the useful information for a user
+/// is "not this network," not an exhaustive list they'd have to cross-
+/// reference against the selector anyway.
+fn require_sendable_chain_id(chain_id: u64) -> Result<(), String> {
+    if !SENDABLE_CHAIN_IDS.contains(&chain_id) {
+        return Err("Sending is not yet supported on this network".to_string());
+    }
+    Ok(())
+}
 
 /// Filename of the sealed vault inside the app data directory.
 const VAULT_FILENAME: &str = "wallet.vault";
@@ -665,6 +770,41 @@ fn get_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Result<Str
     Ok(account.address().to_checksummed_hex())
 }
 
+/// The Base58 Solana address for Solana account `index` of the currently
+/// unlocked wallet — the display-only counterpart of [`get_account_address`]
+/// for the app's new, separate Solana account type (see
+/// `crypto/src/solana.rs`'s module doc comment for why Solana derivation is
+/// a genuinely different algorithm from EVM's, not a variant of it).
+///
+/// DISPLAY ONLY at this phase: no balance fetching, no signing. This command
+/// exists purely to prove the derivation module is correctly wired into the
+/// app's existing account architecture, mirroring the same
+/// derivation-index pattern `get_account_address` already uses for EVM
+/// accounts — see the project notes on why balance fetching and signing are
+/// each their own later, separately-reviewed phase.
+///
+/// Bounds checking, same story as `get_account_address`: not duplicated
+/// here, since `SolanaAccountKey::derive` already rejects an out-of-range
+/// index (see `crypto/src/solana.rs`).
+#[tauri::command]
+fn get_solana_account_address(index: u32, unlocked: State<'_, UnlockedWallet>) -> Result<String, String> {
+    get_solana_account_address_impl(index, &unlocked)
+}
+
+/// The testable core of [`get_solana_account_address`].
+fn get_solana_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Result<String, String> {
+    let guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    let session = guard.as_ref().ok_or("wallet is locked")?;
+
+    let seed = session.mnemonic.to_seed("");
+    let account = SolanaAccountKey::derive(&seed, index)
+        .map_err(|_| "failed to derive the requested account".to_string())?;
+    Ok(account.address())
+}
+
 /// Sign an EIP-1559 Sepolia transaction sending from account `from_index` of
 /// the currently-unlocked wallet, and return the raw signed transaction as a
 /// `0x`-prefixed hex string, ready for `eth_sendRawTransaction`.
@@ -687,13 +827,20 @@ fn get_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Result<Str
 /// parsed strictly: a malformed address or a numeric string that doesn't
 /// parse cleanly is rejected outright, never guessed at or coerced.
 ///
-/// The `chain_id == 11155111` check is deliberately redundant with the
-/// frontend only ever constructing Sepolia transactions — this command is
-/// the last line of defense before a real signature is produced, so it
-/// does not trust the caller's chain_id, however that value got here.
-/// Every other numeric argument (nonce, fees, gas limit) is taken as given
-/// once past basic parsing: those come from the RPC node's own
-/// `getTransactionCount`/fee-estimate responses, not from the user, and
+/// The chain-id checks are deliberately redundant with the frontend only
+/// ever constructing transactions for a network it thinks is sendable —
+/// this command is the last line of defense before a real signature is
+/// produced, so it does not trust the caller's chain_id, however that
+/// value got here. Two checks, not one: first that it's a chain this app
+/// recognizes at all (`require_supported_chain_id` — see
+/// `SUPPORTED_CHAIN_IDS` for the full list), then the separate, narrower
+/// requirement that this specific chain is one this app will actually sign
+/// for (`require_sendable_chain_id` — see `SENDABLE_CHAIN_IDS`; every
+/// mainnet is read-only for now, see that check's own comment below for
+/// why this is deliberate, not a bug). Every other numeric argument
+/// (nonce, fees, gas limit) is taken as given once past basic parsing:
+/// those come from the RPC node's own `getTransactionCount`/fee-estimate
+/// responses, not from the user, and
 /// this command has no independent way to second-guess them.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -734,11 +881,14 @@ fn sign_transaction_impl(
     chain_id: u64,
     from_index: u32,
 ) -> Result<String, String> {
-    if chain_id != SEPOLIA_CHAIN_ID {
-        return Err(format!(
-            "refusing to sign: expected chain ID {SEPOLIA_CHAIN_ID} (Sepolia), got {chain_id}"
-        ));
-    }
+    require_supported_chain_id(chain_id)?;
+    // TEMPORARY, deliberate restriction — not a bug: this app can already
+    // READ every mainnet here (balance/history, entirely on the frontend),
+    // but signing real-value mainnet transactions is a separate decision
+    // this app does not make by omission. Adding a mainnet to
+    // `SENDABLE_CHAIN_IDS` is its own deliberate, reviewed change, not a
+    // side effect of adding it to `SUPPORTED_CHAIN_IDS` for reading.
+    require_sendable_chain_id(chain_id)?;
 
     // Strict EIP-55 checksum validation — rejects malformed input outright
     // rather than attempting to "fix" casing or accept an unchecksummed
@@ -859,14 +1009,13 @@ fn sign_token_transfer_impl(
     chain_id: u64,
     from_index: u32,
 ) -> Result<String, String> {
-    // Same hard rule as sign_transaction_impl, no exceptions for token
+    // Same two-layer rule as sign_transaction_impl, no exceptions for token
     // sends: this is the last line of defense before a real signature is
     // produced, so it does not trust the caller's chain_id.
-    if chain_id != SEPOLIA_CHAIN_ID {
-        return Err(format!(
-            "refusing to sign: expected chain ID {SEPOLIA_CHAIN_ID} (Sepolia), got {chain_id}"
-        ));
-    }
+    require_supported_chain_id(chain_id)?;
+    // TEMPORARY, deliberate restriction — see sign_transaction_impl's
+    // identical check for the full reasoning. Not a bug.
+    require_sendable_chain_id(chain_id)?;
 
     let token_contract = AlloyAddress::parse_checksummed(token_address, None).map_err(|_| {
         "token contract address is not a well-formed, checksummed address".to_string()
@@ -1007,6 +1156,99 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Sign a Solana SOL transfer from account `from_index` of the currently
+/// unlocked wallet, returning the fully-signed transaction as a base64
+/// string, ready for the frontend to submit via the `sendTransaction` RPC
+/// method. Mirrors [`sign_transaction`]'s split exactly: this command signs
+/// and nothing else — broadcasting happens in the frontend
+/// (`desktop/src/solana.ts`), since a signed transaction isn't secret and
+/// duplicating RPC communication in Rust would just be two places that need
+/// to agree on how to talk to an endpoint, for no benefit.
+///
+/// TEMPORARY, single-purpose scope: this is the one-off checkpoint send
+/// used to prove the signer works at all against real mainnet, before any
+/// general Solana send UI exists (see the project notes on why this comes
+/// before, not alongside, wiring a real send flow). `to`/`lamports`/
+/// `recent_blockhash` are untrusted frontend input and parsed strictly, the
+/// same discipline as every EVM signing command in this file — a malformed
+/// address or blockhash is rejected outright, never guessed at.
+#[tauri::command]
+fn sign_solana_transaction(
+    to: String,
+    lamports: u64,
+    recent_blockhash: String,
+    from_index: u32,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    sign_solana_transaction_impl(&unlocked, &to, lamports, &recent_blockhash, from_index)
+}
+
+/// The testable core of [`sign_solana_transaction`].
+fn sign_solana_transaction_impl(
+    unlocked: &UnlockedWallet,
+    to: &str,
+    lamports: u64,
+    recent_blockhash: &str,
+    from_index: u32,
+) -> Result<String, String> {
+    let to_pubkey: SolanaPubkey = to
+        .parse()
+        .map_err(|_| "recipient is not a well-formed Solana address".to_string())?;
+    let blockhash: SolanaHash = recent_blockhash
+        .parse()
+        .map_err(|_| "recent blockhash is not well-formed".to_string())?;
+
+    let guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    let session = guard.as_ref().ok_or("wallet is locked")?;
+
+    let seed = session.mnemonic.to_seed("");
+    let account = SolanaAccountKey::derive(&seed, from_index)
+        .map_err(|_| "failed to derive the sending account".to_string())?;
+
+    // The sender's own pubkey, derived the same way `get_solana_account_address`
+    // derives the address it displays -- not re-parsed from that display
+    // string, so there is no path where the two could ever disagree.
+    let from_pubkey: SolanaPubkey = account
+        .address()
+        .parse()
+        .map_err(|_| "internal error: derived Solana address failed to re-parse".to_string())?;
+
+    let transfer_ix = solana_system_interface::instruction::transfer(&from_pubkey, &to_pubkey, lamports);
+    let message = SolanaMessage::new_with_blockhash(&[transfer_ix], Some(&from_pubkey), &blockhash);
+
+    // Only the raw signed bytes leave this closure — the signing key itself
+    // never does. Same shape as `sign_unsigned_transaction`'s EVM
+    // equivalent.
+    let signed_base64 = account.expose_secret(|signing_key| -> Result<String, String> {
+        let message_bytes = message.serialize();
+        let signature: Ed25519Signature = signing_key.sign(&message_bytes);
+
+        // Self-check before this ever leaves the process, same reasoning as
+        // every EVM signing command's self-check: verify the signature
+        // against the message and the account's own public key before
+        // returning anything for broadcast.
+        signing_key
+            .verifying_key()
+            .verify_strict(&message_bytes, &signature)
+            .map_err(|_| "produced signature failed self-verification".to_string())?;
+
+        let solana_signature = SolanaSignature::from(signature.to_bytes());
+        let transaction = SolanaTransaction {
+            signatures: vec![solana_signature],
+            message,
+        };
+
+        let wire_bytes = bincode::serialize(&transaction)
+            .map_err(|_| "failed to serialize the signed transaction".to_string())?;
+        Ok(BASE64_STANDARD.encode(wire_bytes))
+    })?;
+
+    Ok(signed_base64)
+}
+
 /// DIAGNOSTIC ONLY — proves `cryptwallet-crypto` and `cryptwallet-vault` are
 /// actually linked into the app and working, exercised across the Tauri IPC
 /// boundary. MUST be removed before any real release; this is scaffolding
@@ -1103,8 +1345,10 @@ pub fn run() {
         unlock_wallet,
         lock_wallet,
         get_account_address,
+        get_solana_account_address,
         sign_transaction,
-        sign_token_transfer
+        sign_token_transfer,
+        sign_solana_transaction
     ]);
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -1114,8 +1358,10 @@ pub fn run() {
         unlock_wallet,
         lock_wallet,
         get_account_address,
+        get_solana_account_address,
         sign_transaction,
-        sign_token_transfer
+        sign_token_transfer,
+        sign_solana_transaction
     ]);
 
     builder
@@ -1257,8 +1503,135 @@ mod tests {
         );
     }
 
+    /// A syntactically valid (well-formed base58, correct length) but
+    /// otherwise arbitrary hash, standing in for a recent blockhash in
+    /// tests that only exercise signing, never broadcast -- these tests
+    /// have no RPC connection and no reason to need a real, currently-valid
+    /// blockhash.
+    const FAKE_BLOCKHASH: &str = "11111111111111111111111111111111";
+
     #[test]
-    fn wrong_chain_id_is_rejected_before_any_signing() {
+    fn solana_signature_recovers_to_the_signing_account() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        // Expected signer, derived independently for comparison -- not read
+        // back out of the signing path itself. Same discipline as the EVM
+        // version of this test above.
+        let expected_address = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            SolanaAccountKey::derive(&seed, 0)
+                .expect("derive account 0")
+                .address()
+        };
+        let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
+
+        let signed_base64 =
+            sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, FAKE_BLOCKHASH, 0)
+                .expect("signing should succeed");
+
+        // Independent verification: decode the returned bytes and verify
+        // the signature against the signer's own public key via a fresh
+        // ed25519 check -- does NOT reuse sign_solana_transaction_impl's own
+        // internal self-check, so it would catch a bug even if that check
+        // were ever removed or broken.
+        let wire_bytes = BASE64_STANDARD.decode(&signed_base64).expect("valid base64");
+        let transaction: SolanaTransaction =
+            bincode::deserialize(&wire_bytes).expect("valid transaction wire format");
+
+        assert_eq!(transaction.signatures.len(), 1);
+        assert_eq!(
+            transaction.message.account_keys[0].to_string(),
+            expected_address,
+            "fee payer / signer must be account 0"
+        );
+
+        let signer_pubkey: SolanaPubkey = expected_address.parse().expect("our own address must re-parse");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&signer_pubkey.to_bytes())
+            .expect("our own derived pubkey must be a valid ed25519 point");
+
+        let message_bytes = transaction.message.serialize();
+        let signature = Ed25519Signature::from_bytes(transaction.signatures[0].as_array());
+        verifying_key
+            .verify_strict(&message_bytes, &signature)
+            .expect("signature must verify against the signer's own public key");
+    }
+
+    #[test]
+    fn sign_solana_transaction_requires_an_unlocked_session() {
+        let unlocked = UnlockedWallet::default();
+        let error = sign_solana_transaction_impl(
+            &unlocked,
+            "11111111111111111111111111111111",
+            1_000_000,
+            FAKE_BLOCKHASH,
+            0,
+        )
+        .expect_err("locked wallet must refuse");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn sign_solana_transaction_rejects_a_malformed_recipient() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let result = sign_solana_transaction_impl(&unlocked, "not-a-solana-address", 1_000_000, FAKE_BLOCKHASH, 0);
+        assert!(result.is_err(), "malformed recipient must be rejected");
+    }
+
+    #[test]
+    fn sign_solana_transaction_rejects_a_malformed_blockhash() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
+        let result = sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, "not-a-hash", 0);
+        assert!(result.is_err(), "malformed blockhash must be rejected");
+    }
+
+    #[test]
+    fn require_supported_chain_id_allows_all_ten_known_chains_and_rejects_others() {
+        for id in SUPPORTED_CHAIN_IDS {
+            assert!(
+                require_supported_chain_id(id).is_ok(),
+                "expected chain id {id} to be recognized"
+            );
+        }
+        assert_eq!(SUPPORTED_CHAIN_IDS.len(), 10, "this test should cover every entry");
+
+        // A representative sample of real, well-known chain IDs that are
+        // simply not in this app's allowlist -- being a real EVM chain
+        // elsewhere doesn't make it supported here.
+        assert!(require_supported_chain_id(43114).is_err()); // Avalanche C-Chain
+        assert!(require_supported_chain_id(250).is_err()); // Fantom Opera
+        assert!(require_supported_chain_id(324).is_err()); // zkSync Era
+        assert!(require_supported_chain_id(0).is_err());
+        assert!(require_supported_chain_id(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn require_sendable_chain_id_allows_every_testnet_and_rejects_every_mainnet() {
+        // Every testnet this app knows about is sendable...
+        assert!(require_sendable_chain_id(SEPOLIA_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(BSC_TESTNET_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(ARBITRUM_SEPOLIA_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(BASE_SEPOLIA_CHAIN_ID).is_ok());
+
+        // ...and every mainnet -- old and newly added alike -- is refused,
+        // with the same generic message regardless of which mainnet.
+        for mainnet_id in [
+            MAINNET_CHAIN_ID,
+            BSC_CHAIN_ID,
+            ARBITRUM_CHAIN_ID,
+            BASE_CHAIN_ID,
+            POLYGON_CHAIN_ID,
+            OPTIMISM_CHAIN_ID,
+        ] {
+            let error = require_sendable_chain_id(mainnet_id)
+                .expect_err(&format!("mainnet chain id {mainnet_id} must be refused"));
+            assert_eq!(error, "Sending is not yet supported on this network");
+        }
+    }
+
+    #[test]
+    fn unrecognized_chain_id_is_rejected_before_any_signing() {
         // Deliberately locked (no session at all) so that if the chain-id
         // check were NOT first, this would fail with "wallet is locked"
         // instead -- getting the chain-id-specific message proves that
@@ -1273,18 +1646,49 @@ mod tests {
             "0",
             "0",
             21000,
-            1, // Ethereum mainnet, not Sepolia -- must be refused
+            43114, // Avalanche C-Chain -- not in SUPPORTED_CHAIN_IDS at all, must be refused
             0,
         );
 
-        let error = result.expect_err("a non-Sepolia chain id must be rejected");
+        let error = result.expect_err("an unrecognized chain id must be rejected");
         assert!(
-            error.contains("chain ID"),
-            "expected a chain-id error, got: {error}"
+            error.contains("unsupported chain ID"),
+            "expected an unsupported-chain-id error, got: {error}"
         );
         assert!(
             !error.to_lowercase().contains("locked"),
             "got a 'wallet locked' error instead of a chain-id error -- the \
+             chain-id check ran after touching session state, not before: {error}"
+        );
+    }
+
+    #[test]
+    fn mainnet_is_a_recognized_chain_id_but_sending_is_refused() {
+        // Mainnet is a real entry in SUPPORTED_CHAIN_IDS (read-only balance/
+        // history viewing needs it to be recognized) -- this test exists
+        // specifically to prove that recognizing it is NOT the same as
+        // allowing it to sign. Deliberately locked, same reasoning as
+        // unrecognized_chain_id_is_rejected_before_any_signing: proves this
+        // check also runs before touching session state.
+        let unlocked = UnlockedWallet::default();
+
+        let result = sign_transaction_impl(
+            &unlocked,
+            "0x0000000000000000000000000000000000dEaD",
+            "0",
+            0,
+            "0",
+            "0",
+            21000,
+            1, // Ethereum mainnet -- recognized, but sending must still be refused
+            0,
+        );
+
+        let error = result.expect_err("mainnet sending must be refused");
+        assert_eq!(error, "Sending is not yet supported on this network");
+        assert!(
+            !error.to_lowercase().contains("locked"),
+            "got a 'wallet locked' error instead of the sepolia-only message -- the \
              chain-id check ran after touching session state, not before: {error}"
         );
     }
@@ -1436,10 +1840,10 @@ mod tests {
     }
 
     #[test]
-    fn token_transfer_wrong_chain_id_is_rejected_before_any_signing() {
+    fn token_transfer_unrecognized_chain_id_is_rejected_before_any_signing() {
         // Deliberately locked, same reasoning as
-        // wrong_chain_id_is_rejected_before_any_signing: proves the chain-id
-        // check runs before anything touches session state.
+        // unrecognized_chain_id_is_rejected_before_any_signing: proves the
+        // chain-id check runs before anything touches session state.
         let unlocked = UnlockedWallet::default();
 
         let result = sign_token_transfer_impl(
@@ -1451,12 +1855,39 @@ mod tests {
             "0",
             "0",
             65_000,
-            1, // Ethereum mainnet, not Sepolia -- must be refused
+            43114, // Avalanche C-Chain -- not in SUPPORTED_CHAIN_IDS at all, must be refused
             0,
         );
 
-        let error = result.expect_err("a non-Sepolia chain id must be rejected");
-        assert!(error.contains("chain ID"), "expected a chain-id error, got: {error}");
+        let error = result.expect_err("an unrecognized chain id must be rejected");
+        assert!(error.contains("unsupported chain ID"), "expected an unsupported-chain-id error, got: {error}");
+        assert!(
+            !error.to_lowercase().contains("locked"),
+            "chain-id check must run before touching session state: {error}"
+        );
+    }
+
+    #[test]
+    fn token_transfer_mainnet_is_recognized_but_sending_is_refused() {
+        // Same reasoning as mainnet_is_a_recognized_chain_id_but_sending_is_refused,
+        // for the token-transfer signing path.
+        let unlocked = UnlockedWallet::default();
+
+        let result = sign_token_transfer_impl(
+            &unlocked,
+            "0x0000000000000000000000000000000000dEaD",
+            "0x0000000000000000000000000000000000dEaD",
+            "0",
+            0,
+            "0",
+            "0",
+            65_000,
+            1, // Ethereum mainnet -- recognized, but sending must still be refused
+            0,
+        );
+
+        let error = result.expect_err("mainnet token sending must be refused");
+        assert_eq!(error, "Sending is not yet supported on this network");
         assert!(
             !error.to_lowercase().contains("locked"),
             "chain-id check must run before touching session state: {error}"
@@ -1561,6 +1992,40 @@ mod tests {
         // enforces (see crypto/src/derivation.rs) rather than a second copy
         // of the `>= 2^31` comparison here.
         let result = get_account_address_impl(0x8000_0000, &unlocked);
+        assert!(result.is_err(), "hardened-range index must be rejected");
+    }
+
+    #[test]
+    fn get_solana_account_address_matches_direct_derivation_and_varies_by_index() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        let expected_0 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            SolanaAccountKey::derive(&seed, 0).expect("derive account 0").address()
+        };
+
+        let account_0 = get_solana_account_address_impl(0, &unlocked).expect("derive account 0");
+        let account_1 = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
+
+        assert_eq!(account_0, expected_0, "must match direct derivation, not just be well-formed");
+        assert_ne!(account_0, account_1, "different indices must derive different addresses");
+    }
+
+    #[test]
+    fn get_solana_account_address_requires_an_unlocked_session() {
+        let unlocked = UnlockedWallet::default();
+        let error = get_solana_account_address_impl(0, &unlocked).expect_err("locked wallet must refuse");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn get_solana_account_address_rejects_the_hardened_range() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        // Relies on the same bounds check `SolanaAccountKey::derive` already
+        // enforces (see crypto/src/solana.rs) rather than a second copy of
+        // the `>= 2^31` comparison here.
+        let result = get_solana_account_address_impl(0x8000_0000, &unlocked);
         assert!(result.is_err(), "hardened-range index must be rejected");
     }
 

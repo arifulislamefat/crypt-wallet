@@ -186,13 +186,15 @@ fieldset input[type="password"] {
   margin: 1rem 0;
 }
 
-.balance-section .balance-value {
+.balance-section .balance-value,
+.solana-accounts-section .balance-value {
   font-family: ui-monospace, monospace;
   font-size: 1.3em;
   min-height: 1.4em;
 }
 
-.balance-section .balance-value.loading {
+.balance-section .balance-value.loading,
+.solana-accounts-section .balance-value.loading {
   opacity: 0.6;
   font-size: 1em;
   font-family: inherit;
@@ -266,9 +268,123 @@ fieldset input[type="password"] {
   font-size: 0.85em;
 }
 
+#custom-network-form {
+  text-align: left;
+}
+
+#custom-network-form input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 0.4rem;
+}
+
+/*
+ * Network banner: has to be unmistakable, not just informative -- mainnet
+ * shows real balances with real value, so a color/weight change here is
+ * load-bearing, not decorative. Deliberately different colors per network
+ * (not just different text) so it reads correctly even at a glance.
+ */
+.network-banner {
+  margin: 0.3rem 0 1.2rem;
+  padding: 0.5rem 0.8rem;
+  border-radius: 6px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.network-banner-testnet {
+  background-color: #2d79c722;
+  color: #2d79c7;
+  border: 1px solid #2d79c755;
+}
+
+.network-banner-mainnet {
+  background-color: #c0392b22;
+  color: #c0392b;
+  border: 1px solid #c0392b88;
+}
+
 .token-balances-label {
   margin-top: 1rem;
   margin-bottom: 0.3rem;
+}
+
+.solana-account-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.solana-account-item {
+  font-family: ui-monospace, monospace;
+  font-size: 0.95em;
+  word-break: break-all;
+}
+
+.solana-checkpoint-send {
+  border-color: #d9822b;
+}
+
+#solana-checkpoint-recipient,
+#solana-checkpoint-status {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/*
+ * Chain-family badge: the always-on half of the address-safety pair (the
+ * other half is the interstitial in switchChainFamily). Deliberately
+ * distinct, high-contrast colors per curve family, not per network --
+ * this signals "different address space entirely", not "different
+ * network within the same address space" (that's what network-banner
+ * already communicates). Solana's badge uses Solana's own brand purple so
+ * it reads as unmistakably "not this app's own EVM color" even at a
+ * glance.
+ */
+.chain-badge {
+  display: inline-block;
+  font-size: 0.7em;
+  font-weight: 700;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+.chain-badge-evm {
+  background-color: #2d79c722;
+  color: #2d79c7;
+  border: 1px solid #2d79c755;
+}
+
+.chain-badge-solana {
+  background-color: #9945ff22;
+  color: #9945ff;
+  border: 1px solid #9945ff55;
+}
+
+.address-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.chain-family-toggle {
+  margin: 1rem 0;
+  gap: 0.5rem;
+}
+
+.chain-family-btn.active {
+  border-color: #396cd8;
+  font-weight: 700;
 }
 
 .token-balance-list {

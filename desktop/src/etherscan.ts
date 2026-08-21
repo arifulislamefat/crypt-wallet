@@ -1,10 +1,12 @@
-import type { Address } from "./sepolia";
+import type { Address } from "viem";
 
 /**
- * Read-only Sepolia transaction history, via Etherscan's V2 API.
+ * Read-only transaction history for any network this app supports, via
+ * Etherscan's V2 API — unified across chains through the `chainid` query
+ * param (see `fetchEtherscanList`), not a separate host per network.
  *
  * Independent of everything in `main.ts`'s secret-handling flow, same as
- * `sepolia.ts` — this module only ever moves an address (public) out and a
+ * `networks.ts` — this module only ever moves an address (public) out and a
  * list of already-broadcast transactions (public) back. No signing, no
  * vault, no passphrase.
  *
@@ -16,14 +18,15 @@ import type { Address } from "./sepolia";
  * came back `{"status":"0","message":"NOTOK","result":"Missing/Invalid API
  * Key"}`. There is no working keyless or public-demo access left; getting a
  * key still requires a free Etherscan account. Free tier is 3 calls/sec,
- * 100,000 calls/day (docs.etherscan.io/rate-limits, checked same day).
+ * 100,000 calls/day (docs.etherscan.io/rate-limits, checked same day). One
+ * key works across every chain the V2 API supports — the same key backs
+ * both networks this app knows about, nothing per-network to configure.
  *
  * The key is read from `VITE_ETHERSCAN_API_KEY` (a Vite build-time env var,
  * see `vite-env.d.ts` and the repo's `.env.example`) rather than hardcoded,
  * so swapping in a real key later — or rotating one — never touches this
- * file. `fetchSepoliaTransactions` and `fetchSepoliaTokenTransfers` both
- * fail fast with a clear message when it's unset, instead of sending a
- * doomed request.
+ * file. `fetchTransactions` and `fetchTokenTransfers` both fail fast with a
+ * clear message when it's unset, instead of sending a doomed request.
  *
  * ## Two endpoints, two different views of the same activity
  *
@@ -53,7 +56,6 @@ import type { Address } from "./sepolia";
  * transfer edge case above).
  */
 const ETHERSCAN_API_BASE_URL = "https://api.etherscan.io/v2/api";
-const SEPOLIA_CHAIN_ID = 11155111;
 
 /**
  * Most recent entries to request per fetch, for either endpoint. This is a
@@ -63,7 +65,7 @@ const SEPOLIA_CHAIN_ID = 11155111;
 const MAX_RESULTS = 100;
 
 /**
- * Bounded for the same reason as `RPC_TIMEOUT_MS` in sepolia.ts: an
+ * Bounded for the same reason as `RPC_TIMEOUT_MS` in networks.ts: an
  * unreachable or hung Etherscan should surface as a visible error within a
  * reasonable time, not leave the history view stuck loading indefinitely.
  */
@@ -87,7 +89,7 @@ export class EtherscanConfigError extends Error {}
 /** A real Etherscan request failed — network error, HTTP error, or an API-level error response. */
 export class EtherscanApiError extends Error {}
 
-export interface SepoliaTransaction {
+export interface EthTransaction {
   hash: `0x${string}`;
   from: Address;
   /** `null` for a contract-creation transaction, which has no `to`. */
@@ -103,7 +105,7 @@ export interface SepoliaTransaction {
    * alone would otherwise show as a plain ETH send of 0 ETH — relevant now
    * only for the failed-token-transfer edge case `tokentx` can't cover (see
    * this module's top-level doc comment), since a successful one is
-   * rendered from `fetchSepoliaTokenTransfers` instead.
+   * rendered from `fetchTokenTransfers` instead.
    */
   input: `0x${string}`;
 }
@@ -125,8 +127,8 @@ export interface TokenTransferEvent {
 }
 
 /**
- * Fetch `address`'s Sepolia transaction list (module=account, action=txlist),
- * newest first.
+ * Fetch `address`'s transaction list on the chain identified by `chainId`
+ * (module=account, action=txlist), newest first.
  *
  * Two failure shapes are deliberately not conflated:
  * - `EtherscanConfigError`: no API key configured. Nothing was sent.
@@ -137,10 +139,11 @@ export interface TokenTransferEvent {
  * `status: "0", message: "No transactions found"`, which this returns as an
  * empty array rather than throwing.
  */
-export async function fetchSepoliaTransactions(
+export async function fetchTransactions(
+  chainId: number,
   address: Address,
-): Promise<SepoliaTransaction[]> {
-  const raw = await fetchEtherscanList("txlist", address);
+): Promise<EthTransaction[]> {
+  const raw = await fetchEtherscanList(chainId, "txlist", address);
   const transactions = raw.map(parseTransaction);
   // Newest first is also requested via `sort=desc`, but sorted again here
   // rather than trusted blind — cheap, and it's the property the UI
@@ -150,29 +153,36 @@ export async function fetchSepoliaTransactions(
 }
 
 /**
- * Fetch every ERC-20 `Transfer` event involving `address` (module=account,
- * action=tokentx), sent or received, newest first. Same two failure shapes
- * and same "no history isn't an error" handling as `fetchSepoliaTransactions`
- * — both endpoints share `fetchEtherscanList` for exactly this reason.
+ * Fetch every ERC-20 `Transfer` event involving `address` on the chain
+ * identified by `chainId` (module=account, action=tokentx), sent or
+ * received, newest first. Same two failure shapes and same "no history
+ * isn't an error" handling as `fetchTransactions` — both endpoints share
+ * `fetchEtherscanList` for exactly this reason.
  */
-export async function fetchSepoliaTokenTransfers(
+export async function fetchTokenTransfers(
+  chainId: number,
   address: Address,
 ): Promise<TokenTransferEvent[]> {
-  const raw = await fetchEtherscanList("tokentx", address);
+  const raw = await fetchEtherscanList(chainId, "tokentx", address);
   const events = raw.map(parseTokenTransferEvent);
   events.sort((a, b) => b.timestamp - a.timestamp);
   return events;
 }
 
 /**
- * Shared plumbing for both endpoints: build the request, enforce the
+ * Shared plumbing for both endpoints: build the request against `chainId`
+ * (Etherscan's V2 API is one host for every chain it supports, selected
+ * entirely through this query param — not a different subdomain per
+ * network the way the human-facing explorer *website* is; see
+ * `NetworkConfig.explorerBaseUrl` in `networks.ts` for that), enforce the
  * timeout, and unwrap Etherscan's `{status, message, result}` envelope down
  * to the raw `result` array — everything both `txlist` and `tokentx` share
  * byte-for-byte except the `action` param and how each entry in `result` is
- * parsed, which stay in `fetchSepoliaTransactions`/`fetchSepoliaTokenTransfers`
- * and their respective per-entry parsers.
+ * parsed, which stay in `fetchTransactions`/`fetchTokenTransfers` and their
+ * respective per-entry parsers.
  */
 async function fetchEtherscanList(
+  chainId: number,
   action: "txlist" | "tokentx",
   address: Address,
 ): Promise<unknown[]> {
@@ -183,7 +193,7 @@ async function fetchEtherscanList(
   }
 
   const url = new URL(ETHERSCAN_API_BASE_URL);
-  url.searchParams.set("chainid", String(SEPOLIA_CHAIN_ID));
+  url.searchParams.set("chainid", String(chainId));
   url.searchParams.set("module", "account");
   url.searchParams.set("action", action);
   url.searchParams.set("address", address);
@@ -260,7 +270,7 @@ function isEtherscanEnvelope(value: unknown): value is EtherscanEnvelope {
  * validated and kept, so a shape change in the fields we still ignore can't
  * break this.
  */
-function parseTransaction(raw: unknown): SepoliaTransaction {
+function parseTransaction(raw: unknown): EthTransaction {
   if (typeof raw !== "object" || raw === null) {
     throw new EtherscanApiError("Etherscan returned a malformed transaction entry.");
   }
@@ -341,7 +351,7 @@ function parseTokenTransferEvent(raw: unknown): TokenTransferEvent {
   };
 }
 
-/** The public block-explorer page for a transaction, for independent verification. */
-export function sepoliaExplorerTxUrl(hash: string): string {
-  return `https://sepolia.etherscan.io/tx/${hash}`;
+/** The public block-explorer page for a transaction on `explorerBaseUrl`'s network, for independent verification. */
+export function explorerTxUrl(explorerBaseUrl: string, hash: string): string {
+  return `${explorerBaseUrl}/tx/${hash}`;
 }

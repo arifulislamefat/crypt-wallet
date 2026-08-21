@@ -59,6 +59,49 @@ rand_core = { version = "0.6", features = ["std", "getrandom"] }
 #                    explicitly rather than pulled in wholesale
 alloy = { version = "0.9", default-features = false, features = ["consensus", "eips", "k256", "rlp", "sol-types", "std"] }
 
+# --- Solana transaction construction, signing envelope, and wire encoding ---
+# Same rule as alloy above: audited library territory for transaction
+# construction/serialization, not hand-written. `SolanaAccountKey`
+# (cryptwallet-crypto) supplies the derived ed25519 key; everything about
+# building the Message, wrapping it in a Transaction, and encoding the wire
+# format comes from Solana's own SDK crates, mirroring exactly how EVM
+# signing here uses alloy instead of hand-rolled RLP.
+#
+# "full" feature: re-exports Transaction/Signature via solana_program (see
+# docs.rs/solana-sdk) -- needed since this crate alone doesn't expose them
+# without it.
+solana-sdk = { version = "4", features = ["full"] }
+# Direct dependency (not just relying on whatever solana-sdk's "full"
+# feature transitively enables) so `Pubkey`/`Hash`'s `FromStr` impls
+# (feature "decode") are guaranteed available for parsing the recipient
+# address and recent blockhash from untrusted frontend input.
+solana-pubkey = "3"
+solana-hash = "3"
+# `solana_system_interface::instruction::transfer` builds the System
+# Program transfer instruction -- the modern, split-crate replacement for
+# the old `solana_sdk::system_instruction::transfer`. Referenced directly by
+# solana-program's own docs as the way to build this instruction now.
+solana-system-interface = { version = "3", features = ["bincode"] }
+# ed25519-dalek is already `cryptwallet-crypto`'s dependency for
+# `SolanaAccountKey`; pinned to the same "2" here so Cargo resolves both to
+# one identical version -- required for `SolanaAccountKey::expose_secret`'s
+# `&ed25519_dalek::SigningKey` to be usable here at all (two different
+# resolved versions would be two different, incompatible types).
+ed25519-dalek = { version = "2" }
+# Solana's wire format for a full signed `Transaction` (signatures +
+# message) is bincode-serialized -- confirmed via solana-transaction's own
+# docs, which note its test/example code uses bincode for exactly this.
+# Pinned to the long-stable 1.x line: bincode's later 2.x/3.x releases are
+# a materially different config-based API, and 3.0.0 does not build at all
+# (the crate's maintainer stopped publishing after a harassment incident,
+# per its own docs.rs page) -- 1.x is what the wider Solana ecosystem's own
+# tooling has used for this for years.
+bincode = "1"
+# Encodes the final signed transaction for the `sendTransaction` RPC's
+# base64 input format (Solana's currently-recommended encoding for that
+# call, over the legacy base58 option).
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 

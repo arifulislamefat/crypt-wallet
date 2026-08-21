@@ -37,6 +37,8 @@ const EXPECTED_CHAIN_IDS: Record<NetworkId, number> = {
   baseSepolia: 84532,
   polygon: 137,
   optimism: 10,
+  polygonAmoy: 80002,
+  optimismSepolia: 11155420,
 };
 
 const ALL_NETWORK_IDS = Object.keys(NETWORKS) as NetworkId[];
@@ -51,7 +53,7 @@ describe("network configuration", () => {
     expect(NETWORKS[DEFAULT_NETWORK].isTestnet).toBe(false);
   });
 
-  it("has exactly the ten expected networks, each with its verified chain ID", () => {
+  it("has exactly the twelve expected networks, each with its verified chain ID", () => {
     expect(ALL_NETWORK_IDS.sort()).toEqual(Object.keys(EXPECTED_CHAIN_IDS).sort());
     for (const id of ALL_NETWORK_IDS) {
       expect(NETWORKS[id].chainId).toBe(EXPECTED_CHAIN_IDS[id]);
@@ -81,6 +83,8 @@ describe("network configuration", () => {
     expect(NETWORKS.baseSepolia.explorerBaseUrl).toBe("https://sepolia.basescan.org");
     expect(NETWORKS.polygon.explorerBaseUrl).toBe("https://polygonscan.com");
     expect(NETWORKS.optimism.explorerBaseUrl).toBe("https://optimistic.etherscan.io");
+    expect(NETWORKS.polygonAmoy.explorerBaseUrl).toBe("https://amoy.polygonscan.com");
+    expect(NETWORKS.optimismSepolia.explorerBaseUrl).toBe("https://sepolia-optimistic.etherscan.io");
   });
 
   it("only allows each network's own RPC origin for that network, never another's", () => {
@@ -105,7 +109,14 @@ describe("network configuration", () => {
     // value. This correlation is a property of today's built-in networks,
     // not a rule the code enforces -- see NetworkConfig.isTestnet's own
     // doc comment on why the two fields are deliberately independent.
-    for (const id of ["sepolia", "bscTestnet", "arbitrumSepolia", "baseSepolia"] as const) {
+    for (const id of [
+      "sepolia",
+      "bscTestnet",
+      "arbitrumSepolia",
+      "baseSepolia",
+      "polygonAmoy",
+      "optimismSepolia",
+    ] as const) {
       expect(NETWORKS[id].isTestnet).toBe(true);
       expect(NETWORKS[id].sendSupported).toBe(true);
     }
@@ -128,6 +139,7 @@ describe("network configuration", () => {
     // PoS in 2024. Matches viem's own `polygon.nativeCurrency` and
     // chainlist.org's current listing, cross-checked at verification time.
     expect(NETWORKS.polygon.nativeCurrencySymbol).toBe("POL");
+    expect(NETWORKS.polygonAmoy.nativeCurrencySymbol).toBe("POL");
     for (const id of [
       "sepolia",
       "mainnet",
@@ -136,6 +148,7 @@ describe("network configuration", () => {
       "base",
       "baseSepolia",
       "optimism",
+      "optimismSepolia",
     ] as const) {
       expect(NETWORKS[id].nativeCurrencySymbol).toBe("ETH");
     }
@@ -162,6 +175,8 @@ describe("network configuration", () => {
       "baseSepolia",
       "polygon",
       "optimism",
+      "polygonAmoy",
+      "optimismSepolia",
     ] as const) {
       expect(NETWORKS[id].tokens).toEqual([]);
     }

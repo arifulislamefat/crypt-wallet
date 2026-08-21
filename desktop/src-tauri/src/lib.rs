@@ -89,8 +89,19 @@ const POLYGON_CHAIN_ID: u64 = 137;
 /// against a direct eth_chainId call to this app's RPC default, which
 /// echoed back the same 0xa.
 const OPTIMISM_CHAIN_ID: u64 = 10;
+/// Verified 2026-08-21 against https://chainlist.org/chain/80002 directly
+/// (page displays "Amoy", chain ID 80002 / 0x13882 — Polygon's current
+/// testnet; Mumbai, the previous one, was deprecated in 2024), and
+/// independently against a direct eth_chainId call to this app's RPC
+/// default, which echoed back the same 0x13882.
+const POLYGON_AMOY_CHAIN_ID: u64 = 80002;
+/// Verified 2026-08-21 against https://chainlist.org/chain/11155420
+/// directly (page displays "OP Sepolia Testnet", chain ID 11155420 /
+/// 0xaa37dc), and independently against a direct eth_chainId call to this
+/// app's RPC default, which echoed back the same 0xaa37dc.
+const OPTIMISM_SEPOLIA_CHAIN_ID: u64 = 11155420;
 
-const SUPPORTED_CHAIN_IDS: [u64; 10] = [
+const SUPPORTED_CHAIN_IDS: [u64; 12] = [
     SEPOLIA_CHAIN_ID,
     MAINNET_CHAIN_ID,
     BSC_CHAIN_ID,
@@ -101,6 +112,8 @@ const SUPPORTED_CHAIN_IDS: [u64; 10] = [
     BASE_SEPOLIA_CHAIN_ID,
     POLYGON_CHAIN_ID,
     OPTIMISM_CHAIN_ID,
+    POLYGON_AMOY_CHAIN_ID,
+    OPTIMISM_SEPOLIA_CHAIN_ID,
 ];
 
 /// Chain IDs this app will actually sign a transaction for — every testnet
@@ -115,11 +128,13 @@ const SUPPORTED_CHAIN_IDS: [u64; 10] = [
 /// Mainnet sending is out of scope for this app across every chain here,
 /// not evaluated per-chain: real-fund sending is a deliberate, separately-
 /// reviewed decision this list does not make by omission.
-const SENDABLE_CHAIN_IDS: [u64; 4] = [
+const SENDABLE_CHAIN_IDS: [u64; 6] = [
     SEPOLIA_CHAIN_ID,
     BSC_TESTNET_CHAIN_ID,
     ARBITRUM_SEPOLIA_CHAIN_ID,
     BASE_SEPOLIA_CHAIN_ID,
+    POLYGON_AMOY_CHAIN_ID,
+    OPTIMISM_SEPOLIA_CHAIN_ID,
 ];
 
 /// `Err` if `chain_id` isn't one of `SUPPORTED_CHAIN_IDS` at all. Shared by
@@ -1867,14 +1882,14 @@ mod tests {
     }
 
     #[test]
-    fn require_supported_chain_id_allows_all_ten_known_chains_and_rejects_others() {
+    fn require_supported_chain_id_allows_all_twelve_known_chains_and_rejects_others() {
         for id in SUPPORTED_CHAIN_IDS {
             assert!(
                 require_supported_chain_id(id).is_ok(),
                 "expected chain id {id} to be recognized"
             );
         }
-        assert_eq!(SUPPORTED_CHAIN_IDS.len(), 10, "this test should cover every entry");
+        assert_eq!(SUPPORTED_CHAIN_IDS.len(), 12, "this test should cover every entry");
 
         // A representative sample of real, well-known chain IDs that are
         // simply not in this app's allowlist -- being a real EVM chain
@@ -1893,6 +1908,8 @@ mod tests {
         assert!(require_sendable_chain_id(BSC_TESTNET_CHAIN_ID).is_ok());
         assert!(require_sendable_chain_id(ARBITRUM_SEPOLIA_CHAIN_ID).is_ok());
         assert!(require_sendable_chain_id(BASE_SEPOLIA_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(POLYGON_AMOY_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(OPTIMISM_SEPOLIA_CHAIN_ID).is_ok());
 
         // ...and every mainnet -- old and newly added alike -- is refused,
         // with the same generic message regardless of which mainnet.

@@ -8,7 +8,9 @@ import {
   bscTestnet,
   mainnet,
   optimism,
+  optimismSepolia,
   polygon,
+  polygonAmoy,
   sepolia,
 } from "viem/chains";
 import { MAINNET_TOKENS, SEPOLIA_TOKENS, type TokenListing } from "./tokens";
@@ -35,7 +37,9 @@ export type NetworkId =
   | "base"
   | "baseSepolia"
   | "polygon"
-  | "optimism";
+  | "polygonAmoy"
+  | "optimism"
+  | "optimismSepolia";
 
 export interface NetworkConfig {
   /**
@@ -179,6 +183,27 @@ export const DEFAULT_POLYGON_RPC_URL = "https://polygon-bor-rpc.publicnode.com";
  */
 export const DEFAULT_OPTIMISM_RPC_URL = "https://optimism-rpc.publicnode.com";
 
+/**
+ * Verified 2026-08-21 against https://chainlist.org/chain/80002 directly
+ * (page displays "Amoy", chain ID 80002 / 0x13882 — Polygon's current
+ * testnet, replacing the deprecated Mumbai testnet), and the RPC endpoint
+ * below confirmed responding with the same chain ID (0x13882) via a direct
+ * eth_chainId call. Live explorer check (not just an HTTP 200) confirmed
+ * the page title reads "TESTNET Polygon PoS Chain Amoy (POL) Blockchain
+ * Explorer" — genuinely this network, not a generic landing page.
+ */
+export const DEFAULT_POLYGON_AMOY_RPC_URL = "https://polygon-amoy-bor-rpc.publicnode.com";
+
+/**
+ * Verified 2026-08-21 against https://chainlist.org/chain/11155420 directly
+ * (page displays "OP Sepolia Testnet", chain ID 11155420 / 0xaa37dc), and
+ * the RPC endpoint below confirmed responding with the same chain ID
+ * (0xaa37dc) via a direct eth_chainId call. Live explorer check confirmed
+ * the page title reads "TESTNET OP Sepolia Network (ETH) Blockchain
+ * Explorer".
+ */
+export const DEFAULT_OPTIMISM_SEPOLIA_RPC_URL = "https://optimism-sepolia-rpc.publicnode.com";
+
 export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
   sepolia: {
     id: "sepolia",
@@ -317,6 +342,23 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     sendSupported: false,
     tokens: [],
   },
+  polygonAmoy: {
+    id: "polygonAmoy",
+    label: "Polygon Amoy",
+    // Verified 2026-08-21 against https://chainlist.org/chain/80002
+    // directly: page displays "Amoy", chain ID 80002 (0x13882). Amoy is
+    // Polygon's current testnet -- Mumbai, the previous one, was
+    // deprecated/shut down in 2024.
+    chainId: polygonAmoy.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: polygonAmoy,
+    defaultRpcUrl: DEFAULT_POLYGON_AMOY_RPC_URL,
+    explorerBaseUrl: "https://amoy.polygonscan.com",
+    nativeCurrencySymbol: "POL",
+    sendSupported: true,
+    tokens: [],
+  },
   optimism: {
     id: "optimism",
     label: "Optimism",
@@ -328,6 +370,22 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     explorerBaseUrl: "https://optimistic.etherscan.io",
     nativeCurrencySymbol: "ETH",
     sendSupported: false,
+    tokens: [],
+  },
+  optimismSepolia: {
+    id: "optimismSepolia",
+    label: "OP Sepolia",
+    // Verified 2026-08-21 against https://chainlist.org/chain/11155420
+    // directly: page displays "OP Sepolia Testnet", chain ID 11155420
+    // (0xaa37dc).
+    chainId: optimismSepolia.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: optimismSepolia,
+    defaultRpcUrl: DEFAULT_OPTIMISM_SEPOLIA_RPC_URL,
+    explorerBaseUrl: "https://sepolia-optimistic.etherscan.io",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
     tokens: [],
   },
 };

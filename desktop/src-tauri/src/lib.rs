@@ -159,6 +159,16 @@ const VAULT_FILENAME: &str = "wallet.vault";
 /// exactly the scripted-attack case the rate limit is meant to slow.
 const UNLOCK_FAILURES_FILENAME: &str = "unlock-failures";
 
+/// Filename of the persisted Solana account count, kept next to the vault
+/// in app data. Not secret (it's an integer, not key material) -- same
+/// sensitivity class as `UNLOCK_FAILURES_FILENAME` above, which is why this
+/// lives as its own plain sidecar file rather than inside the encrypted
+/// vault: adding a field to the vault's encrypted plaintext would mean a
+/// vault format/version migration, a materially bigger and riskier change
+/// than a wallet-account-count feature calls for. See `read_solana_account_count`/
+/// `add_solana_account` for how this is used.
+const SOLANA_ACCOUNTS_FILENAME: &str = "solana-accounts";
+
 /// How long an unlocked wallet may sit before its mnemonic is cleared from
 /// memory. See [`UnlockedWallet`] for the reasoning behind this value.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -428,6 +438,63 @@ fn write_vault_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Write `bytes` to `path` atomically (temp file, fsync, rename over the
+/// target) -- the same crash-safety technique as `write_vault_atomically`,
+/// but deliberately a separate function, not a shared one: that function's
+/// whole point includes refusing to ever overwrite an existing vault, which
+/// is wrong for a file like the Solana account count that is *meant* to be
+/// legitimately rewritten every time an account is added. What this DOES
+/// share with it is the actual crash-safety property -- no reader of this
+/// file ever observes a partially-written value, torn mid-write by a power
+/// loss or crash between open and close.
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("invalid file path")?;
+    create_private_dir_all(parent)
+        .map_err(|_| "could not create the application data directory".to_string())?;
+
+    let temp_path = path.with_extension("tmp");
+    if temp_path.exists() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    let mut file = create_new_private_file(&temp_path).map_err(|_| "could not create a temporary file".to_string())?;
+    file.write_all(bytes).map_err(|_| "could not write the file".to_string())?;
+    file.sync_all().map_err(|_| "could not flush the file to disk".to_string())?;
+    drop(file);
+
+    fs::rename(&temp_path, path).map_err(|_| "could not finalize the file".to_string())?;
+
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
+}
+
+/// Read the persisted Solana account count. Defaults to `1` (just account
+/// 0) when the file is missing or unparseable -- the same "fail open"
+/// reasoning as `read_unlock_failures`, and the correct default for a
+/// wallet that predates this feature or has never added a second Solana
+/// account: account 0 always exists, so `1` is the honest floor, not `0`.
+fn read_solana_account_count(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n: &u32| n >= 1)
+        .unwrap_or(1)
+}
+
+/// Persist the Solana account count, atomically (see `write_file_atomically`).
+fn write_solana_account_count(path: &Path, count: u32) -> Result<(), String> {
+    write_file_atomically(path, count.to_string().as_bytes())
+}
+
+/// Path the persisted Solana account count lives at, alongside the vault.
+fn solana_accounts_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(SOLANA_ACCOUNTS_FILENAME))
 }
 
 /// Path the sealed vault lives at, inside Tauri's resolved app data
@@ -958,6 +1025,50 @@ fn get_solana_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Res
     let account = SolanaAccountKey::derive(&seed, index)
         .map_err(|_| "failed to derive the requested account".to_string())?;
     Ok(account.address())
+}
+
+/// How many Solana accounts this wallet has created, persisted (see
+/// `read_solana_account_count`). Does NOT require an unlocked session --
+/// it's a plain integer read from a non-secret sidecar file, not a
+/// derivation, so there is nothing here that depends on the mnemonic being
+/// in memory. The frontend calls this right after unlock to know how many
+/// `get_solana_account_address` calls to make, mirroring how EVM's
+/// `MAX_ACCOUNTS` constant tells `loadAccounts` how many indices to derive
+/// -- except this one reflects a real, persisted count instead of a fixed
+/// ceiling.
+#[tauri::command]
+fn get_solana_account_count(app: AppHandle) -> Result<u32, String> {
+    let path = solana_accounts_path(&app)?;
+    Ok(read_solana_account_count(&path))
+}
+
+/// Derive and persist one more Solana account: read the current count,
+/// derive account `count` (the next unused index), write `count + 1` back
+/// atomically, and return the new account's address. Requires an unlocked
+/// session, same as every other command that derives from the mnemonic.
+///
+/// The persist-then-derive ordering matters: if derivation somehow failed
+/// after the count were already incremented, the frontend would believe an
+/// account exists that was never actually shown to the user -- deriving
+/// FIRST, and only persisting the new count once that succeeds, means a
+/// failure here leaves the count exactly where it was, not silently ahead
+/// of what the user has actually seen.
+#[tauri::command]
+fn add_solana_account(app: AppHandle, unlocked: State<'_, UnlockedWallet>) -> Result<String, String> {
+    let path = solana_accounts_path(&app)?;
+    add_solana_account_impl(&unlocked, &path)
+}
+
+/// The testable core of [`add_solana_account`].
+fn add_solana_account_impl(unlocked: &UnlockedWallet, path: &Path) -> Result<String, String> {
+    let current_count = read_solana_account_count(path);
+    let new_index = current_count; // 0-based index of the account being added.
+
+    let address = get_solana_account_address_impl(new_index, unlocked)?;
+
+    write_solana_account_count(path, current_count + 1)?;
+
+    Ok(address)
 }
 
 /// Sign an EIP-1559 Sepolia transaction sending from account `from_index` of
@@ -1505,6 +1616,8 @@ pub fn run() {
         lock_wallet,
         get_account_address,
         get_solana_account_address,
+        get_solana_account_count,
+        add_solana_account,
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
@@ -1521,6 +1634,8 @@ pub fn run() {
         lock_wallet,
         get_account_address,
         get_solana_account_address,
+        get_solana_account_count,
+        add_solana_account,
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
@@ -2395,6 +2510,103 @@ mod tests {
         let error = export_solana_private_key_impl(&unlocked, TEST_PASSWORD, 0, &path, &failures, |_| {})
             .expect_err("a locked session must refuse to export");
         assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn read_solana_account_count_defaults_to_one_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SOLANA_ACCOUNTS_FILENAME);
+        assert!(!path.exists());
+        assert_eq!(read_solana_account_count(&path), 1);
+    }
+
+    #[test]
+    fn read_solana_account_count_defaults_to_one_when_the_file_is_unparseable_or_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SOLANA_ACCOUNTS_FILENAME);
+
+        fs::write(&path, "not a number").expect("write garbage");
+        assert_eq!(read_solana_account_count(&path), 1);
+
+        // 0 is nonsensical -- account 0 always exists the moment a wallet
+        // does, so a persisted 0 is corrupt state, not a real "zero
+        // accounts" case. Falls back to the same safe floor as missing/
+        // unparseable, rather than trusting a value that would make
+        // `add_solana_account` re-derive index 0 as if it were new.
+        fs::write(&path, "0").expect("write zero");
+        assert_eq!(read_solana_account_count(&path), 1);
+    }
+
+    #[test]
+    fn write_then_read_solana_account_count_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SOLANA_ACCOUNTS_FILENAME);
+
+        write_solana_account_count(&path, 3).expect("write succeeds");
+        assert_eq!(read_solana_account_count(&path), 3);
+
+        // Overwriting an existing count must succeed -- this file is meant
+        // to be legitimately rewritten every time an account is added,
+        // unlike the vault file's "never overwrite" rule.
+        write_solana_account_count(&path, 4).expect("overwrite succeeds");
+        assert_eq!(read_solana_account_count(&path), 4);
+    }
+
+    #[test]
+    fn add_solana_account_derives_the_next_index_and_persists_the_new_count() {
+        let (unlocked, _vault_path, _failures, _words, dir) = sealed_and_unlocked_wallet();
+        let accounts_path = dir.path().join(SOLANA_ACCOUNTS_FILENAME);
+
+        // Starting fresh: no file yet, so the first add derives index 1
+        // (account 0 is always implicit).
+        assert_eq!(read_solana_account_count(&accounts_path), 1);
+
+        let expected_index_1 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            SolanaAccountKey::derive(&seed, 1).expect("derive account 1").address()
+        };
+
+        let added_address =
+            add_solana_account_impl(&unlocked, &accounts_path).expect("add should succeed");
+
+        assert_eq!(added_address, expected_index_1, "must derive the real next index, not a placeholder");
+        assert_eq!(
+            read_solana_account_count(&accounts_path),
+            2,
+            "count must be persisted immediately after a successful add"
+        );
+
+        // A second add derives index 2, proving this isn't hardcoded to
+        // "always derive index 1" -- it must track the persisted count.
+        let expected_index_2 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            SolanaAccountKey::derive(&seed, 2).expect("derive account 2").address()
+        };
+        let second_added = add_solana_account_impl(&unlocked, &accounts_path).expect("second add should succeed");
+        assert_eq!(second_added, expected_index_2);
+        assert_eq!(read_solana_account_count(&accounts_path), 3);
+    }
+
+    #[test]
+    fn add_solana_account_requires_an_unlocked_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let accounts_path = dir.path().join(SOLANA_ACCOUNTS_FILENAME);
+
+        let unlocked = UnlockedWallet::default();
+        let error = add_solana_account_impl(&unlocked, &accounts_path)
+            .expect_err("a locked session must refuse to add an account");
+        assert_eq!(error, "wallet is locked");
+
+        // A failed add (locked session) must not have advanced the count --
+        // see add_solana_account_impl's own doc comment on the
+        // derive-before-persist ordering this proves.
+        assert_eq!(
+            read_solana_account_count(&accounts_path),
+            1,
+            "a failed add must leave the persisted count untouched"
+        );
     }
 
     #[test]

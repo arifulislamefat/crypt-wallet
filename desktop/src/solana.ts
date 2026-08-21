@@ -1,3 +1,4 @@
+import bs58 from "bs58";
 import { formatUnits } from "viem";
 
 /**
@@ -23,6 +24,28 @@ export const SOL_DECIMALS = 9;
 
 /** A malformed or error RPC response — network failures surface as the underlying `fetch`/`TypeError`, not this. */
 export class SolanaRpcError extends Error {}
+
+/**
+ * Strict Solana address validation: must Base58-decode cleanly AND decode
+ * to exactly 32 bytes — a Solana address is the raw 32-byte ed25519 public
+ * key, nothing more (see `crypto/src/solana.rs`'s `address` doc comment).
+ * Real decoding via the `bs58` library, not a regex/length heuristic — the
+ * same "use the audited library's real check, don't approximate it" rule
+ * this app already holds EVM's EIP-55 checksum validation to. Rejects
+ * outright rather than attempting to "fix" a malformed address; a false
+ * positive here is a fund-loss-adjacent bug, so this only ever needs to
+ * err toward rejecting.
+ */
+export function isValidSolanaAddress(address: string): boolean {
+  if (!address) {
+    return false;
+  }
+  try {
+    return bs58.decode(address).length === 32;
+  } catch {
+    return false;
+  }
+}
 
 interface SolanaRpcResponse<T> {
   jsonrpc: string;

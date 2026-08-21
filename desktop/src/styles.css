@@ -310,21 +310,6 @@ fieldset input[type="password"] {
   margin-bottom: 0.3rem;
 }
 
-.solana-account-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-}
-
-.solana-account-item {
-  font-family: ui-monospace, monospace;
-  font-size: 0.95em;
-  word-break: break-all;
-}
-
 /*
  * Chain-family badge: the always-on half of the address-safety pair (the
  * other half is the interstitial in switchChainFamily). Deliberately

@@ -167,16 +167,29 @@
 
           <div id="solana-chain-content" class="hidden">
             <fieldset class="solana-accounts-section">
-              <legend>Solana (mainnet, view only)</legend>
+              <legend>Solana (mainnet)</legend>
               <p class="hint">
-                Real SOL mainnet balance. No general send flow yet.
+                Real SOL mainnet balance.
               </p>
-              <ul id="solana-account-list" class="solana-account-list" aria-live="polite"></ul>
+
+              <label for="solana-account-select" class="hint">Active account</label>
+              <select id="solana-account-select" class="account-select"></select>
               <p id="solana-account-error" class="error"></p>
+              <p class="address-row">
+                <span class="chain-badge chain-badge-solana">SOL</span>
+                <span id="solana-active-address" class="address"></span>
+              </p>
+
+              <div class="row">
+                <button id="solana-add-account-btn" type="button">Add account</button>
+              </div>
+              <p id="solana-add-account-error" class="error"></p>
+
               <p id="solana-balance-value" class="balance-value" aria-live="polite"></p>
               <p id="solana-balance-error" class="error"></p>
               <div class="row">
                 <button id="refresh-solana-balance-btn" type="button">Refresh SOL balance</button>
+                <button id="solana-send-nav-btn" type="button">Send</button>
               </div>
             </fieldset>
           </div>
@@ -267,6 +280,86 @@
 
         <div class="row">
           <button id="send-done-btn" type="button" class="hidden">
+            Back to wallet
+          </button>
+        </div>
+      </section>
+
+      <!-- Solana send step 1: recipient (free text, validated), amount -->
+      <section id="step-solana-send" class="step hidden">
+        <h2>
+          <span class="chain-badge chain-badge-solana">SOL</span>
+          Send SOL
+        </h2>
+        <p class="hint">
+          Enter a Solana address. Unlike the EVM send flow, this is not
+          restricted to the wallet's own accounts — check the address
+          carefully before sending; a Solana address is not valid on any
+          EVM chain and vice versa.
+        </p>
+
+        <label for="solana-send-recipient" class="hint rpc-label">Recipient address</label>
+        <input id="solana-send-recipient" type="text" spellcheck="false" placeholder="Solana address" />
+
+        <label for="solana-send-amount" class="hint rpc-label">Amount (SOL)</label>
+        <input id="solana-send-amount" type="text" inputmode="decimal" spellcheck="false" placeholder="0.0" />
+
+        <div class="row">
+          <button id="solana-send-cancel-btn" type="button">Cancel</button>
+          <button id="solana-send-review-btn" type="button">Review send</button>
+        </div>
+
+        <p id="solana-send-status" class="hint"></p>
+        <p id="solana-send-error" class="error"></p>
+      </section>
+
+      <!-- Solana send step 2: mandatory confirmation, no skip path -->
+      <section id="step-solana-send-confirm" class="step hidden">
+        <h2>Confirm this transaction</h2>
+        <p class="warning">
+          This sends a real transaction on Solana mainnet and cannot be
+          undone once broadcast. Review every field below.
+        </p>
+
+        <dl class="review-list">
+          <dt>Recipient</dt>
+          <dd class="address-row">
+            <span class="chain-badge chain-badge-solana">SOL</span>
+            <span id="solana-review-recipient" class="address"></span>
+          </dd>
+          <dt>Amount</dt>
+          <dd id="solana-review-amount"></dd>
+          <dt>Network fee</dt>
+          <dd id="solana-review-fee"></dd>
+          <dt>Total</dt>
+          <dd id="solana-review-total"></dd>
+        </dl>
+
+        <label class="review-ack">
+          <input id="solana-send-ack-checkbox" type="checkbox" />
+          I understand this cannot be undone.
+        </label>
+
+        <div class="row">
+          <button id="solana-send-back-btn" type="button">Back</button>
+          <button id="solana-send-confirm-btn" type="button" disabled>
+            Confirm and send
+          </button>
+        </div>
+
+        <p id="solana-send-confirm-error" class="error"></p>
+      </section>
+
+      <!-- Solana send step 3: signing / broadcasting / pending / confirmed -->
+      <section id="step-solana-send-status" class="step hidden">
+        <h2>Sending transaction</h2>
+
+        <p id="solana-send-progress" class="hint" aria-live="polite"></p>
+        <p id="solana-send-signature" class="address"></p>
+        <p id="solana-send-final-error" class="error"></p>
+
+        <div class="row">
+          <button id="solana-send-done-btn" type="button" class="hidden">
             Back to wallet
           </button>
         </div>

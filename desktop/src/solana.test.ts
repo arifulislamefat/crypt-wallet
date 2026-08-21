@@ -7,8 +7,39 @@ import {
   fetchLatestBlockhash,
   fetchSolanaBalanceLamports,
   formatLamportsAsSol,
+  isValidSolanaAddress,
   sendRawSolanaTransaction,
 } from "./solana";
+
+describe("isValidSolanaAddress", () => {
+  it("accepts a real, known-valid 32-byte address (the System Program ID)", () => {
+    expect(isValidSolanaAddress("11111111111111111111111111111111")).toBe(true);
+  });
+
+  it("accepts the addresses confirmed live on mainnet earlier this session", () => {
+    expect(isValidSolanaAddress("GAfD4PcV6TogQXr8dKffdvnoQfrWRXDBZz1N6yyiBcnL")).toBe(true);
+    expect(isValidSolanaAddress("FpxjtumdWSXRDALrHFgzL8b9Tg8mnGoQsExhD1H8eNsk")).toBe(true);
+  });
+
+  it("rejects the empty string", () => {
+    expect(isValidSolanaAddress("")).toBe(false);
+  });
+
+  it("rejects a string containing characters outside the Base58 alphabet", () => {
+    // "0", "O", "I", "l" are deliberately excluded from Base58 -- a common
+    // typo/transcription source, and exactly the class of input a naive
+    // "looks like an address" regex could miss.
+    expect(isValidSolanaAddress("0Fpxjtumd0SXRDALrHFgzL8b9Tg8mnGoQsExhD1H8eNsk")).toBe(false);
+  });
+
+  it("rejects a well-formed Base58 string that decodes to the wrong byte length", () => {
+    // Valid Base58, but far too short to be a 32-byte key.
+    expect(isValidSolanaAddress("abc")).toBe(false);
+    // An EVM address (also just characters, but the wrong alphabet/shape
+    // entirely) must never be accepted as a Solana one.
+    expect(isValidSolanaAddress("0x0000000000000000000000000000000000dEaD")).toBe(false);
+  });
+});
 
 /**
  * `fetchSolanaBalanceLamports` is the one function in this module that

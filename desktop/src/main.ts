@@ -13,7 +13,16 @@ import {
   type NetworkConfig,
 } from "./networks";
 import { fetchTokenBalance, fetchTokenMetadata, parseUnitsStrict, type TokenMetadata } from "./tokens";
-import { fetchSolanaBalanceLamports, formatLamportsAsSol } from "./solana";
+import {
+  BASE_FEE_LAMPORTS_PER_SIGNATURE,
+  SOL_DECIMALS,
+  confirmSolanaTransaction,
+  fetchLatestBlockhash,
+  fetchSolanaBalanceLamports,
+  formatLamportsAsSol,
+  isValidSolanaAddress,
+  sendRawSolanaTransaction,
+} from "./solana";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -54,7 +63,10 @@ type Step =
   | "send"
   | "send-confirm"
   | "send-status"
-  | "reveal";
+  | "reveal"
+  | "solana-send"
+  | "solana-send-confirm"
+  | "solana-send-status";
 
 const ALL_STEPS: Step[] = [
   "unlock",
@@ -67,6 +79,9 @@ const ALL_STEPS: Step[] = [
   "send-confirm",
   "send-status",
   "reveal",
+  "solana-send",
+  "solana-send-confirm",
+  "solana-send-status",
 ];
 
 /**
@@ -174,13 +189,12 @@ interface WalletAccount {
 let accounts: WalletAccount[] = [];
 
 /**
- * A derived Solana account, display-only at this phase — see
- * `SOLANA_ACCOUNTS_TO_SHOW`'s doc comment. Deliberately its own type, not a
- * variant of `WalletAccount`: a Solana address isn't `Address` (EVM's
- * `0x`-prefixed, EIP-55-checksummed hex type — see `networks.ts`), it's a
- * plain Base58 string, and conflating the two would let a Solana address
- * slip into an EVM-typed slot (a send-destination field, an EVM RPC call)
- * undetected by the type system.
+ * A derived Solana account. Deliberately its own type, not a variant of
+ * `WalletAccount`: a Solana address isn't `Address` (EVM's `0x`-prefixed,
+ * EIP-55-checksummed hex type — see `networks.ts`), it's a plain Base58
+ * string, and conflating the two would let a Solana address slip into an
+ * EVM-typed slot (a send-destination field, an EVM RPC call) undetected by
+ * the type system.
  */
 interface SolanaWalletAccount {
   index: number;
@@ -188,22 +202,14 @@ interface SolanaWalletAccount {
 }
 
 /**
- * How many Solana accounts to derive and display. Fixed at 1 (just account
- * 0) rather than mirroring EVM's `MAX_ACCOUNTS` switcher: this phase is
- * display-only, proving the derivation module is wired into the app's
- * account architecture — not yet a real multi-account Solana experience
- * (there's no Solana account switcher, no balance, no send). Revisit this
- * constant once Solana balance fetching (the next planned phase) makes more
- * than one visible account actually useful to show.
- */
-const SOLANA_ACCOUNTS_TO_SHOW = 1;
-
-/**
- * Every Solana account currently displayed, derived once per unlock (see
- * `loadAccounts`) alongside the EVM accounts. Read-only display list — see
- * this array's own doc comment on `SolanaWalletAccount` for why Solana
- * addresses are never allowed to flow into any EVM-typed code path from
- * here.
+ * Every Solana account this wallet has actually created, derived once per
+ * unlock (see `loadSolanaAccounts`) — real, persisted create/switch
+ * accounting, mirroring how EVM's account switcher works, NOT a fixed
+ * ceiling like EVM's `MAX_ACCOUNTS` still is (that's a known, separate,
+ * not-yet-fixed gap on the EVM side). How many accounts exist is asked of
+ * the backend (`get_solana_account_count`, backed by a persisted sidecar
+ * file next to the vault — see that file's own doc comment in lib.rs) —
+ * never assumed or hardcoded here.
  */
 let solanaAccounts: SolanaWalletAccount[] = [];
 
@@ -314,6 +320,29 @@ type PreparedSend = PreparedEthSend | PreparedTokenSend;
 let preparedSend: PreparedSend | null = null;
 
 /**
+ * Everything `confirmSolanaSend` needs, populated by `reviewSolanaSend` and
+ * consumed exactly once. Same shape/lifecycle as `PreparedSend` above, but
+ * deliberately a separate type, not folded into that union: a Solana send
+ * has no nonce, no gas, no per-token variant, and its own recipient type
+ * (a validated Base58 string, not `Address`) — squeezing it into the EVM
+ * shape would just mean fields that mean something different per `kind`.
+ */
+interface PreparedSolanaSend {
+  recipient: string;
+  lamports: bigint;
+  recentBlockhash: string;
+}
+let preparedSolanaSend: PreparedSolanaSend | null = null;
+
+/**
+ * Which Solana account is active — set by `switchActiveSolanaAccount`,
+ * read by `fetchSolanaBalance` and the send flow (`reviewSolanaSend`/
+ * `confirmSolanaSend`). Mirrors EVM's `activeAccountIndex` exactly, now
+ * that Solana has a real account switcher instead of always being 0.
+ */
+let activeSolanaAccountIndex = 0;
+
+/**
  * The send-asset selector's option value for "the chain's own native
  * currency" (ETH, BNB, ...), as opposed to a specific token address.
  * Deliberately NOT the literal display symbol (that varies per network —
@@ -337,6 +366,20 @@ function clearSendState() {
   el("send-tx-hash").textContent = "";
   el("send-final-error").textContent = "";
   el("send-done-btn").classList.add("hidden");
+}
+
+function clearSolanaSendState() {
+  preparedSolanaSend = null;
+  el<HTMLInputElement>("solana-send-recipient").value = "";
+  el<HTMLInputElement>("solana-send-amount").value = "";
+  el<HTMLInputElement>("solana-send-ack-checkbox").checked = false;
+  el("solana-send-status").textContent = "";
+  el("solana-send-error").textContent = "";
+  el("solana-send-confirm-error").textContent = "";
+  el("solana-send-progress").textContent = "";
+  el("solana-send-signature").textContent = "";
+  el("solana-send-final-error").textContent = "";
+  el("solana-send-done-btn").classList.add("hidden");
 }
 
 /**
@@ -375,6 +418,7 @@ function isSessionLockedError(error: unknown): boolean {
  */
 function handleSessionLocked() {
   clearSendState();
+  clearSolanaSendState();
   showStep("unlock");
   el("unlock-error").textContent =
     "Your session locked due to inactivity — please unlock again.";
@@ -728,11 +772,19 @@ async function loadAccounts() {
  */
 async function loadSolanaAccounts() {
   const errorEl = el("solana-account-error");
+  const select = el<HTMLSelectElement>("solana-account-select");
   errorEl.textContent = "";
   solanaAccounts = [];
+  select.replaceChildren();
+  select.disabled = true;
 
   try {
-    for (let index = 0; index < SOLANA_ACCOUNTS_TO_SHOW; index++) {
+    // How many accounts actually exist is asked of the backend every time
+    // — never assumed — since it reflects real persisted state (see
+    // `solanaAccounts`'s own doc comment) that can only grow via
+    // `handleAddSolanaAccount`, not a constant this file gets to decide.
+    const count = await invoke<number>("get_solana_account_count");
+    for (let index = 0; index < count; index++) {
       const address = await invoke<string>("get_solana_account_address", { index });
       solanaAccounts.push({ index, address });
     }
@@ -742,41 +794,81 @@ async function loadSolanaAccounts() {
       return;
     }
     errorEl.textContent = `Could not derive Solana accounts: ${String(error)}`;
+  } finally {
+    select.disabled = false;
   }
 
-  renderSolanaAccountList();
-  void fetchSolanaBalance();
+  renderSolanaAccountSelect();
+  if (solanaAccounts.length > 0) {
+    switchActiveSolanaAccount(0);
+  }
   updateSolanaInterstitialAddress();
 }
 
 /**
- * Render the display-only Solana account list. No `<select>`, no click
- * handler, no active-account concept — unlike `renderAccountSelect`, there
- * is nothing here yet for a user to *do* with these addresses (see
- * `SOLANA_ACCOUNTS_TO_SHOW`'s doc comment on why this phase is display
- * only), so a plain list is the honest UI for what this is.
- *
- * Each row carries its own chain-family badge (see `.chain-badge` in
- * styles.css) — built with `createElement`/`append`, not a template
- * string assigned to `textContent`, specifically so the badge is a real
- * sibling element rather than text that could drift out of sync with it.
+ * Populate the Solana account switcher from `solanaAccounts` — same option
+ * text format (`Account N — address`) as EVM's `renderAccountSelect`, so
+ * the two switchers read consistently even though they're for entirely
+ * different address spaces (see the chain-family badge next to the active
+ * address for that distinction).
  */
-function renderSolanaAccountList() {
-  const list = el("solana-account-list");
-  list.replaceChildren();
+function renderSolanaAccountSelect() {
+  const select = el<HTMLSelectElement>("solana-account-select");
+  select.replaceChildren();
   for (const account of solanaAccounts) {
-    const item = document.createElement("li");
-    item.className = "solana-account-item";
+    const option = document.createElement("option");
+    option.value = String(account.index);
+    option.textContent = `Account ${account.index + 1} — ${account.address}`;
+    select.appendChild(option);
+  }
+}
 
-    const badge = document.createElement("span");
-    badge.className = "chain-badge chain-badge-solana";
-    badge.textContent = "SOL";
+/**
+ * Make `index` the active Solana account — mirrors `switchActiveAccount`
+ * exactly: updates `activeSolanaAccountIndex`, reflects the choice in the
+ * switcher (in case this was called programmatically, e.g. right after
+ * `handleAddSolanaAccount`), updates the visible active-address line, and
+ * refreshes the balance for the newly active account. `fetchSolanaBalance`
+ * reads `activeSolanaAccountIndex` itself (see that function), so no
+ * separate "which account" plumbing is needed here beyond setting it.
+ */
+function switchActiveSolanaAccount(index: number) {
+  const account = solanaAccounts.find((a) => a.index === index);
+  if (!account) {
+    return;
+  }
+  activeSolanaAccountIndex = account.index;
+  el("solana-active-address").textContent = account.address;
+  el<HTMLSelectElement>("solana-account-select").value = String(account.index);
+  void fetchSolanaBalance();
+}
 
-    const text = document.createElement("span");
-    text.textContent = `Account ${account.index + 1} — ${account.address}`;
+/**
+ * Derive and persist one more Solana account (backend-side: see
+ * `add_solana_account` in lib.rs), add it to `solanaAccounts`, re-render
+ * the switcher, and make it the active account — the natural thing to want
+ * right after adding one.
+ */
+async function handleAddSolanaAccount() {
+  const errorEl = el("solana-add-account-error");
+  const addBtn = el<HTMLButtonElement>("solana-add-account-btn");
+  errorEl.textContent = "";
+  addBtn.disabled = true;
 
-    item.append(badge, text);
-    list.appendChild(item);
+  try {
+    const address = await invoke<string>("add_solana_account");
+    const index = solanaAccounts.length; // The backend derives the next unused index, same count this array already reflects.
+    solanaAccounts.push({ index, address });
+    renderSolanaAccountSelect();
+    switchActiveSolanaAccount(index);
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    errorEl.textContent = `Could not add an account: ${String(error)}`;
+  } finally {
+    addBtn.disabled = false;
   }
 }
 
@@ -825,21 +917,27 @@ function switchChainFamily(family: "evm" | "solana") {
 }
 
 /**
- * Fetch and render account 0's real SOL mainnet balance — see `solana.ts`'s
- * module doc comment for the RPC endpoint's own verification. Mirrors
- * `fetchBalance`'s stale-response guard (`solanaBalanceRequestId`) for the
- * same reason: a slow response from a superseded request (double-click
- * refresh, or a lock/unlock in between) must never land after a newer one
+ * Fetch and render the ACTIVE Solana account's real SOL mainnet balance —
+ * see `solana.ts`'s module doc comment for the RPC endpoint's own
+ * verification. Mirrors `fetchBalance`'s stale-response guard
+ * (`solanaBalanceRequestId`) for the same reason: a slow response from a
+ * superseded request (double-click refresh, a switch to a different
+ * account, or a lock/unlock in between) must never land after a newer one
  * and get shown as current.
  *
- * Account 0 only, matching `SOLANA_ACCOUNTS_TO_SHOW` — there is only ever
- * one Solana account displayed at this phase.
+ * BUG FIX: this used to look up index 0 unconditionally, independent of
+ * `activeSolanaAccountIndex` — harmless while only one Solana account
+ * could ever exist, but wrong the moment a second one did: switching the
+ * active account would move `activeSolanaAccountIndex` while the balance
+ * shown stayed pinned to account 0 regardless. Now reads the same variable
+ * `switchActiveSolanaAccount` sets, the same way `fetchBalance` already
+ * follows `activeAccountAddress` on the EVM side.
  */
 async function fetchSolanaBalance() {
   const valueEl = el("solana-balance-value");
   const errorEl = el("solana-balance-error");
   const refreshBtn = el<HTMLButtonElement>("refresh-solana-balance-btn");
-  const account = solanaAccounts.find((a) => a.index === 0);
+  const account = solanaAccounts.find((a) => a.index === activeSolanaAccountIndex);
 
   const requestId = ++solanaBalanceRequestId;
   errorEl.textContent = "";
@@ -2173,6 +2271,187 @@ async function confirmSend() {
   void fetchBalance();
 }
 
+/**
+ * Enter the Solana send flow. Unlike `goToSend`, there is no destination
+ * dropdown to populate — see `step-solana-send`'s own hint text: this
+ * accepts any valid Solana address, not just this wallet's own accounts
+ * (deliberately, per this feature's spec). Nothing to prefetch here beyond
+ * clearing prior state; `reviewSolanaSend` does the real validation and
+ * network calls.
+ */
+function goToSolanaSend() {
+  clearSolanaSendState();
+  showStep("solana-send");
+}
+
+/**
+ * "Review send": validate the recipient and amount, fetch a fresh balance
+ * and blockhash, and show the mandatory confirmation screen. Mirrors
+ * `reviewSend`'s shape (validate -> fetch over the network -> populate
+ * review -> show confirm), simplified for what Solana actually needs: no
+ * nonce, no gas estimate, no asset picker -- just a fixed protocol fee
+ * (`BASE_FEE_LAMPORTS_PER_SIGNATURE`, not an estimate) and a blockhash.
+ */
+async function reviewSolanaSend() {
+  const errorEl = el("solana-send-error");
+  const statusEl = el("solana-send-status");
+  const reviewBtn = el<HTMLButtonElement>("solana-send-review-btn");
+  errorEl.textContent = "";
+
+  const recipient = el<HTMLInputElement>("solana-send-recipient").value.trim();
+  const amountInput = el<HTMLInputElement>("solana-send-amount").value.trim();
+
+  // Real Base58 decode + exact-length check (see `isValidSolanaAddress`'s
+  // own doc comment) -- not a regex heuristic, the same bar EVM's EIP-55
+  // checksum validation is held to. Checked before any network call, so a
+  // typo'd address never gets as far as a balance fetch.
+  if (!isValidSolanaAddress(recipient)) {
+    errorEl.textContent = "Enter a valid Solana address (Base58, 32 bytes).";
+    return;
+  }
+
+  let lamports: bigint;
+  try {
+    lamports = parseUnitsStrict(amountInput, SOL_DECIMALS);
+  } catch {
+    errorEl.textContent = "Enter a valid, positive amount in SOL.";
+    return;
+  }
+  if (lamports <= 0n) {
+    errorEl.textContent = "Amount must be greater than zero.";
+    return;
+  }
+
+  reviewBtn.disabled = true;
+  const account = solanaAccounts.find((a) => a.index === activeSolanaAccountIndex);
+  if (!account) {
+    errorEl.textContent = "Active Solana account has not been derived yet.";
+    reviewBtn.disabled = false;
+    return;
+  }
+
+  let balanceLamports: bigint;
+  statusEl.textContent = "Checking balance…";
+  try {
+    balanceLamports = await fetchSolanaBalanceLamports(account.address);
+  } catch (error) {
+    statusEl.textContent = "";
+    reviewBtn.disabled = false;
+    errorEl.textContent = `Could not fetch balance: ${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+
+  // Must not allow spending more than balance minus the fixed network fee
+  // -- checked against a balance just fetched fresh, not a possibly-stale
+  // cached value, so a send attempted right after another one already
+  // spent this account's balance is judged against the real current state.
+  if (lamports + BASE_FEE_LAMPORTS_PER_SIGNATURE > balanceLamports) {
+    statusEl.textContent = "";
+    reviewBtn.disabled = false;
+    errorEl.textContent =
+      `Amount plus the ${formatLamportsAsSol(BASE_FEE_LAMPORTS_PER_SIGNATURE)} SOL network fee ` +
+      `exceeds the current balance (${formatLamportsAsSol(balanceLamports)} SOL).`;
+    return;
+  }
+
+  let recentBlockhash: string;
+  statusEl.textContent = "Fetching recent blockhash…";
+  try {
+    recentBlockhash = await fetchLatestBlockhash();
+  } catch (error) {
+    statusEl.textContent = "";
+    reviewBtn.disabled = false;
+    errorEl.textContent = `Could not fetch a recent blockhash: ${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+
+  statusEl.textContent = "";
+  reviewBtn.disabled = false;
+
+  preparedSolanaSend = { recipient, lamports, recentBlockhash };
+  el("solana-review-recipient").textContent = recipient;
+  el("solana-review-amount").textContent = `${formatLamportsAsSol(lamports)} SOL`;
+  el("solana-review-fee").textContent = `${formatLamportsAsSol(BASE_FEE_LAMPORTS_PER_SIGNATURE)} SOL`;
+  el("solana-review-total").textContent =
+    `${formatLamportsAsSol(lamports + BASE_FEE_LAMPORTS_PER_SIGNATURE)} SOL (amount + fee)`;
+
+  el<HTMLInputElement>("solana-send-ack-checkbox").checked = false;
+  el<HTMLButtonElement>("solana-send-confirm-btn").disabled = true;
+  el("solana-send-confirm-error").textContent = "";
+  showStep("solana-send-confirm");
+}
+
+/**
+ * Sign (via the backend, which holds the key), broadcast, then poll for
+ * confirmation. Mirrors `confirmSend`'s three distinct failure stages
+ * (signing / broadcast / confirmation), the same reasoning: each is a
+ * different operational problem a user troubleshooting a stuck or
+ * rejected send needs to tell apart.
+ */
+async function confirmSolanaSend() {
+  if (!preparedSolanaSend) {
+    return;
+  }
+  const send = preparedSolanaSend;
+
+  const progressEl = el("solana-send-progress");
+  const finalErrorEl = el("solana-send-final-error");
+  const confirmBtn = el<HTMLButtonElement>("solana-send-confirm-btn");
+  finalErrorEl.textContent = "";
+  el("solana-send-signature").textContent = "";
+  confirmBtn.disabled = true;
+  showStep("solana-send-status");
+
+  progressEl.textContent = "Signing…";
+  let signedBase64: string;
+  try {
+    signedBase64 = await invoke<string>("sign_solana_transaction", {
+      to: send.recipient,
+      lamports: Number(send.lamports),
+      recentBlockhash: send.recentBlockhash,
+      fromIndex: activeSolanaAccountIndex,
+    });
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    progressEl.textContent = "";
+    finalErrorEl.textContent = `Signing failed: ${String(error)}`;
+    el("solana-send-done-btn").classList.remove("hidden");
+    return;
+  }
+
+  progressEl.textContent = "Broadcasting…";
+  let signature: string;
+  try {
+    signature = await sendRawSolanaTransaction(signedBase64);
+  } catch (error) {
+    progressEl.textContent = "";
+    finalErrorEl.textContent = `Broadcast was rejected: ${error instanceof Error ? error.message : String(error)}`;
+    el("solana-send-done-btn").classList.remove("hidden");
+    return;
+  }
+
+  el("solana-send-signature").textContent = `Signature: ${signature}`;
+  progressEl.textContent = "Pending — waiting for confirmation…";
+  try {
+    const status = await confirmSolanaTransaction(signature);
+    progressEl.textContent =
+      status === "confirmed" || status === "finalized"
+        ? `${status[0].toUpperCase()}${status.slice(1)}.`
+        : status === "failed"
+          ? "The transaction failed on-chain."
+          : "Not yet confirmed within the wait window — it may still confirm later; check the signature above.";
+  } catch (error) {
+    progressEl.textContent = "";
+    finalErrorEl.textContent = `Confirmation check failed: ${error instanceof Error ? error.message : String(error)}. The transaction may still confirm later — check the signature above.`;
+  }
+
+  el("solana-send-done-btn").classList.remove("hidden");
+  void fetchSolanaBalance();
+}
+
 async function unlock() {
   const errorEl = el("unlock-error");
   const statusEl = el("unlock-status");
@@ -2212,8 +2491,11 @@ async function lock() {
   el<HTMLSelectElement>("account-select").replaceChildren();
   el("unlocked-address").textContent = "";
   solanaAccounts = [];
+  activeSolanaAccountIndex = 0;
   el("solana-account-error").textContent = "";
-  el("solana-account-list").replaceChildren();
+  el<HTMLSelectElement>("solana-account-select").replaceChildren();
+  el("solana-active-address").textContent = "";
+  el("solana-add-account-error").textContent = "";
   solanaBalanceRequestId++; // Invalidate any Solana balance fetch still in flight.
   el("solana-balance-value").textContent = "";
   el("solana-balance-value").classList.remove("loading");
@@ -2232,6 +2514,7 @@ async function lock() {
   clearPassphraseInputs();
   clearPhraseFromMemory();
   clearSendState();
+  clearSolanaSendState();
   showStep("unlock");
 }
 
@@ -2248,6 +2531,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("custom-network-add-btn").addEventListener("click", handleAddCustomNetwork);
   el("refresh-balance-btn").addEventListener("click", () => void fetchBalance());
   el("refresh-solana-balance-btn").addEventListener("click", () => void fetchSolanaBalance());
+  el<HTMLSelectElement>("solana-account-select").addEventListener("change", (event) => {
+    switchActiveSolanaAccount(Number((event.target as HTMLSelectElement).value));
+  });
+  el("solana-add-account-btn").addEventListener("click", () => void handleAddSolanaAccount());
   el("chain-family-evm-btn").addEventListener("click", () => switchChainFamily("evm"));
   el("chain-family-solana-btn").addEventListener("click", () => switchChainFamily("solana"));
   el("solana-interstitial-continue-btn").addEventListener("click", () => {
@@ -2333,6 +2620,30 @@ window.addEventListener("DOMContentLoaded", async () => {
     showStep("unlocked");
     void fetchBalance();
   });
+
+  el("solana-send-nav-btn").addEventListener("click", goToSolanaSend);
+  el("solana-send-cancel-btn").addEventListener("click", () => {
+    clearSolanaSendState();
+    showStep("unlocked");
+  });
+  el("solana-send-review-btn").addEventListener("click", () => void reviewSolanaSend());
+  el("solana-send-back-btn").addEventListener("click", () => {
+    el("solana-send-confirm-error").textContent = "";
+    showStep("solana-send");
+  });
+  el<HTMLInputElement>("solana-send-ack-checkbox").addEventListener("change", (event) => {
+    el<HTMLButtonElement>("solana-send-confirm-btn").disabled = !(event.target as HTMLInputElement).checked;
+  });
+  // Deliberately does NOT call confirmSolanaSend() itself -- same reasoning
+  // as the EVM ack checkbox above: only the explicit Confirm button click
+  // triggers a real send.
+  el("solana-send-confirm-btn").addEventListener("click", () => void confirmSolanaSend());
+  el("solana-send-done-btn").addEventListener("click", () => {
+    clearSolanaSendState();
+    showStep("unlocked");
+    void fetchSolanaBalance();
+  });
+
   el("unlock-password").addEventListener("keydown", (event) => {
     if ((event as KeyboardEvent).key === "Enter") {
       unlock();

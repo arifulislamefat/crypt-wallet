@@ -103,8 +103,53 @@ const POLYGON_AMOY_CHAIN_ID: u64 = 80002;
 /// 0xaa37dc), and independently against a direct eth_chainId call to this
 /// app's RPC default, which echoed back the same 0xaa37dc.
 const OPTIMISM_SEPOLIA_CHAIN_ID: u64 = 11155420;
+/// Verified 2026-08-22 against https://chainlist.org/chain/43114 directly
+/// (page displays "Avalanche C-Chain", chain ID 43114 / 0xa86a), and
+/// independently against a direct eth_chainId call to this app's RPC
+/// default, which echoed back the same 0xa86a.
+const AVALANCHE_CHAIN_ID: u64 = 43114;
+/// Avalanche's Fuji testnet. Verified via a direct eth_chainId call to this
+/// app's RPC default, which echoed back 0xa869 (43113) -- not independently
+/// re-checked against chainlist.org, matching this codebase's existing
+/// practice of trusting the RPC-echoed value for testnets paired with an
+/// already-verified mainnet on the same chain family.
+const AVALANCHE_FUJI_CHAIN_ID: u64 = 43113;
+/// Verified 2026-08-22 against https://chainlist.org/chain/324 directly
+/// (page displays "zkSync Mainnet", chain ID 324 / 0x144), and
+/// independently against a direct eth_chainId call to this app's RPC
+/// default, which echoed back the same 0x144.
+const ZKSYNC_CHAIN_ID: u64 = 324;
+/// zkSync's Sepolia testnet. Verified via a direct eth_chainId call to this
+/// app's RPC default, which echoed back 0x12c (300).
+const ZKSYNC_SEPOLIA_CHAIN_ID: u64 = 300;
+/// Verified 2026-08-22 against https://chainlist.org/chain/59144 directly
+/// (page displays "Linea", chain ID 59144 / 0xe708), and independently
+/// against a direct eth_chainId call to this app's RPC default, which
+/// echoed back the same 0xe708.
+const LINEA_CHAIN_ID: u64 = 59144;
+/// Linea's Sepolia testnet. Verified via a direct eth_chainId call to this
+/// app's RPC default, which echoed back 0xe705 (59141).
+const LINEA_SEPOLIA_CHAIN_ID: u64 = 59141;
+/// Verified 2026-08-22 against https://chainlist.org/chain/534352 directly
+/// (page displays "Scroll", chain ID 534352 / 0x82750), and independently
+/// against a direct eth_chainId call to this app's RPC default, which
+/// echoed back the same 0x82750.
+const SCROLL_CHAIN_ID: u64 = 534352;
+/// Scroll's Sepolia testnet. Verified via a direct eth_chainId call to this
+/// app's RPC default, which echoed back 0x8274f (534351).
+const SCROLL_SEPOLIA_CHAIN_ID: u64 = 534351;
+/// Verified 2026-08-22 against https://chainlist.org/chain/81457 directly
+/// (page displays "Blast", chain ID 81457 / 0x13e31), and independently
+/// against a direct eth_chainId call to this app's RPC default, which
+/// echoed back the same 0x13e31.
+const BLAST_CHAIN_ID: u64 = 81457;
+/// Blast's Sepolia testnet. Verified via a direct eth_chainId call to this
+/// app's RPC default (Blast's own `sepolia.blast.io` -- publicnode does not
+/// serve this testnet, see `DEFAULT_BLAST_SEPOLIA_RPC_URL` in networks.ts),
+/// which echoed back 0xa0c71fd (168587773).
+const BLAST_SEPOLIA_CHAIN_ID: u64 = 168587773;
 
-const SUPPORTED_CHAIN_IDS: [u64; 12] = [
+const SUPPORTED_CHAIN_IDS: [u64; 22] = [
     SEPOLIA_CHAIN_ID,
     MAINNET_CHAIN_ID,
     BSC_CHAIN_ID,
@@ -117,6 +162,16 @@ const SUPPORTED_CHAIN_IDS: [u64; 12] = [
     OPTIMISM_CHAIN_ID,
     POLYGON_AMOY_CHAIN_ID,
     OPTIMISM_SEPOLIA_CHAIN_ID,
+    AVALANCHE_CHAIN_ID,
+    AVALANCHE_FUJI_CHAIN_ID,
+    ZKSYNC_CHAIN_ID,
+    ZKSYNC_SEPOLIA_CHAIN_ID,
+    LINEA_CHAIN_ID,
+    LINEA_SEPOLIA_CHAIN_ID,
+    SCROLL_CHAIN_ID,
+    SCROLL_SEPOLIA_CHAIN_ID,
+    BLAST_CHAIN_ID,
+    BLAST_SEPOLIA_CHAIN_ID,
 ];
 
 /// Chain IDs this app will actually sign a transaction for. This is the
@@ -138,21 +193,25 @@ const SUPPORTED_CHAIN_IDS: [u64; 12] = [
 /// this app supports — not an audit having occurred, not a per-chain
 /// evaluation, a direct policy reversal recorded here so a future reader
 /// does not mistake the absence of the old restriction for an oversight.
-/// All 6 mainnets (`MAINNET_CHAIN_ID`, `BSC_CHAIN_ID`, `ARBITRUM_CHAIN_ID`,
-/// `BASE_CHAIN_ID`, `POLYGON_CHAIN_ID`, `OPTIMISM_CHAIN_ID`) now sit
-/// alongside every testnet — this list is currently identical to
-/// `SUPPORTED_CHAIN_IDS`, kept as its own separate, explicitly-enumerated
-/// list rather than collapsed into an alias, since the two lists represent
-/// genuinely different decisions (read-only support vs. sign-for) that
-/// happen to currently agree, not the same decision twice — a future
-/// restriction (e.g. a custom network, or re-tightening this policy) would
-/// need to diverge them again. See `desktop/src/main.ts`'s
-/// `EVM_MAINNET_WARNING_ACKNOWLEDGED`-style one-time warning gate for the
-/// compensating control this reversal shipped with: informed consent
-/// before a user's first real-fund send this session, since removing the
-/// architectural block does not mean removing the "this hasn't been
-/// audited" disclosure.
-const SENDABLE_CHAIN_IDS: [u64; 12] = [
+/// All 6 mainnets present at the time of that reversal (`MAINNET_CHAIN_ID`,
+/// `BSC_CHAIN_ID`, `ARBITRUM_CHAIN_ID`, `BASE_CHAIN_ID`, `POLYGON_CHAIN_ID`,
+/// `OPTIMISM_CHAIN_ID`) sat alongside every testnet from that point on —
+/// this list is kept identical in membership to `SUPPORTED_CHAIN_IDS`, as its
+/// own separate, explicitly-enumerated list rather than collapsed into
+/// an alias, since the two lists represent genuinely different decisions
+/// (read-only support vs. sign-for) that happen to currently agree, not the
+/// same decision twice — a future restriction (e.g. a custom network, or
+/// re-tightening this policy) would need to diverge them again. The five
+/// EVM networks added 2026-08-22 (Avalanche, zkSync Era, Linea, Scroll,
+/// Blast, each mainnet+testnet) followed the already-reversed policy: no
+/// new per-chain audit exemption was made, they simply landed under the
+/// standing "every chain this app supports is sendable" decision. See
+/// `desktop/src/main.ts`'s `EVM_MAINNET_WARNING_ACKNOWLEDGED`-style
+/// one-time warning gate for the compensating control this reversal
+/// shipped with: informed consent before a user's first real-fund send
+/// this session, since removing the architectural block does not mean
+/// removing the "this hasn't been audited" disclosure.
+const SENDABLE_CHAIN_IDS: [u64; 22] = [
     SEPOLIA_CHAIN_ID,
     MAINNET_CHAIN_ID,
     BSC_CHAIN_ID,
@@ -165,6 +224,16 @@ const SENDABLE_CHAIN_IDS: [u64; 12] = [
     OPTIMISM_CHAIN_ID,
     POLYGON_AMOY_CHAIN_ID,
     OPTIMISM_SEPOLIA_CHAIN_ID,
+    AVALANCHE_CHAIN_ID,
+    AVALANCHE_FUJI_CHAIN_ID,
+    ZKSYNC_CHAIN_ID,
+    ZKSYNC_SEPOLIA_CHAIN_ID,
+    LINEA_CHAIN_ID,
+    LINEA_SEPOLIA_CHAIN_ID,
+    SCROLL_CHAIN_ID,
+    SCROLL_SEPOLIA_CHAIN_ID,
+    BLAST_CHAIN_ID,
+    BLAST_SEPOLIA_CHAIN_ID,
 ];
 
 /// `Err` if `chain_id` isn't one of `SUPPORTED_CHAIN_IDS` at all. Shared by
@@ -2504,21 +2573,24 @@ mod tests {
     }
 
     #[test]
-    fn require_supported_chain_id_allows_all_twelve_known_chains_and_rejects_others() {
+    fn require_supported_chain_id_allows_every_known_chain_and_rejects_others() {
         for id in SUPPORTED_CHAIN_IDS {
             assert!(
                 require_supported_chain_id(id).is_ok(),
                 "expected chain id {id} to be recognized"
             );
         }
-        assert_eq!(SUPPORTED_CHAIN_IDS.len(), 12, "this test should cover every entry");
+        assert_eq!(SUPPORTED_CHAIN_IDS.len(), 22, "this test should cover every entry");
 
         // A representative sample of real, well-known chain IDs that are
         // simply not in this app's allowlist -- being a real EVM chain
-        // elsewhere doesn't make it supported here.
-        assert!(require_supported_chain_id(43114).is_err()); // Avalanche C-Chain
+        // elsewhere doesn't make it supported here. (43114/Avalanche and
+        // 324/zkSync Era used to live in this list before their 2026-08-22
+        // addition to SUPPORTED_CHAIN_IDS -- Gnosis Chain and Fantom Opera
+        // replace them as still-genuinely-unsupported examples.)
+        assert!(require_supported_chain_id(100).is_err()); // Gnosis Chain
         assert!(require_supported_chain_id(250).is_err()); // Fantom Opera
-        assert!(require_supported_chain_id(324).is_err()); // zkSync Era
+        assert!(require_supported_chain_id(42220).is_err()); // Celo Mainnet
         assert!(require_supported_chain_id(0).is_err());
         assert!(require_supported_chain_id(u64::MAX).is_err());
     }
@@ -2537,11 +2609,11 @@ mod tests {
                 "expected chain id {id} to be sendable"
             );
         }
-        assert_eq!(SENDABLE_CHAIN_IDS.len(), 12, "this test should cover every entry");
+        assert_eq!(SENDABLE_CHAIN_IDS.len(), 22, "this test should cover every entry");
 
         // A chain id this app doesn't recognize at all is still refused --
         // this remains a real allowlist, not a check that always passes.
-        let error = require_sendable_chain_id(43114) // Avalanche C-Chain
+        let error = require_sendable_chain_id(100) // Gnosis Chain
             .expect_err("an unsupported chain id must be refused");
         assert_eq!(error, "Sending is not yet supported on this network");
     }
@@ -2562,7 +2634,7 @@ mod tests {
             "0",
             "0",
             21000,
-            43114, // Avalanche C-Chain -- not in SUPPORTED_CHAIN_IDS at all, must be refused
+            100, // Gnosis Chain -- not in SUPPORTED_CHAIN_IDS at all, must be refused
             0,
         );
 
@@ -2750,7 +2822,7 @@ mod tests {
             "0",
             "0",
             65_000,
-            43114, // Avalanche C-Chain -- not in SUPPORTED_CHAIN_IDS at all, must be refused
+            100, // Gnosis Chain -- not in SUPPORTED_CHAIN_IDS at all, must be refused
             0,
         );
 

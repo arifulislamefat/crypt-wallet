@@ -39,6 +39,16 @@ const EXPECTED_CHAIN_IDS: Record<NetworkId, number> = {
   optimism: 10,
   polygonAmoy: 80002,
   optimismSepolia: 11155420,
+  avalanche: 43114,
+  avalancheFuji: 43113,
+  zksync: 324,
+  zksyncSepolia: 300,
+  linea: 59144,
+  lineaSepolia: 59141,
+  scroll: 534352,
+  scrollSepolia: 534351,
+  blast: 81457,
+  blastSepolia: 168587773,
 };
 
 const ALL_NETWORK_IDS = Object.keys(NETWORKS) as NetworkId[];
@@ -53,7 +63,7 @@ describe("network configuration", () => {
     expect(NETWORKS[DEFAULT_NETWORK].isTestnet).toBe(false);
   });
 
-  it("has exactly the twelve expected networks, each with its verified chain ID", () => {
+  it("has exactly the twenty-two expected networks, each with its verified chain ID", () => {
     expect(ALL_NETWORK_IDS.sort()).toEqual(Object.keys(EXPECTED_CHAIN_IDS).sort());
     for (const id of ALL_NETWORK_IDS) {
       expect(NETWORKS[id].chainId).toBe(EXPECTED_CHAIN_IDS[id]);

@@ -2,16 +2,26 @@ import { createPublicClient, defineChain, http, type Address, type Chain } from 
 import {
   arbitrum,
   arbitrumSepolia,
+  avalanche,
+  avalancheFuji,
   base,
   baseSepolia,
+  blast,
+  blastSepolia,
   bsc,
   bscTestnet,
+  linea,
+  lineaSepolia,
   mainnet,
   optimism,
   optimismSepolia,
   polygon,
   polygonAmoy,
+  scroll,
+  scrollSepolia,
   sepolia,
+  zksync,
+  zksyncSepoliaTestnet,
 } from "viem/chains";
 import { MAINNET_TOKENS, SEPOLIA_TOKENS, type TokenListing } from "./tokens";
 
@@ -39,7 +49,17 @@ export type NetworkId =
   | "polygon"
   | "polygonAmoy"
   | "optimism"
-  | "optimismSepolia";
+  | "optimismSepolia"
+  | "avalanche"
+  | "avalancheFuji"
+  | "zksync"
+  | "zksyncSepolia"
+  | "linea"
+  | "lineaSepolia"
+  | "scroll"
+  | "scrollSepolia"
+  | "blast"
+  | "blastSepolia";
 
 export interface NetworkConfig {
   /**
@@ -122,7 +142,7 @@ export interface NetworkConfig {
    * custom network's RPC endpoint anyway.
    */
   sendSupported: boolean;
-  /** This network's verified token list — see each token's own doc comment in `tokens.ts` for how its address was verified. Never the same list reused across networks: a token contract address is only valid on the specific chain it was verified for. Empty for the four networks added 2026-08-27 (BNB Smart Chain, Arbitrum, Base, and their testnets) and for every custom network — token contract addresses for those are each their own separately-verified addition, out of scope here. */
+  /** This network's verified token list — see each token's own doc comment in `tokens.ts` for how its address was verified. Never the same list reused across networks: a token contract address is only valid on the specific chain it was verified for. Empty for every network added since MAINNET_TOKENS/SEPOLIA_TOKENS were established (BNB Smart Chain, Arbitrum, Base, Polygon, Optimism, Avalanche, zkSync Era, Linea, Scroll, Blast, and all of their testnets) and for every custom network — token contract addresses for those are each their own separately-verified addition, out of scope here. */
   tokens: readonly TokenListing[];
 }
 
@@ -212,6 +232,68 @@ export const DEFAULT_POLYGON_AMOY_RPC_URL = "https://polygon-amoy-bor-rpc.public
  * Explorer".
  */
 export const DEFAULT_OPTIMISM_SEPOLIA_RPC_URL = "https://optimism-sepolia-rpc.publicnode.com";
+
+/**
+ * Verified 2026-08-22 against https://chainlist.org/chain/43114 directly
+ * (page displays "Avalanche C-Chain", chain ID 43114 / 0xa86a), and the RPC
+ * endpoint below confirmed responding with the same chain ID (0xa86a) via a
+ * direct eth_chainId call. Same publicnode provider as every other default
+ * here. The Fuji testnet default was verified the same way against its own
+ * eth_chainId response (0xa869 / 43113), not separately re-checked against
+ * chainlist.org.
+ */
+export const DEFAULT_AVALANCHE_RPC_URL = "https://avalanche-c-chain-rpc.publicnode.com";
+export const DEFAULT_AVALANCHE_FUJI_RPC_URL = "https://avalanche-fuji-c-chain-rpc.publicnode.com";
+
+/**
+ * Verified 2026-08-22 against https://chainlist.org/chain/324 directly
+ * (page displays "zkSync Mainnet", chain ID 324 / 0x144), and the RPC
+ * endpoint below confirmed responding with the same chain ID (0x144) via a
+ * direct eth_chainId call. NOT publicnode -- publicnode does not serve
+ * zkSync Era under any hostname tried (zksync-rpc / zksync-era-rpc /
+ * zksync-mainnet-rpc / zksync.publicnode.com all returned empty responses);
+ * this is zkSync's own official endpoint instead, matching viem's own
+ * built-in default for this chain. The Sepolia testnet default was verified
+ * the same way against its own eth_chainId response (0x12c / 300).
+ */
+export const DEFAULT_ZKSYNC_RPC_URL = "https://mainnet.era.zksync.io";
+export const DEFAULT_ZKSYNC_SEPOLIA_RPC_URL = "https://sepolia.era.zksync.dev";
+
+/**
+ * Verified 2026-08-22 against https://chainlist.org/chain/59144 directly
+ * (page displays "Linea", chain ID 59144 / 0xe708), and the RPC endpoint
+ * below confirmed responding with the same chain ID (0xe708) via a direct
+ * eth_chainId call. Same publicnode provider as every other default here.
+ * The Sepolia testnet default was verified the same way against its own
+ * eth_chainId response (0xe705 / 59141).
+ */
+export const DEFAULT_LINEA_RPC_URL = "https://linea-rpc.publicnode.com";
+export const DEFAULT_LINEA_SEPOLIA_RPC_URL = "https://linea-sepolia-rpc.publicnode.com";
+
+/**
+ * Verified 2026-08-22 against https://chainlist.org/chain/534352 directly
+ * (page displays "Scroll", chain ID 534352 / 0x82750), and the RPC endpoint
+ * below confirmed responding with the same chain ID (0x82750) via a direct
+ * eth_chainId call. Same publicnode provider as every other default here.
+ * The Sepolia testnet default was verified the same way against its own
+ * eth_chainId response (0x8274f / 534351).
+ */
+export const DEFAULT_SCROLL_RPC_URL = "https://scroll-rpc.publicnode.com";
+export const DEFAULT_SCROLL_SEPOLIA_RPC_URL = "https://scroll-sepolia-rpc.publicnode.com";
+
+/**
+ * Verified 2026-08-22 against https://chainlist.org/chain/81457 directly
+ * (page displays "Blast", chain ID 81457 / 0x13e31), and the RPC endpoint
+ * below confirmed responding with the same chain ID (0x13e31) via a direct
+ * eth_chainId call. Same publicnode provider as every other default here.
+ * The Sepolia testnet default is NOT publicnode, though -- both
+ * `blast-sepolia-rpc.publicnode.com` and `blast-sepolia.publicnode.com`
+ * returned "unsupported platform"; Blast's own official Sepolia endpoint is
+ * used instead, confirmed responding with the expected chain ID (0xa0c71fd
+ * / 168587773) via the same direct eth_chainId call.
+ */
+export const DEFAULT_BLAST_RPC_URL = "https://blast-rpc.publicnode.com";
+export const DEFAULT_BLAST_SEPOLIA_RPC_URL = "https://sepolia.blast.io";
 
 export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
   sepolia: {
@@ -396,6 +478,146 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     viemChain: optimismSepolia,
     defaultRpcUrl: DEFAULT_OPTIMISM_SEPOLIA_RPC_URL,
     explorerBaseUrl: "https://sepolia-optimistic.etherscan.io",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  avalancheFuji: {
+    id: "avalancheFuji",
+    label: "Avalanche Fuji",
+    chainId: avalancheFuji.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: avalancheFuji,
+    defaultRpcUrl: DEFAULT_AVALANCHE_FUJI_RPC_URL,
+    explorerBaseUrl: "https://testnet.snowtrace.io",
+    nativeCurrencySymbol: "AVAX",
+    sendSupported: true,
+    tokens: [],
+  },
+  avalanche: {
+    id: "avalanche",
+    label: "Avalanche C-Chain",
+    // Verified 2026-08-22 against https://chainlist.org/chain/43114
+    // directly: page displays "Avalanche C-Chain", chain ID 43114 (0xa86a).
+    chainId: avalanche.id,
+    isTestnet: false,
+    isCustom: false,
+    viemChain: avalanche,
+    defaultRpcUrl: DEFAULT_AVALANCHE_RPC_URL,
+    explorerBaseUrl: "https://snowtrace.io",
+    nativeCurrencySymbol: "AVAX",
+    sendSupported: true,
+    tokens: [],
+  },
+  zksyncSepolia: {
+    id: "zksyncSepolia",
+    label: "zkSync Sepolia",
+    chainId: zksyncSepoliaTestnet.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: zksyncSepoliaTestnet,
+    defaultRpcUrl: DEFAULT_ZKSYNC_SEPOLIA_RPC_URL,
+    explorerBaseUrl: "https://sepolia.explorer.zksync.io",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  zksync: {
+    id: "zksync",
+    label: "zkSync Era",
+    // Verified 2026-08-22 against https://chainlist.org/chain/324 directly:
+    // page displays "zkSync Mainnet", chain ID 324 (0x144).
+    chainId: zksync.id,
+    isTestnet: false,
+    isCustom: false,
+    viemChain: zksync,
+    defaultRpcUrl: DEFAULT_ZKSYNC_RPC_URL,
+    explorerBaseUrl: "https://explorer.zksync.io",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  lineaSepolia: {
+    id: "lineaSepolia",
+    label: "Linea Sepolia",
+    chainId: lineaSepolia.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: lineaSepolia,
+    defaultRpcUrl: DEFAULT_LINEA_SEPOLIA_RPC_URL,
+    explorerBaseUrl: "https://sepolia.lineascan.build",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  linea: {
+    id: "linea",
+    label: "Linea",
+    // Verified 2026-08-22 against https://chainlist.org/chain/59144
+    // directly: page displays "Linea", chain ID 59144 (0xe708).
+    chainId: linea.id,
+    isTestnet: false,
+    isCustom: false,
+    viemChain: linea,
+    defaultRpcUrl: DEFAULT_LINEA_RPC_URL,
+    explorerBaseUrl: "https://lineascan.build",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  scrollSepolia: {
+    id: "scrollSepolia",
+    label: "Scroll Sepolia",
+    chainId: scrollSepolia.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: scrollSepolia,
+    defaultRpcUrl: DEFAULT_SCROLL_SEPOLIA_RPC_URL,
+    explorerBaseUrl: "https://sepolia.scrollscan.com",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  scroll: {
+    id: "scroll",
+    label: "Scroll",
+    // Verified 2026-08-22 against https://chainlist.org/chain/534352
+    // directly: page displays "Scroll", chain ID 534352 (0x82750).
+    chainId: scroll.id,
+    isTestnet: false,
+    isCustom: false,
+    viemChain: scroll,
+    defaultRpcUrl: DEFAULT_SCROLL_RPC_URL,
+    explorerBaseUrl: "https://scrollscan.com",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  blastSepolia: {
+    id: "blastSepolia",
+    label: "Blast Sepolia",
+    chainId: blastSepolia.id,
+    isTestnet: true,
+    isCustom: false,
+    viemChain: blastSepolia,
+    defaultRpcUrl: DEFAULT_BLAST_SEPOLIA_RPC_URL,
+    explorerBaseUrl: "https://sepolia.blastscan.io",
+    nativeCurrencySymbol: "ETH",
+    sendSupported: true,
+    tokens: [],
+  },
+  blast: {
+    id: "blast",
+    label: "Blast",
+    // Verified 2026-08-22 against https://chainlist.org/chain/81457
+    // directly: page displays "Blast", chain ID 81457 (0x13e31).
+    chainId: blast.id,
+    isTestnet: false,
+    isCustom: false,
+    viemChain: blast,
+    defaultRpcUrl: DEFAULT_BLAST_RPC_URL,
+    explorerBaseUrl: "https://blastscan.io",
     nativeCurrencySymbol: "ETH",
     sendSupported: true,
     tokens: [],

@@ -1701,8 +1701,98 @@ fn core_health_check() -> String {
     format!("{crypto_summary} | {vault_summary}")
 }
 
+/// Etherscan V2 API base URL -- the same one `desktop/src/etherscan.ts`
+/// called directly before this command existed; see that module's own doc
+/// comment for the endpoint's own verification (one host for every chain,
+/// selected via `chainid`).
+const ETHERSCAN_API_BASE_URL: &str = "https://api.etherscan.io/v2/api";
+
+/// Fetch a raw Etherscan V2 API list response (`txlist` or `tokentx`) for
+/// `address` on `chain_id`, attaching this app's Etherscan API key
+/// server-side. This is the fix for a real credential-leak finding: the key
+/// used to live in the frontend as a Vite build-time env var, which meant
+/// it was inlined in plaintext into the built JS bundle -- readable by
+/// anyone who inspected a shipped app's webview resources. It now lives
+/// only in this process's environment (`ETHERSCAN_API_KEY`, loaded from
+/// `desktop/src-tauri/.env` by `dotenvy::dotenv()` in `run()`) and never
+/// crosses into the webview/frontend in any form.
+///
+/// Returns the raw JSON response body as a string, deliberately UNPARSED:
+/// envelope unwrapping (`status`/`message`/`result`), the "no history isn't
+/// an error" special case, and per-entry field validation all stay in
+/// `desktop/src/etherscan.ts` exactly as before this command existed -- this
+/// is a thin network+key relay, not a second copy of that parsing logic
+/// written twice in two languages.
+///
+/// `action` is checked against an exact allowlist before it's used to build
+/// the request -- untrusted frontend input gets the same "don't trust it,
+/// validate before use" treatment as every other command in this file, even
+/// though the actual risk here is low (worst case with an unchecked action
+/// is a malformed request Etherscan itself would reject).
+///
+/// No secret material of this wallet's own is involved -- address/chain_id
+/// are public, and the API key is a third-party service credential, not
+/// anything derived from the mnemonic -- so this doesn't need an unlocked
+/// session.
+#[tauri::command]
+async fn fetch_etherscan_list(chain_id: u64, action: String, address: String) -> Result<String, String> {
+    if action != "txlist" && action != "tokentx" {
+        return Err("unsupported Etherscan action".to_string());
+    }
+
+    let api_key = std::env::var("ETHERSCAN_API_KEY").map_err(|_| {
+        "No Etherscan API key is configured (set ETHERSCAN_API_KEY in desktop/src-tauri/.env).".to_string()
+    })?;
+
+    let mut url = reqwest::Url::parse(ETHERSCAN_API_BASE_URL)
+        .map_err(|_| "internal error: malformed Etherscan base URL".to_string())?;
+    url.query_pairs_mut()
+        .append_pair("chainid", &chain_id.to_string())
+        .append_pair("module", "account")
+        .append_pair("action", &action)
+        .append_pair("address", &address)
+        .append_pair("startblock", "0")
+        .append_pair("endblock", "99999999")
+        .append_pair("page", "1")
+        // Most recent 100 entries -- a read-only history view, not a full
+        // ledger export; covers "what did I just do" for a wallet this
+        // young without needing pagination UI yet.
+        .append_pair("offset", "100")
+        .append_pair("sort", "desc")
+        .append_pair("apikey", &api_key);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach Etherscan: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Etherscan returned HTTP {}", response.status()));
+    }
+
+    response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read Etherscan response: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Loads desktop/src-tauri/.env (gitignored) into this process's
+    // environment if present -- the only thing it currently supplies is
+    // ETHERSCAN_API_KEY (see `fetch_etherscan_list`). Deliberately
+    // `ok()`-ignored: a missing `.env` is expected and fine (matches how a
+    // missing VITE_ETHERSCAN_API_KEY was already handled before this
+    // command existed) -- transaction history just won't be available,
+    // nothing else in this app depends on it.
+    dotenvy::dotenv().ok();
+
     let unlocked = UnlockedWallet::default();
 
     // Idle-timeout sweeper: clears the session once it has sat unused past
@@ -1757,6 +1847,7 @@ pub fn run() {
         get_solana_account_count,
         add_solana_account,
         get_bitcoin_account_address,
+        fetch_etherscan_list,
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
@@ -1776,6 +1867,7 @@ pub fn run() {
         get_solana_account_count,
         add_solana_account,
         get_bitcoin_account_address,
+        fetch_etherscan_list,
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
@@ -2483,6 +2575,17 @@ mod tests {
         // the `>= 2^31` comparison here.
         let result = get_bitcoin_account_address_impl(0x8000_0000, &unlocked);
         assert!(result.is_err(), "hardened-range index must be rejected");
+    }
+
+    #[tokio::test]
+    async fn fetch_etherscan_list_rejects_an_unrecognized_action() {
+        // Checked before any network call is attempted, same "don't trust
+        // untrusted frontend input, validate before use" discipline as
+        // every other command in this file -- this test only needs to
+        // prove the check fires, not touch the real Etherscan API.
+        let result = fetch_etherscan_list(1, "not-a-real-action".to_string(), "0x0".to_string()).await;
+        let error = result.expect_err("an unrecognized action must be rejected");
+        assert_eq!(error, "unsupported Etherscan action");
     }
 
     #[test]

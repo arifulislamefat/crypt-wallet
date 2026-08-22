@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { Address } from "viem";
 
 /**
@@ -22,11 +23,19 @@ import type { Address } from "viem";
  * key works across every chain the V2 API supports — the same key backs
  * both networks this app knows about, nothing per-network to configure.
  *
- * The key is read from `VITE_ETHERSCAN_API_KEY` (a Vite build-time env var,
- * see `vite-env.d.ts` and the repo's `.env.example`) rather than hardcoded,
- * so swapping in a real key later — or rotating one — never touches this
- * file. `fetchTransactions` and `fetchTokenTransfers` both fail fast with a
- * clear message when it's unset, instead of sending a doomed request.
+ * POLICY HISTORY: through 2026-08-22 the key was read here directly, from
+ * `VITE_ETHERSCAN_API_KEY` (a Vite build-time env var) — a real problem,
+ * confirmed by inspecting a built app bundle: Vite inlines
+ * `import.meta.env.VITE_*` values at build time, so the key shipped in
+ * plaintext inside the built JS (`desktop/dist/assets/*.js`), readable by
+ * anyone who inspected a shipped app's webview resources. Fixed by moving
+ * the actual HTTP call to Rust (`fetch_etherscan_list` in
+ * `desktop/src-tauri/src/lib.rs`, key read from `ETHERSCAN_API_KEY` in
+ * `desktop/src-tauri/.env`, loaded at runtime, never compiled into any
+ * artifact) — the key now never crosses into this file, or this process, at
+ * all. `fetchTransactions`/`fetchTokenTransfers` still fail with a clear,
+ * distinguishable message when it's unset backend-side (see
+ * `EtherscanConfigError`), same as before this fix.
  *
  * ## Two endpoints, two different views of the same activity
  *
@@ -54,36 +63,27 @@ import type { Address } from "viem";
  * `tokentx`'s richer data for any hash it covers and falling back to
  * `txlist` for everything else (plain ETH activity, and the failed-token-
  * transfer edge case above).
+ *
+ * The API base URL itself (`https://api.etherscan.io/v2/api`) now lives
+ * backend-side, in `ETHERSCAN_API_BASE_URL` (`desktop/src-tauri/src/lib.rs`)
+ * — see `fetchEtherscanList`'s own doc comment for why the actual HTTP call
+ * moved there.
  */
-const ETHERSCAN_API_BASE_URL = "https://api.etherscan.io/v2/api";
 
 /**
- * Most recent entries to request per fetch, for either endpoint. This is a
- * read-only history view, not a full ledger export — 100 covers "what did I
- * just do" for a wallet this young without needing pagination UI yet.
- */
-const MAX_RESULTS = 100;
-
-/**
- * Bounded for the same reason as `RPC_TIMEOUT_MS` in networks.ts: an
- * unreachable or hung Etherscan should surface as a visible error within a
- * reasonable time, not leave the history view stuck loading indefinitely.
- */
-const REQUEST_TIMEOUT_MS = 10_000;
-
-const apiKey = import.meta.env.VITE_ETHERSCAN_API_KEY?.trim() ?? "";
-
-/** True if a key is configured at all — checked before ever touching the network. */
-export function hasEtherscanApiKey(): boolean {
-  return apiKey.length > 0;
-}
-
-/**
- * Distinguishes a "we can't even try" configuration problem (no key set)
- * from a genuine network/API failure — the two need different messages and,
+ * Exact copy, kept in sync by hand, of the message
+ * `fetch_etherscan_list` (`desktop/src-tauri/src/lib.rs`) returns when
+ * `ETHERSCAN_API_KEY` isn't set — the same "match the backend's error
+ * string" pattern `SESSION_LOCKED_ERROR` uses in `main.ts`, needed here to
+ * distinguish a config problem from a genuine network/API failure (see
+ * `fetchEtherscanList`'s catch block). The two need different messages and,
  * for the caller, different next steps (fix a `.env` file vs. "try again
  * later").
  */
+const ETHERSCAN_CONFIG_ERROR_MESSAGE =
+  "No Etherscan API key is configured (set ETHERSCAN_API_KEY in desktop/src-tauri/.env).";
+
+/** See `ETHERSCAN_CONFIG_ERROR_MESSAGE`'s own doc comment for what distinguishes this from `EtherscanApiError`. */
 export class EtherscanConfigError extends Error {}
 
 /** A real Etherscan request failed — network error, HTTP error, or an API-level error response. */
@@ -170,58 +170,40 @@ export async function fetchTokenTransfers(
 }
 
 /**
- * Shared plumbing for both endpoints: build the request against `chainId`
- * (Etherscan's V2 API is one host for every chain it supports, selected
- * entirely through this query param — not a different subdomain per
- * network the way the human-facing explorer *website* is; see
- * `NetworkConfig.explorerBaseUrl` in `networks.ts` for that), enforce the
- * timeout, and unwrap Etherscan's `{status, message, result}` envelope down
+ * Shared plumbing for both endpoints: ask the backend
+ * (`fetch_etherscan_list` in `desktop/src-tauri/src/lib.rs`) for the raw
+ * response against `chainId` (Etherscan's V2 API is one host for every
+ * chain it supports, selected entirely through this query param — not a
+ * different subdomain per network the way the human-facing explorer
+ * *website* is; see `NetworkConfig.explorerBaseUrl` in `networks.ts` for
+ * that), then unwrap Etherscan's `{status, message, result}` envelope down
  * to the raw `result` array — everything both `txlist` and `tokentx` share
  * byte-for-byte except the `action` param and how each entry in `result` is
  * parsed, which stay in `fetchTransactions`/`fetchTokenTransfers` and their
- * respective per-entry parsers.
+ * respective per-entry parsers. The actual HTTP call, the API key, the
+ * query-param construction, and the request timeout all live backend-side
+ * now (see `fetch_etherscan_list`'s own doc comment for why) — this
+ * function's job is just turning that raw JSON string into the array this
+ * module's callers want, and translating the backend's plain-string error
+ * (Tauri's `Result<_, String>` arrives here as a bare string, not an `Error`
+ * object) into the right one of this module's two error classes.
  */
 async function fetchEtherscanList(
   chainId: number,
   action: "txlist" | "tokentx",
   address: Address,
 ): Promise<unknown[]> {
-  if (!hasEtherscanApiKey()) {
-    throw new EtherscanConfigError(
-      "No Etherscan API key is configured (set VITE_ETHERSCAN_API_KEY in .env).",
-    );
-  }
-
-  const url = new URL(ETHERSCAN_API_BASE_URL);
-  url.searchParams.set("chainid", String(chainId));
-  url.searchParams.set("module", "account");
-  url.searchParams.set("action", action);
-  url.searchParams.set("address", address);
-  url.searchParams.set("startblock", "0");
-  url.searchParams.set("endblock", "99999999");
-  url.searchParams.set("page", "1");
-  url.searchParams.set("offset", String(MAX_RESULTS));
-  url.searchParams.set("sort", "desc");
-  url.searchParams.set("apikey", apiKey);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let response: Response;
+  let raw: string;
   try {
-    response = await fetch(url, { signal: controller.signal });
+    raw = await invoke<string>("fetch_etherscan_list", { chainId, action, address });
   } catch (error) {
-    throw new EtherscanApiError(
-      `Could not reach Etherscan: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  } finally {
-    clearTimeout(timer);
+    if (String(error) === ETHERSCAN_CONFIG_ERROR_MESSAGE) {
+      throw new EtherscanConfigError(String(error));
+    }
+    throw new EtherscanApiError(String(error));
   }
 
-  if (!response.ok) {
-    throw new EtherscanApiError(`Etherscan returned HTTP ${response.status}.`);
-  }
-
-  const body: unknown = await response.json();
+  const body: unknown = JSON.parse(raw);
   if (!isEtherscanEnvelope(body)) {
     throw new EtherscanApiError("Etherscan returned an unrecognized response shape.");
   }

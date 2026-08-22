@@ -55,8 +55,12 @@ rand_core = { version = "0.6", features = ["std", "getrandom"] }
 #                    full RPC-calling contract client this app doesn't use;
 #                    "sol-types" alone gives ABI encoding with none of that.
 #   - "std"       -> default-features carries "std" among other things
-#                    (reqwest, network I/O) this app doesn't want; re-added
-#                    explicitly rather than pulled in wholesale
+#                    (a transitive reqwest/network-I/O pull-in via alloy's
+#                    own default features specifically, independent of this
+#                    crate's own direct `reqwest` dependency added below for
+#                    the Etherscan proxy) that alloy itself doesn't need for
+#                    what this app uses it for; re-added explicitly rather
+#                    than pulled in wholesale from alloy's defaults
 alloy = { version = "0.9", default-features = false, features = ["consensus", "eips", "k256", "rlp", "sol-types", "std"] }
 
 # --- Solana transaction construction, signing envelope, and wire encoding ---
@@ -108,6 +112,37 @@ base64 = "0.22"
 # above: one resolved version, not a coincidentally-compatible second copy.
 bs58 = "0.5"
 
+# --- Etherscan transaction-history proxy ---
+# Added 2026-08-22 to fix a real credential-leak finding: the Etherscan API
+# key used to live in the frontend as a Vite build-time env var
+# (VITE_ETHERSCAN_API_KEY), which meant it was inlined in plaintext into the
+# built JS bundle (`desktop/dist/assets/*.js`) -- readable by anyone who
+# inspected a shipped app's webview resources, confirmed by grepping a real
+# build output. Moving the actual HTTP call here means the key now lives
+# only in this process's environment (see `fetch_etherscan_list`) and never
+# crosses into the webview/frontend at all, in any form.
+#
+# This is a deliberate architectural change, not an oversight of the
+# std-feature comment on `alloy` above ("this app doesn't want" reqwest/
+# network I/O) -- that comment described EVERY network call being frontend-
+# initiated, which was true until this fix. Address/transaction data here is
+# all public (same as every other read this app already does over IPC); the
+# API key is the only sensitive value this command touches, and it's a
+# third-party service credential, not anything derived from the wallet's own
+# mnemonic.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Loads desktop/src-tauri/.env (gitignored, mirroring the frontend's own
+# desktop/.env pattern) into the process environment at startup, so
+# ETHERSCAN_API_KEY is read at runtime, not baked into any compiled or
+# bundled artifact -- see `main()`'s `dotenvy::dotenv()` call.
+dotenvy = "0.15"
+
 [dev-dependencies]
 tempfile = "3"
+# Only for testing fetch_etherscan_list, the one async command in this
+# crate -- minimal features (no I/O drivers), since the tests that need it
+# never touch real network/timers themselves (the one that did, hitting the
+# real Etherscan API with a real key, was a temporary, disposable
+# verification, already removed -- see its own commit history).
+tokio = { version = "1", features = ["rt", "macros"] }
 

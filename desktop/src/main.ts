@@ -23,6 +23,7 @@ import {
   isValidSolanaAddress,
   sendRawSolanaTransaction,
 } from "./solana";
+import { fetchBitcoinBalanceSats, formatSatsAsBtc } from "./bitcoin";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -117,6 +118,9 @@ let activeNetworkId: string = DEFAULT_NETWORK;
  * paying attention right now, not tracking whether they've *ever* seen it.
  */
 let solanaInterstitialAcknowledged = false;
+
+/** Same once-per-session gate as `solanaInterstitialAcknowledged`, for switching into the Bitcoin chain family — see `switchChainFamily`. */
+let bitcoinInterstitialAcknowledged = false;
 
 /**
  * Networks the user has added this session, keyed by their generated id
@@ -213,6 +217,15 @@ interface SolanaWalletAccount {
  */
 let solanaAccounts: SolanaWalletAccount[] = [];
 
+/**
+ * The wallet's single Bitcoin address, derived once per unlock (see
+ * `loadBitcoinAccount`) at index 0 — unlike EVM/Solana's account
+ * switchers, there is deliberately no multi-account support here yet, the
+ * same "start with one account, add a switcher later" progression EVM and
+ * Solana each began with. `null` until derivation resolves.
+ */
+let bitcoinAddress: string | null = null;
+
 /** Which account in `accounts` is currently selected in the switcher. */
 let activeAccountIndex = 0;
 
@@ -236,6 +249,9 @@ let balanceRequestId = 0;
 
 /** Same stale-response guard as `balanceRequestId`, for the Solana SOL balance fetch. */
 let solanaBalanceRequestId = 0;
+
+/** Same stale-response guard as `balanceRequestId`, for the Bitcoin BTC balance fetch. */
+let bitcoinBalanceRequestId = 0;
 
 /**
  * Same stale-response guard as `balanceRequestId`, for the transaction
@@ -758,6 +774,7 @@ async function loadAccounts() {
   renderAccountSelect();
   switchActiveAccount(0);
   void loadSolanaAccounts();
+  void loadBitcoinAccount();
 }
 
 /**
@@ -884,6 +901,84 @@ function updateSolanaInterstitialAddress() {
 }
 
 /**
+ * Derive the wallet's single Bitcoin account (index 0), called once right
+ * after unlock, mirroring `loadSolanaAccounts`'s own failure isolation: a
+ * Bitcoin derivation failure must never abort or blank out the EVM/Solana
+ * account state the rest of the app depends on, and vice versa.
+ */
+async function loadBitcoinAccount() {
+  const errorEl = el("bitcoin-account-error");
+  errorEl.textContent = "";
+  bitcoinAddress = null;
+
+  try {
+    bitcoinAddress = await invoke<string>("get_bitcoin_account_address", { index: 0 });
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    errorEl.textContent = `Could not derive the Bitcoin account: ${String(error)}`;
+    return;
+  }
+
+  el("bitcoin-active-address").textContent = bitcoinAddress;
+  updateBitcoinInterstitialAddress();
+  void fetchBitcoinBalance();
+}
+
+/** Same purpose as `updateSolanaInterstitialAddress`, for the Bitcoin interstitial. */
+function updateBitcoinInterstitialAddress() {
+  el("bitcoin-interstitial-address").textContent = bitcoinAddress ?? "Loading…";
+}
+
+/**
+ * Fetch and render the wallet's real BTC mainnet balance — see
+ * `bitcoin.ts`'s module doc comment for the indexer endpoint's own
+ * verification. Mirrors `fetchSolanaBalance`'s stale-response guard
+ * (`bitcoinBalanceRequestId`) for the same reason: a slow response must
+ * never land after a newer one (a double-click refresh, or a lock/unlock in
+ * between) and get shown as current.
+ */
+async function fetchBitcoinBalance() {
+  const valueEl = el("bitcoin-balance-value");
+  const errorEl = el("bitcoin-balance-error");
+  const refreshBtn = el<HTMLButtonElement>("refresh-bitcoin-balance-btn");
+
+  const requestId = ++bitcoinBalanceRequestId;
+  errorEl.textContent = "";
+
+  if (!bitcoinAddress) {
+    valueEl.textContent = "";
+    return;
+  }
+
+  valueEl.textContent = "Loading balance…";
+  valueEl.classList.add("loading");
+  refreshBtn.disabled = true;
+
+  try {
+    const sats = await fetchBitcoinBalanceSats(bitcoinAddress);
+    if (requestId !== bitcoinBalanceRequestId) {
+      return; // Superseded by a newer request; drop this result.
+    }
+    valueEl.textContent = `${formatSatsAsBtc(sats)} BTC`;
+    valueEl.classList.remove("loading");
+  } catch (error) {
+    if (requestId !== bitcoinBalanceRequestId) {
+      return;
+    }
+    valueEl.textContent = "";
+    valueEl.classList.remove("loading");
+    errorEl.textContent = `Could not fetch BTC balance: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    if (requestId === bitcoinBalanceRequestId) {
+      refreshBtn.disabled = false;
+    }
+  }
+}
+
+/**
  * Switch which curve family's panel is in view. This is the one place
  * that decides whether the "different address" interstitial is shown —
  * see `solanaInterstitialAcknowledged`'s own doc comment for why it's
@@ -899,20 +994,30 @@ function updateSolanaInterstitialAddress() {
  * mainnet/testnet distinction for that, a separate and already-solved
  * problem).
  */
-function switchChainFamily(family: "evm" | "solana") {
+function switchChainFamily(family: "evm" | "solana" | "bitcoin") {
   el("chain-family-evm-btn").classList.toggle("active", family === "evm");
   el("chain-family-evm-btn").setAttribute("aria-pressed", String(family === "evm"));
   el("chain-family-solana-btn").classList.toggle("active", family === "solana");
   el("chain-family-solana-btn").setAttribute("aria-pressed", String(family === "solana"));
+  el("chain-family-bitcoin-btn").classList.toggle("active", family === "bitcoin");
+  el("chain-family-bitcoin-btn").setAttribute("aria-pressed", String(family === "bitcoin"));
 
   el("evm-chain-panel").classList.toggle("hidden", family !== "evm");
   el("solana-chain-panel").classList.toggle("hidden", family !== "solana");
+  el("bitcoin-chain-panel").classList.toggle("hidden", family !== "bitcoin");
 
   if (family === "solana") {
     updateSolanaInterstitialAddress();
     const showInterstitial = !solanaInterstitialAcknowledged;
     el("solana-interstitial").classList.toggle("hidden", !showInterstitial);
     el("solana-chain-content").classList.toggle("hidden", showInterstitial);
+  }
+
+  if (family === "bitcoin") {
+    updateBitcoinInterstitialAddress();
+    const showInterstitial = !bitcoinInterstitialAcknowledged;
+    el("bitcoin-interstitial").classList.toggle("hidden", !showInterstitial);
+    el("bitcoin-chain-content").classList.toggle("hidden", showInterstitial);
   }
 }
 
@@ -2502,6 +2607,15 @@ async function lock() {
   el("solana-balance-error").textContent = "";
   solanaInterstitialAcknowledged = false;
   el("solana-interstitial-address").textContent = "";
+  bitcoinAddress = null;
+  el("bitcoin-account-error").textContent = "";
+  el("bitcoin-active-address").textContent = "";
+  bitcoinBalanceRequestId++; // Invalidate any Bitcoin balance fetch still in flight.
+  el("bitcoin-balance-value").textContent = "";
+  el("bitcoin-balance-value").classList.remove("loading");
+  el("bitcoin-balance-error").textContent = "";
+  bitcoinInterstitialAcknowledged = false;
+  el("bitcoin-interstitial-address").textContent = "";
   switchChainFamily("evm");
   el("balance-value").textContent = "";
   el("balance-value").classList.remove("loading");
@@ -2537,11 +2651,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("solana-add-account-btn").addEventListener("click", () => void handleAddSolanaAccount());
   el("chain-family-evm-btn").addEventListener("click", () => switchChainFamily("evm"));
   el("chain-family-solana-btn").addEventListener("click", () => switchChainFamily("solana"));
+  el("chain-family-bitcoin-btn").addEventListener("click", () => switchChainFamily("bitcoin"));
   el("solana-interstitial-continue-btn").addEventListener("click", () => {
     solanaInterstitialAcknowledged = true;
     el("solana-interstitial").classList.add("hidden");
     el("solana-chain-content").classList.remove("hidden");
   });
+  el("bitcoin-interstitial-continue-btn").addEventListener("click", () => {
+    bitcoinInterstitialAcknowledged = true;
+    el("bitcoin-interstitial").classList.add("hidden");
+    el("bitcoin-chain-content").classList.remove("hidden");
+  });
+  el("refresh-bitcoin-balance-btn").addEventListener("click", () => void fetchBitcoinBalance());
   el("refresh-tx-history-btn").addEventListener("click", () => void fetchTxHistory());
   el<HTMLSelectElement>("account-select").addEventListener("change", (event) => {
     switchActiveAccount(Number((event.target as HTMLSelectElement).value));

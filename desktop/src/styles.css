@@ -342,6 +342,12 @@ fieldset input[type="password"] {
   border: 1px solid #9945ff55;
 }
 
+.chain-badge-bitcoin {
+  background-color: #f7931a22;
+  color: #f7931a;
+  border: 1px solid #f7931a55;
+}
+
 .address-row {
   display: flex;
   align-items: center;

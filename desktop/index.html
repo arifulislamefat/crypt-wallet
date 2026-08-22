@@ -51,6 +51,9 @@
           <button id="chain-family-solana-btn" type="button" class="chain-family-btn" aria-pressed="false">
             Solana
           </button>
+          <button id="chain-family-bitcoin-btn" type="button" class="chain-family-btn" aria-pressed="false">
+            Bitcoin
+          </button>
         </div>
 
         <div id="evm-chain-panel">
@@ -190,6 +193,53 @@
               <div class="row">
                 <button id="refresh-solana-balance-btn" type="button">Refresh SOL balance</button>
                 <button id="solana-send-nav-btn" type="button">Send</button>
+              </div>
+            </fieldset>
+          </div>
+        </div>
+
+        <div id="bitcoin-chain-panel" class="hidden">
+          <!--
+            Same first-switch-this-session interstitial as Solana's, above --
+            see `switchChainFamily`. View-only phase: no send button here at
+            all yet (unlike Solana's panel), since Bitcoin balance display is
+            its own complete, separately verified phase before signing is
+            even discussed.
+          -->
+          <fieldset id="bitcoin-interstitial" class="warning">
+            <legend>Different address — read before continuing</legend>
+            <p>
+              Bitcoin uses a completely different address than your EVM and
+              Solana accounts above (different cryptography, not just a
+              different network). Sending to the wrong one loses funds. Your
+              Bitcoin address for this wallet:
+            </p>
+            <p class="address-row">
+              <span class="chain-badge chain-badge-bitcoin">BTC</span>
+              <span id="bitcoin-interstitial-address" class="address"></span>
+            </p>
+            <div class="row">
+              <button id="bitcoin-interstitial-continue-btn" type="button">Continue</button>
+            </div>
+          </fieldset>
+
+          <div id="bitcoin-chain-content" class="hidden">
+            <fieldset class="bitcoin-account-section">
+              <legend>Bitcoin (mainnet)</legend>
+              <p class="hint">
+                Real BTC mainnet balance, view-only. No sending yet.
+              </p>
+
+              <p id="bitcoin-account-error" class="error"></p>
+              <p class="address-row">
+                <span class="chain-badge chain-badge-bitcoin">BTC</span>
+                <span id="bitcoin-active-address" class="address"></span>
+              </p>
+
+              <p id="bitcoin-balance-value" class="balance-value" aria-live="polite"></p>
+              <p id="bitcoin-balance-error" class="error"></p>
+              <div class="row">
+                <button id="refresh-bitcoin-balance-btn" type="button">Refresh BTC balance</button>
               </div>
             </fieldset>
           </div>

@@ -25,7 +25,7 @@ use alloy::eips::eip2930::AccessList;
 use alloy::sol_types::SolCall;
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
-use cryptwallet_crypto::{EvmAccountKey, SecretMnemonic, SolanaAccountKey, WordCount};
+use cryptwallet_crypto::{BitcoinAccountKey, EvmAccountKey, SecretMnemonic, SolanaAccountKey, WordCount};
 use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
 use ed25519_dalek::Signer as _;
 use ed25519_dalek::Signature as Ed25519Signature;
@@ -1042,6 +1042,42 @@ fn get_solana_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Res
     Ok(account.address())
 }
 
+/// The bech32 native SegWit Bitcoin address for Bitcoin account `index` of
+/// the currently unlocked wallet -- the display-only counterpart of
+/// [`get_account_address`]/[`get_solana_account_address`] for the app's
+/// newest, separate Bitcoin account type (see `crypto/src/bitcoin.rs`'s
+/// module doc comment for why Bitcoin derivation reuses EVM's BIP-32
+/// machinery but not its address encoding).
+///
+/// DISPLAY ONLY at this phase: no UTXO handling, no transaction
+/// construction, no signing -- same staged-rollout discipline as
+/// `get_solana_account_address` before it. Bitcoin derivation (Phase A) was
+/// verified byte-for-byte against the official BIP-84 test vectors and
+/// cross-checked against three independent reference wallets before this
+/// command was written.
+///
+/// Bounds checking, same story as `get_account_address`: not duplicated
+/// here, since `BitcoinAccountKey::derive` already rejects an out-of-range
+/// index (see `crypto/src/bitcoin.rs`).
+#[tauri::command]
+fn get_bitcoin_account_address(index: u32, unlocked: State<'_, UnlockedWallet>) -> Result<String, String> {
+    get_bitcoin_account_address_impl(index, &unlocked)
+}
+
+/// The testable core of [`get_bitcoin_account_address`].
+fn get_bitcoin_account_address_impl(index: u32, unlocked: &UnlockedWallet) -> Result<String, String> {
+    let guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    let session = guard.as_ref().ok_or("wallet is locked")?;
+
+    let seed = session.mnemonic.to_seed("");
+    let account = BitcoinAccountKey::derive(&seed, index)
+        .map_err(|_| "failed to derive the requested account".to_string())?;
+    Ok(account.address())
+}
+
 /// How many Solana accounts this wallet has created, persisted (see
 /// `read_solana_account_count`). Does NOT require an unlocked session --
 /// it's a plain integer read from a non-secret sidecar file, not a
@@ -1633,6 +1669,7 @@ pub fn run() {
         get_solana_account_address,
         get_solana_account_count,
         add_solana_account,
+        get_bitcoin_account_address,
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
@@ -1651,6 +1688,7 @@ pub fn run() {
         get_solana_account_address,
         get_solana_account_count,
         add_solana_account,
+        get_bitcoin_account_address,
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
@@ -2323,6 +2361,40 @@ mod tests {
         // enforces (see crypto/src/solana.rs) rather than a second copy of
         // the `>= 2^31` comparison here.
         let result = get_solana_account_address_impl(0x8000_0000, &unlocked);
+        assert!(result.is_err(), "hardened-range index must be rejected");
+    }
+
+    #[test]
+    fn get_bitcoin_account_address_matches_direct_derivation_and_varies_by_index() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        let expected_0 = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            BitcoinAccountKey::derive(&seed, 0).expect("derive account 0").address()
+        };
+
+        let account_0 = get_bitcoin_account_address_impl(0, &unlocked).expect("derive account 0");
+        let account_1 = get_bitcoin_account_address_impl(1, &unlocked).expect("derive account 1");
+
+        assert_eq!(account_0, expected_0, "must match direct derivation, not just be well-formed");
+        assert_ne!(account_0, account_1, "different indices must derive different addresses");
+    }
+
+    #[test]
+    fn get_bitcoin_account_address_requires_an_unlocked_session() {
+        let unlocked = UnlockedWallet::default();
+        let error = get_bitcoin_account_address_impl(0, &unlocked).expect_err("locked wallet must refuse");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn get_bitcoin_account_address_rejects_the_hardened_range() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        // Relies on the same bounds check `BitcoinAccountKey::derive` already
+        // enforces (see crypto/src/bitcoin.rs) rather than a second copy of
+        // the `>= 2^31` comparison here.
+        let result = get_bitcoin_account_address_impl(0x8000_0000, &unlocked);
         assert!(result.is_err(), "hardened-range index must be rejected");
     }
 

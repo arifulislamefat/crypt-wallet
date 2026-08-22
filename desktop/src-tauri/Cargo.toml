@@ -112,6 +112,27 @@ base64 = "0.22"
 # above: one resolved version, not a coincidentally-compatible second copy.
 bs58 = "0.5"
 
+# --- Bitcoin transaction construction, signing, and wire encoding ---
+# Same rule as alloy/solana-sdk above: audited library territory for
+# transaction construction/serialization/sighash computation, not hand-
+# written. Evaluated the same way bech32/ripemd were for Bitcoin derivation
+# (crypto/src/bitcoin.rs): `bitcoin` (crates.io/crates/bitcoin, rust-bitcoin
+# org -- the same org already trusted here for `bip39`/`bech32`) is the
+# foundational crate of the Rust Bitcoin ecosystem -- 14.3M total downloads,
+# 3.27M recent, patch releases as recently as July 2026, and the base BDK
+# (Bitcoin Dev Kit) itself builds on. No credible lighter-weight
+# alternative exists for P2WPKH tx construction + BIP-143 sighash without
+# dropping to hand-rolled serialization, exactly what this rule exists to
+# avoid. Re-exports its own `secp256k1` (`bitcoin::secp256k1::*`) so there
+# is no second, separately-versioned secp256k1 dependency to keep in sync.
+#
+# Used for direct Transaction construction, not the PSBT format -- this
+# app has no cross-device/multi-party signing workflow to interchange a
+# PSBT with (the derived key is signed with in-process, same as every
+# other chain here), so PSBT's extra structure would be overhead with no
+# use, not a security improvement.
+bitcoin = "0.32"
+
 # --- Etherscan transaction-history proxy ---
 # Added 2026-08-22 to fix a real credential-leak finding: the Etherscan API
 # key used to live in the frontend as a Vite build-time env var

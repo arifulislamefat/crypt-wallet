@@ -228,7 +228,7 @@
             <fieldset class="bitcoin-account-section">
               <legend>Bitcoin (mainnet)</legend>
               <p class="hint">
-                Real BTC mainnet balance, view-only. No sending yet.
+                Real BTC mainnet balance and sending.
               </p>
 
               <p id="bitcoin-account-error" class="error"></p>
@@ -251,6 +251,10 @@
               <p id="bitcoin-utxo-error" class="error"></p>
               <p id="bitcoin-utxo-empty" class="hint hidden">No UTXOs for this address.</p>
               <ul id="bitcoin-utxo-list" class="token-balance-list" aria-live="polite"></ul>
+
+              <div class="row">
+                <button id="bitcoin-send-nav-btn" type="button">Send</button>
+              </div>
             </fieldset>
           </div>
         </div>
@@ -457,6 +461,106 @@
 
         <div class="row">
           <button id="solana-send-done-btn" type="button" class="hidden">
+            Back to wallet
+          </button>
+        </div>
+      </section>
+
+      <!-- Bitcoin send step 1: recipient (free text, validated), amount -->
+      <section id="step-bitcoin-send" class="step hidden">
+        <h2>
+          <span class="chain-badge chain-badge-bitcoin">BTC</span>
+          Send BTC
+        </h2>
+        <p class="hint">
+          Enter a Bitcoin address. Unlike the EVM send flow, this is not
+          restricted to the wallet's own accounts — check the address
+          carefully before sending; a Bitcoin address is not valid on any
+          other chain and vice versa.
+        </p>
+
+        <label for="bitcoin-send-recipient" class="hint rpc-label">Recipient address</label>
+        <input id="bitcoin-send-recipient" type="text" spellcheck="false" placeholder="Bitcoin address" />
+
+        <label for="bitcoin-send-amount" class="hint rpc-label">Amount (BTC)</label>
+        <input id="bitcoin-send-amount" type="text" inputmode="decimal" spellcheck="false" placeholder="0.0" />
+
+        <div class="row">
+          <button id="bitcoin-send-cancel-btn" type="button">Cancel</button>
+          <button id="bitcoin-send-review-btn" type="button">Review send</button>
+        </div>
+
+        <p id="bitcoin-send-status" class="hint"></p>
+        <p id="bitcoin-send-error" class="error"></p>
+      </section>
+
+      <!--
+        One-time mainnet audit-disclosure warning, shown once per session
+        before a user's first Bitcoin send reaches the real confirmation
+        screen -- see `bitcoinMainnetWarningAcknowledged` in main.ts. Bitcoin
+        sending is new tonight and was never blocked, but still gets the
+        same informed-consent disclosure every other chain's first mainnet
+        send does.
+      -->
+      <section id="step-bitcoin-mainnet-warning" class="step hidden">
+        <h2>Security warning</h2>
+        <p class="warning">
+          This wallet has not undergone an external security audit. Mainnet
+          transactions are real and irreversible. Proceed?
+        </p>
+        <div class="row">
+          <button id="bitcoin-mainnet-warning-cancel-btn" type="button">Cancel</button>
+          <button id="bitcoin-mainnet-warning-proceed-btn" type="button">Proceed</button>
+        </div>
+      </section>
+
+      <!-- Bitcoin send step 2: mandatory confirmation, no skip path -->
+      <section id="step-bitcoin-send-confirm" class="step hidden">
+        <h2>Confirm this transaction</h2>
+        <p class="warning">
+          This sends a real transaction on the Bitcoin network and cannot be
+          undone once broadcast. Review every field below.
+        </p>
+
+        <dl class="review-list">
+          <dt>Recipient</dt>
+          <dd class="address-row">
+            <span class="chain-badge chain-badge-bitcoin">BTC</span>
+            <span id="bitcoin-review-recipient" class="address"></span>
+          </dd>
+          <dt>Amount</dt>
+          <dd id="bitcoin-review-amount"></dd>
+          <dt>Network fee</dt>
+          <dd id="bitcoin-review-fee"></dd>
+          <dt>Total</dt>
+          <dd id="bitcoin-review-total"></dd>
+        </dl>
+
+        <label class="review-ack">
+          <input id="bitcoin-send-ack-checkbox" type="checkbox" />
+          I understand this cannot be undone.
+        </label>
+
+        <div class="row">
+          <button id="bitcoin-send-back-btn" type="button">Back</button>
+          <button id="bitcoin-send-confirm-btn" type="button" disabled>
+            Confirm and send
+          </button>
+        </div>
+
+        <p id="bitcoin-send-confirm-error" class="error"></p>
+      </section>
+
+      <!-- Bitcoin send step 3: signing / broadcasting / broadcast confirmation -->
+      <section id="step-bitcoin-send-status" class="step hidden">
+        <h2>Sending transaction</h2>
+
+        <p id="bitcoin-send-progress" class="hint" aria-live="polite"></p>
+        <p id="bitcoin-send-txid" class="address"></p>
+        <p id="bitcoin-send-final-error" class="error"></p>
+
+        <div class="row">
+          <button id="bitcoin-send-done-btn" type="button" class="hidden">
             Back to wallet
           </button>
         </div>

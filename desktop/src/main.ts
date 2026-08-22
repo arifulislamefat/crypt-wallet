@@ -26,7 +26,17 @@ import {
   isValidSolanaAddress,
   sendRawSolanaTransaction,
 } from "./solana";
-import { type BitcoinUtxo, fetchBitcoinBalanceSats, fetchBitcoinUtxos, formatSatsAsBtc } from "./bitcoin";
+import {
+  BTC_DECIMALS,
+  type BitcoinUtxo,
+  broadcastBitcoinTransaction,
+  fetchBitcoinBalanceSats,
+  fetchBitcoinFeeRateSatPerVb,
+  fetchBitcoinUtxos,
+  formatSatsAsBtc,
+  isValidBitcoinAddress,
+  selectBitcoinUtxos,
+} from "./bitcoin";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -72,7 +82,11 @@ type Step =
   | "solana-send"
   | "solana-mainnet-warning"
   | "solana-send-confirm"
-  | "solana-send-status";
+  | "solana-send-status"
+  | "bitcoin-send"
+  | "bitcoin-mainnet-warning"
+  | "bitcoin-send-confirm"
+  | "bitcoin-send-status";
 
 const ALL_STEPS: Step[] = [
   "unlock",
@@ -90,6 +104,10 @@ const ALL_STEPS: Step[] = [
   "solana-mainnet-warning",
   "solana-send-confirm",
   "solana-send-status",
+  "bitcoin-send",
+  "bitcoin-mainnet-warning",
+  "bitcoin-send-confirm",
+  "bitcoin-send-status",
 ];
 
 /**
@@ -148,6 +166,9 @@ let evmMainnetWarningAcknowledged = false;
 
 /** Same purpose as `evmMainnetWarningAcknowledged`, for a Solana mainnet-beta send — see `reviewSolanaSend`'s gate into the `"solana-mainnet-warning"` step. */
 let solanaMainnetWarningAcknowledged = false;
+
+/** Same purpose as `evmMainnetWarningAcknowledged`, for a Bitcoin mainnet send — see `reviewBitcoinSend`'s gate into the `"bitcoin-mainnet-warning"` step. Bitcoin sending is new tonight and was never blocked, but still gets the same informed-consent disclosure every other chain's first mainnet send does. */
+let bitcoinMainnetWarningAcknowledged = false;
 
 /**
  * Networks the user has added this session, keyed by their generated id
@@ -387,6 +408,23 @@ interface PreparedSolanaSend {
 let preparedSolanaSend: PreparedSolanaSend | null = null;
 
 /**
+ * Everything `confirmBitcoinSend` needs, populated by `reviewBitcoinSend`.
+ * Same shape/lifecycle as `PreparedSolanaSend`, holding the already-decided
+ * coin-selection result (`selectBitcoinUtxos`'s output) rather than a
+ * nonce/blockhash -- Bitcoin's UTXO model means "what to sign" is which
+ * specific outputs to spend and how much change to return, not a
+ * sequence-number-style nonce.
+ */
+interface PreparedBitcoinSend {
+  recipient: string;
+  amountSats: bigint;
+  selectedUtxos: BitcoinUtxo[];
+  feeSats: bigint;
+  changeSats: bigint;
+}
+let preparedBitcoinSend: PreparedBitcoinSend | null = null;
+
+/**
  * Which Solana account is active — set by `switchActiveSolanaAccount`,
  * read by `fetchSolanaBalance` and the send flow (`reviewSolanaSend`/
  * `confirmSolanaSend`). Mirrors EVM's `activeAccountIndex` exactly, now
@@ -432,6 +470,20 @@ function clearSolanaSendState() {
   el("solana-send-signature").textContent = "";
   el("solana-send-final-error").textContent = "";
   el("solana-send-done-btn").classList.add("hidden");
+}
+
+function clearBitcoinSendState() {
+  preparedBitcoinSend = null;
+  el<HTMLInputElement>("bitcoin-send-recipient").value = "";
+  el<HTMLInputElement>("bitcoin-send-amount").value = "";
+  el<HTMLInputElement>("bitcoin-send-ack-checkbox").checked = false;
+  el("bitcoin-send-status").textContent = "";
+  el("bitcoin-send-error").textContent = "";
+  el("bitcoin-send-confirm-error").textContent = "";
+  el("bitcoin-send-progress").textContent = "";
+  el("bitcoin-send-txid").textContent = "";
+  el("bitcoin-send-final-error").textContent = "";
+  el("bitcoin-send-done-btn").classList.add("hidden");
 }
 
 /**
@@ -2724,6 +2776,201 @@ async function confirmSolanaSend() {
   void fetchSolanaBalance();
 }
 
+/**
+ * Enter the Bitcoin send flow. Same shape as `goToSolanaSend`: no
+ * destination dropdown (accepts any valid Bitcoin address, not just this
+ * wallet's own), nothing to prefetch beyond clearing prior state --
+ * `reviewBitcoinSend` does the real validation, UTXO fetch, fee quote, and
+ * coin selection.
+ */
+function goToBitcoinSend() {
+  clearBitcoinSendState();
+  showStep("bitcoin-send");
+}
+
+/**
+ * "Review send": validate the recipient and amount, fetch a live fee-rate
+ * quote and the current confirmed UTXO set, run coin selection
+ * (`selectBitcoinUtxos`), and show the mandatory confirmation screen.
+ * Mirrors `reviewSend`/`reviewSolanaSend`'s shape (validate -> fetch over
+ * the network -> populate review -> show confirm), with Bitcoin's own
+ * UTXO-model specifics: no nonce, no gas -- a fee rate quote and a coin-
+ * selection result instead.
+ */
+async function reviewBitcoinSend() {
+  const errorEl = el("bitcoin-send-error");
+  const statusEl = el("bitcoin-send-status");
+  const reviewBtn = el<HTMLButtonElement>("bitcoin-send-review-btn");
+  errorEl.textContent = "";
+
+  const recipient = el<HTMLInputElement>("bitcoin-send-recipient").value.trim();
+  const amountInput = el<HTMLInputElement>("bitcoin-send-amount").value.trim();
+
+  // Real bech32/bech32m decode for the address shapes this wallet itself
+  // produces (see `isValidBitcoinAddress`'s own doc comment for the lighter
+  // check legacy formats get) -- checked before any network call, so a
+  // typo'd address never gets as far as a fee-rate fetch.
+  if (!isValidBitcoinAddress(recipient)) {
+    errorEl.textContent = "Enter a valid Bitcoin address.";
+    return;
+  }
+
+  let amountSats: bigint;
+  try {
+    amountSats = parseUnitsStrict(amountInput, BTC_DECIMALS);
+  } catch {
+    errorEl.textContent = "Enter a valid, positive amount in BTC.";
+    return;
+  }
+  if (amountSats <= 0n) {
+    errorEl.textContent = "Amount must be greater than zero.";
+    return;
+  }
+
+  if (!bitcoinAddress) {
+    errorEl.textContent = "Bitcoin account has not been derived yet.";
+    return;
+  }
+
+  reviewBtn.disabled = true;
+
+  let feeRateSatPerVb: number;
+  statusEl.textContent = "Fetching current fee rate…";
+  try {
+    feeRateSatPerVb = await fetchBitcoinFeeRateSatPerVb();
+  } catch (error) {
+    statusEl.textContent = "";
+    reviewBtn.disabled = false;
+    errorEl.textContent = `Could not fetch the current fee rate: ${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+
+  let utxos: BitcoinUtxo[];
+  statusEl.textContent = "Checking available balance…";
+  try {
+    utxos = await fetchBitcoinUtxos(bitcoinAddress);
+  } catch (error) {
+    statusEl.textContent = "";
+    reviewBtn.disabled = false;
+    errorEl.textContent = `Could not fetch available UTXOs: ${error instanceof Error ? error.message : String(error)}`;
+    return;
+  }
+
+  // selectBitcoinUtxos throws BitcoinApiError (a real Error subclass, same
+  // "insufficient balance" reporting as every other chain's balance check)
+  // rather than returning a sentinel -- caught here the same way the
+  // network fetches above are.
+  let plan: ReturnType<typeof selectBitcoinUtxos>;
+  try {
+    plan = selectBitcoinUtxos(utxos, amountSats, feeRateSatPerVb);
+  } catch (error) {
+    statusEl.textContent = "";
+    reviewBtn.disabled = false;
+    errorEl.textContent = error instanceof Error ? error.message : String(error);
+    return;
+  }
+
+  statusEl.textContent = "";
+  reviewBtn.disabled = false;
+
+  preparedBitcoinSend = {
+    recipient,
+    amountSats,
+    selectedUtxos: plan.selectedUtxos,
+    feeSats: plan.feeSats,
+    changeSats: plan.changeSats,
+  };
+  el("bitcoin-review-recipient").textContent = recipient;
+  el("bitcoin-review-amount").textContent = `${formatSatsAsBtc(amountSats)} BTC`;
+  el("bitcoin-review-fee").textContent = `${formatSatsAsBtc(plan.feeSats)} BTC (${feeRateSatPerVb} sat/vB)`;
+  el("bitcoin-review-total").textContent = `${formatSatsAsBtc(amountSats + plan.feeSats)} BTC (amount + fee)`;
+
+  el<HTMLInputElement>("bitcoin-send-ack-checkbox").checked = false;
+  el<HTMLButtonElement>("bitcoin-send-confirm-btn").disabled = true;
+  el("bitcoin-send-confirm-error").textContent = "";
+
+  // One-time mainnet audit-disclosure gate, same reasoning as
+  // reviewSend's/reviewSolanaSend's own (see
+  // `bitcoinMainnetWarningAcknowledged`'s doc comment). Bitcoin has no
+  // testnet selector in this UI either, so this is unconditional here too.
+  if (!bitcoinMainnetWarningAcknowledged) {
+    showStep("bitcoin-mainnet-warning");
+    return;
+  }
+  showStep("bitcoin-send-confirm");
+}
+
+/**
+ * Sign (via the backend, which holds the key and does the actual
+ * transaction construction with the `bitcoin` crate), then broadcast.
+ * Mirrors `confirmSend`/`confirmSolanaSend`'s distinct signing/broadcast
+ * failure stages. Deliberately does NOT poll for confirmation the way
+ * EVM's receipt wait or Solana's `confirmSolanaTransaction` do: Bitcoin's
+ * average block time is ~10 minutes, far past what a blocking UI wait
+ * fits (EVM/Solana's own waits are bounded at 120s/60s specifically
+ * because their typical confirmation times are seconds, not minutes) --
+ * showing the txid immediately and pointing at a block explorer for
+ * confirmation status is the honest UI for this chain's actual timing,
+ * not a shortcut.
+ */
+async function confirmBitcoinSend() {
+  if (!preparedBitcoinSend) {
+    return;
+  }
+  const send = preparedBitcoinSend;
+
+  const progressEl = el("bitcoin-send-progress");
+  const finalErrorEl = el("bitcoin-send-final-error");
+  const confirmBtn = el<HTMLButtonElement>("bitcoin-send-confirm-btn");
+  finalErrorEl.textContent = "";
+  el("bitcoin-send-txid").textContent = "";
+  confirmBtn.disabled = true;
+  showStep("bitcoin-send-status");
+
+  progressEl.textContent = "Signing…";
+  let rawTxHex: string;
+  try {
+    rawTxHex = await invoke<string>("sign_bitcoin_transaction", {
+      inputs: send.selectedUtxos.map((utxo) => ({
+        txid: utxo.txid,
+        vout: utxo.vout,
+        valueSats: Number(utxo.valueSats),
+      })),
+      recipient: send.recipient,
+      amountSats: Number(send.amountSats),
+      changeSats: Number(send.changeSats),
+      fromIndex: 0,
+    });
+  } catch (error) {
+    if (isSessionLockedError(error)) {
+      handleSessionLocked();
+      return;
+    }
+    progressEl.textContent = "";
+    finalErrorEl.textContent = `Signing failed: ${String(error)}`;
+    el("bitcoin-send-done-btn").classList.remove("hidden");
+    return;
+  }
+
+  progressEl.textContent = "Broadcasting…";
+  let txid: string;
+  try {
+    txid = await broadcastBitcoinTransaction(rawTxHex);
+  } catch (error) {
+    progressEl.textContent = "";
+    finalErrorEl.textContent = `Broadcast was rejected: ${error instanceof Error ? error.message : String(error)}`;
+    el("bitcoin-send-done-btn").classList.remove("hidden");
+    return;
+  }
+
+  el("bitcoin-send-txid").textContent = `Transaction ID: ${txid}`;
+  progressEl.textContent =
+    "Broadcast successful — waiting for confirmation can take several minutes (Bitcoin's average block time is ~10 minutes). Check the transaction ID above on a block explorer.";
+
+  el("bitcoin-send-done-btn").classList.remove("hidden");
+  void fetchBitcoinBalance();
+}
+
 async function unlock() {
   const errorEl = el("unlock-error");
   const statusEl = el("unlock-status");
@@ -2755,6 +3002,7 @@ async function lock() {
   await invoke("lock_wallet");
   evmMainnetWarningAcknowledged = false;
   solanaMainnetWarningAcknowledged = false;
+  bitcoinMainnetWarningAcknowledged = false;
   accounts = [];
   activeAccountIndex = 0;
   activeAccountAddress = null;
@@ -2802,6 +3050,7 @@ async function lock() {
   clearPhraseFromMemory();
   clearSendState();
   clearSolanaSendState();
+  clearBitcoinSendState();
   showStep("unlock");
 }
 
@@ -2951,6 +3200,36 @@ window.addEventListener("DOMContentLoaded", async () => {
     clearSolanaSendState();
     showStep("unlocked");
     void fetchSolanaBalance();
+  });
+
+  el("bitcoin-send-nav-btn").addEventListener("click", goToBitcoinSend);
+  el("bitcoin-send-cancel-btn").addEventListener("click", () => {
+    clearBitcoinSendState();
+    showStep("unlocked");
+  });
+  el("bitcoin-send-review-btn").addEventListener("click", () => void reviewBitcoinSend());
+  el("bitcoin-mainnet-warning-cancel-btn").addEventListener("click", () => {
+    showStep("bitcoin-send");
+  });
+  el("bitcoin-mainnet-warning-proceed-btn").addEventListener("click", () => {
+    bitcoinMainnetWarningAcknowledged = true;
+    showStep("bitcoin-send-confirm");
+  });
+  el("bitcoin-send-back-btn").addEventListener("click", () => {
+    el("bitcoin-send-confirm-error").textContent = "";
+    showStep("bitcoin-send");
+  });
+  el<HTMLInputElement>("bitcoin-send-ack-checkbox").addEventListener("change", (event) => {
+    el<HTMLButtonElement>("bitcoin-send-confirm-btn").disabled = !(event.target as HTMLInputElement).checked;
+  });
+  // Deliberately does NOT call confirmBitcoinSend() itself -- same
+  // reasoning as the EVM/Solana ack checkboxes above: only the explicit
+  // Confirm button click triggers a real send.
+  el("bitcoin-send-confirm-btn").addEventListener("click", () => void confirmBitcoinSend());
+  el("bitcoin-send-done-btn").addEventListener("click", () => {
+    clearBitcoinSendState();
+    showStep("unlocked");
+    void fetchBitcoinBalance();
   });
 
   el("unlock-password").addEventListener("keydown", (event) => {

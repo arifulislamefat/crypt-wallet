@@ -30,7 +30,8 @@ use cryptwallet_vault::{KdfParams, SealedVault, VaultError};
 use ed25519_dalek::Signer as _;
 use ed25519_dalek::Signature as Ed25519Signature;
 use rand_core::{OsRng, RngCore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use solana_hash::Hash as SolanaHash;
 use solana_pubkey::Pubkey as SolanaPubkey;
 use solana_sdk::message::legacy::Message as SolanaMessage;
@@ -1657,6 +1658,218 @@ fn sign_solana_transaction_impl(
     Ok(signed_base64)
 }
 
+/// One UTXO the frontend selected to spend, exactly as returned by
+/// `desktop/src/bitcoin.ts`'s `fetchBitcoinUtxos`/`selectBitcoinUtxos` --
+/// untrusted frontend input like every other signing command's arguments,
+/// parsed and validated before use here, not trusted blind.
+///
+/// `rename_all = "camelCase"` is required here, unlike top-level command
+/// parameters: Tauri's `#[tauri::command]` macro only camelCase-converts
+/// the command's own argument NAMES for you, not the fields of a nested
+/// struct type deserialized from one of those arguments -- without this,
+/// serde would look for a literal `value_sats` key and fail to deserialize
+/// the `valueSats` this app's own frontend actually sends.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BitcoinUtxoInput {
+    txid: String,
+    vout: u32,
+    value_sats: u64,
+}
+
+/// Sign a Bitcoin native SegWit (P2WPKH) transaction spending `inputs`
+/// (every one of them an output of Bitcoin account `from_index`'s own
+/// address -- this app derives one Bitcoin address per account, so that's
+/// the only address any of this wallet's own UTXOs can belong to) to
+/// `recipient`, with `amount_sats` going to `recipient` and `change_sats`
+/// (may be zero) returned to this account's own address. Returns the
+/// fully-signed transaction as a hex string, ready for the frontend to
+/// broadcast via Esplora's `/tx` endpoint (`desktop/src/bitcoin.ts`'s
+/// `broadcastBitcoinTransaction`).
+///
+/// Mirrors [`sign_transaction`]/[`sign_solana_transaction`]'s split
+/// exactly: fee estimation and UTXO selection happen in the frontend
+/// (`desktop/src/bitcoin.ts`'s `selectBitcoinUtxos`, against a live fee-
+/// rate quote) -- this command signs the already-decided transaction shape
+/// and nothing else. It does not re-derive the fee or re-select UTXOs; it
+/// only checks that the numbers it was given are internally consistent
+/// (inputs actually cover amount + change) before ever producing a
+/// signature, the same "last line of defense, don't trust the caller"
+/// discipline as every other signing command here.
+///
+/// Uses the `bitcoin` crate (rust-bitcoin org) for transaction
+/// construction, BIP-143 sighash computation, and wire serialization --
+/// audited-library territory, not hand-rolled, the same rule this file
+/// already holds EVM (`alloy`) and Solana (`solana-sdk`) signing to. See
+/// `Cargo.toml`'s own comment on this dependency for the evaluation.
+///
+/// No mainnet restriction here, unlike EVM/Solana's `SENDABLE_CHAIN_IDS`/
+/// `SOLANA_SENDABLE_NETWORKS`: this command is new tonight, added directly
+/// into the post-2026-08-22 "no chain is exempt, mainnet sending is
+/// enabled everywhere" policy (see that policy's own history in
+/// `SENDABLE_CHAIN_IDS`'s doc comment) rather than ever having shipped
+/// blocked and then unblocked. The frontend's one-time mainnet warning
+/// still applies to Bitcoin sends (`desktop/src/main.ts`), same informed-
+/// consent disclosure as every other chain, even though there is no
+/// backend allowlist check to mirror here.
+#[tauri::command]
+fn sign_bitcoin_transaction(
+    inputs: Vec<BitcoinUtxoInput>,
+    recipient: String,
+    amount_sats: u64,
+    change_sats: u64,
+    from_index: u32,
+    unlocked: State<'_, UnlockedWallet>,
+) -> Result<String, String> {
+    sign_bitcoin_transaction_impl(&unlocked, inputs, &recipient, amount_sats, change_sats, from_index)
+}
+
+/// The testable core of [`sign_bitcoin_transaction`].
+fn sign_bitcoin_transaction_impl(
+    unlocked: &UnlockedWallet,
+    inputs: Vec<BitcoinUtxoInput>,
+    recipient: &str,
+    amount_sats: u64,
+    change_sats: u64,
+    from_index: u32,
+) -> Result<String, String> {
+    if inputs.is_empty() {
+        return Err("no inputs to spend".to_string());
+    }
+    if amount_sats == 0 {
+        return Err("amount must be greater than zero".to_string());
+    }
+
+    let total_in: u64 = inputs.iter().try_fold(0u64, |acc, i| {
+        acc.checked_add(i.value_sats).ok_or_else(|| "input value overflow".to_string())
+    })?;
+    let total_out = amount_sats
+        .checked_add(change_sats)
+        .ok_or_else(|| "output value overflow".to_string())?;
+    // The real check that this transaction doesn't spend more than it has:
+    // the frontend already computed change_sats to make this hold, but
+    // this is the last line of defense before a real signature is
+    // produced, so it does not trust the caller's arithmetic, however it
+    // got here.
+    if total_out > total_in {
+        return Err("inputs do not cover the requested amount plus change".to_string());
+    }
+
+    let recipient_address = bitcoin::Address::from_str(recipient)
+        .map_err(|_| "recipient is not a well-formed Bitcoin address".to_string())?
+        .require_network(bitcoin::Network::Bitcoin)
+        .map_err(|_| "recipient address is not a mainnet Bitcoin address".to_string())?;
+
+    let guard = unlocked
+        .0
+        .lock()
+        .map_err(|_| "wallet session state is unavailable")?;
+    let session = guard.as_ref().ok_or("wallet is locked")?;
+
+    let seed = session.mnemonic.to_seed("");
+    let account = BitcoinAccountKey::derive(&seed, from_index)
+        .map_err(|_| "failed to derive the sending account".to_string())?;
+
+    // Own address's script_pubkey -- needed both for the change output and
+    // as the "script_code" every input's BIP-143 sighash is computed
+    // against (every input here spends this same account's own P2WPKH
+    // output, per this command's own doc comment).
+    let own_address = bitcoin::Address::from_str(&account.address())
+        .map_err(|_| "internal error: derived Bitcoin address failed to re-parse".to_string())?
+        .require_network(bitcoin::Network::Bitcoin)
+        .map_err(|_| "internal error: derived address is not a mainnet address".to_string())?;
+    let own_script_pubkey = own_address.script_pubkey();
+
+    let tx_inputs: Vec<bitcoin::TxIn> = inputs
+        .iter()
+        .map(|input| -> Result<bitcoin::TxIn, String> {
+            let txid =
+                bitcoin::Txid::from_str(&input.txid).map_err(|_| "malformed UTXO txid".to_string())?;
+            Ok(bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint { txid, vout: input.vout },
+                script_sig: bitcoin::ScriptBuf::new(),
+                // Final, not RBF-signaling -- this app doesn't offer fee
+                // bumping, so there's nothing for RBF-readiness to enable.
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut tx_outputs = vec![bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(amount_sats),
+        script_pubkey: recipient_address.script_pubkey(),
+    }];
+    if change_sats > 0 {
+        tx_outputs.push(bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(change_sats),
+            script_pubkey: own_script_pubkey.clone(),
+        });
+    }
+
+    let mut tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: tx_inputs,
+        output: tx_outputs,
+    };
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    account.expose_secret(|signing_key| -> Result<(), String> {
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&signing_key.to_bytes())
+            .map_err(|_| "internal error: derived key is not a valid secp256k1 scalar".to_string())?;
+        let compressed_pubkey_bytes = signing_key.verifying_key().to_encoded_point(true);
+        let public_key = bitcoin::secp256k1::PublicKey::from_slice(compressed_pubkey_bytes.as_bytes())
+            .map_err(|_| "internal error: derived pubkey is not a valid secp256k1 point".to_string())?;
+
+        // Computed up front, one per input, before any mutation of `tx` --
+        // `SighashCache::new` borrows `tx` immutably for as long as it's
+        // used, so all sighash computation has to finish (and the cache be
+        // dropped) before the witness-assignment loop below can mutate
+        // `tx.input[..]`.
+        let mut sighash_cache = bitcoin::sighash::SighashCache::new(&tx);
+        let mut signatures = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let sighash = sighash_cache
+                .p2wpkh_signature_hash(
+                    index,
+                    &own_script_pubkey,
+                    bitcoin::Amount::from_sat(input.value_sats),
+                    bitcoin::EcdsaSighashType::All,
+                )
+                .map_err(|_| "failed to compute the signature hash for an input".to_string())?;
+
+            let message = {
+                use bitcoin::hashes::Hash as _;
+                bitcoin::secp256k1::Message::from_digest(sighash.as_byte_array().to_owned())
+            };
+            let signature = secp.sign_ecdsa(&message, &secret_key);
+
+            // Self-check before this ever leaves the process, same
+            // reasoning as every other signing command's self-check:
+            // verify the signature against the message and the account's
+            // own public key before returning anything for broadcast.
+            secp.verify_ecdsa(&message, &signature, &public_key)
+                .map_err(|_| "produced signature failed self-verification".to_string())?;
+
+            signatures.push(bitcoin::ecdsa::Signature {
+                signature,
+                sighash_type: bitcoin::EcdsaSighashType::All,
+            });
+        }
+        drop(sighash_cache);
+
+        for (index, signature) in signatures.into_iter().enumerate() {
+            tx.input[index].witness = bitcoin::Witness::p2wpkh(&signature, &public_key);
+        }
+
+        Ok(())
+    })?;
+
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
 /// DIAGNOSTIC ONLY — proves `cryptwallet-crypto` and `cryptwallet-vault` are
 /// actually linked into the app and working, exercised across the Tauri IPC
 /// boundary. MUST be removed before any real release; this is scaffolding
@@ -1851,6 +2064,7 @@ pub fn run() {
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
+        sign_bitcoin_transaction,
         reveal_mnemonic,
         export_evm_private_key,
         export_solana_private_key
@@ -1871,6 +2085,7 @@ pub fn run() {
         sign_transaction,
         sign_token_transfer,
         sign_solana_transaction,
+        sign_bitcoin_transaction,
         reveal_mnemonic,
         export_evm_private_key,
         export_solana_private_key
@@ -2102,6 +2317,153 @@ mod tests {
         let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
         let result = sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, "not-a-hash", "devnet", 0);
         assert!(result.is_err(), "malformed blockhash must be rejected");
+    }
+
+    /// A syntactically valid (64 hex chars) but otherwise arbitrary txid,
+    /// standing in for a real UTXO's outpoint in tests that only exercise
+    /// signing, never broadcast -- same reasoning as `FAKE_BLOCKHASH`.
+    const FAKE_TXID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn bitcoin_signature_recovers_to_the_signing_account() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+
+        let (expected_pubkey, own_address) = {
+            let guard = unlocked.0.lock().expect("lock");
+            let seed = guard.as_ref().expect("session present").mnemonic.to_seed("");
+            let account = BitcoinAccountKey::derive(&seed, 0).expect("derive account 0");
+            let pubkey = account.expose_secret(|signing_key| {
+                bitcoin::secp256k1::PublicKey::from_slice(
+                    signing_key.verifying_key().to_encoded_point(true).as_bytes(),
+                )
+                .expect("valid pubkey")
+            });
+            (pubkey, account.address())
+        };
+        let recipient = get_bitcoin_account_address_impl(1, &unlocked).expect("derive account 1");
+
+        let input = BitcoinUtxoInput { txid: FAKE_TXID.to_string(), vout: 0, value_sats: 100_000 };
+        let raw_hex = sign_bitcoin_transaction_impl(&unlocked, vec![input], &recipient, 60_000, 39_000, 0)
+            .expect("signing should succeed");
+
+        // Independent verification: decode the raw hex and recompute the
+        // sighash + verify the witness signature from scratch, against the
+        // transaction's own bytes alone -- does NOT reuse
+        // sign_bitcoin_transaction_impl's own internal self-check, so it
+        // would catch a bug even if that check were ever removed or broken.
+        use bitcoin::hashes::Hash as _;
+        let raw_bytes = hex_decode_for_test(&raw_hex);
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&raw_bytes).expect("valid transaction wire format");
+
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.output.len(), 2, "expected a recipient output and a change output");
+        assert_eq!(tx.output[0].value, bitcoin::Amount::from_sat(60_000));
+        assert_eq!(tx.output[1].value, bitcoin::Amount::from_sat(39_000));
+
+        let own_script_pubkey = bitcoin::Address::from_str(&own_address)
+            .expect("valid address")
+            .require_network(bitcoin::Network::Bitcoin)
+            .expect("mainnet address")
+            .script_pubkey();
+        assert_eq!(
+            tx.output[1].script_pubkey, own_script_pubkey,
+            "change must return to this account's own address"
+        );
+
+        let witness = &tx.input[0].witness;
+        assert_eq!(witness.len(), 2, "a P2WPKH witness has exactly two items: signature, pubkey");
+        let sig_bytes = witness.nth(0).expect("signature item");
+        let pubkey_bytes = witness.nth(1).expect("pubkey item");
+        assert_eq!(pubkey_bytes, expected_pubkey.serialize(), "witness pubkey must match the signing account's own");
+
+        let ecdsa_sig = bitcoin::ecdsa::Signature::from_slice(sig_bytes).expect("valid DER + sighash-type signature");
+        let mut sighash_cache = bitcoin::sighash::SighashCache::new(&tx);
+        let sighash = sighash_cache
+            .p2wpkh_signature_hash(0, &own_script_pubkey, bitcoin::Amount::from_sat(100_000), bitcoin::EcdsaSighashType::All)
+            .expect("recompute the sighash independently");
+        let message = bitcoin::secp256k1::Message::from_digest(sighash.as_byte_array().to_owned());
+        bitcoin::secp256k1::Secp256k1::new()
+            .verify_ecdsa(&message, &ecdsa_sig.signature, &expected_pubkey)
+            .expect("signature must verify against the signer's own public key and the independently recomputed sighash");
+    }
+
+    #[test]
+    fn sign_bitcoin_transaction_omits_change_output_when_change_is_zero() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let recipient = get_bitcoin_account_address_impl(1, &unlocked).expect("derive account 1");
+        let input = BitcoinUtxoInput { txid: FAKE_TXID.to_string(), vout: 0, value_sats: 60_500 };
+        let raw_hex = sign_bitcoin_transaction_impl(&unlocked, vec![input], &recipient, 60_000, 0, 0)
+            .expect("signing should succeed");
+        let raw_bytes = hex_decode_for_test(&raw_hex);
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&raw_bytes).expect("valid transaction wire format");
+        assert_eq!(tx.output.len(), 1, "zero change must not produce a change output");
+    }
+
+    #[test]
+    fn sign_bitcoin_transaction_requires_an_unlocked_session() {
+        let unlocked = UnlockedWallet::default();
+        let input = BitcoinUtxoInput { txid: FAKE_TXID.to_string(), vout: 0, value_sats: 100_000 };
+        let error = sign_bitcoin_transaction_impl(
+            &unlocked,
+            vec![input],
+            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+            60_000,
+            39_000,
+            0,
+        )
+        .expect_err("locked wallet must refuse");
+        assert_eq!(error, "wallet is locked");
+    }
+
+    #[test]
+    fn sign_bitcoin_transaction_rejects_a_malformed_recipient() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let input = BitcoinUtxoInput { txid: FAKE_TXID.to_string(), vout: 0, value_sats: 100_000 };
+        let result = sign_bitcoin_transaction_impl(&unlocked, vec![input], "not-a-bitcoin-address", 60_000, 39_000, 0);
+        assert!(result.is_err(), "malformed recipient must be rejected");
+    }
+
+    #[test]
+    fn sign_bitcoin_transaction_rejects_no_inputs() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let recipient = get_bitcoin_account_address_impl(1, &unlocked).expect("derive account 1");
+        let result = sign_bitcoin_transaction_impl(&unlocked, vec![], &recipient, 60_000, 0, 0);
+        assert!(result.is_err(), "signing with no inputs must be rejected");
+    }
+
+    #[test]
+    fn sign_bitcoin_transaction_rejects_a_zero_amount() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let recipient = get_bitcoin_account_address_impl(1, &unlocked).expect("derive account 1");
+        let input = BitcoinUtxoInput { txid: FAKE_TXID.to_string(), vout: 0, value_sats: 100_000 };
+        let result = sign_bitcoin_transaction_impl(&unlocked, vec![input], &recipient, 0, 100_000, 0);
+        assert!(result.is_err(), "a zero amount must be rejected");
+    }
+
+    #[test]
+    fn sign_bitcoin_transaction_rejects_inputs_that_dont_cover_amount_plus_change() {
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let recipient = get_bitcoin_account_address_impl(1, &unlocked).expect("derive account 1");
+        let input = BitcoinUtxoInput { txid: FAKE_TXID.to_string(), vout: 0, value_sats: 100_000 };
+        // amount + change (60_000 + 50_000) exceeds the single 100_000-sat
+        // input -- the frontend should never construct this, but the
+        // backend must refuse it anyway rather than trust the arithmetic.
+        let result = sign_bitcoin_transaction_impl(&unlocked, vec![input], &recipient, 60_000, 50_000, 0);
+        let error = result.expect_err("insufficient inputs must be rejected");
+        assert_eq!(error, "inputs do not cover the requested amount plus change");
+    }
+
+    /// Test-only hex decoder -- this crate has no runtime hex-decoding need
+    /// (`hex_encode` only ever encodes), so this exists solely to let these
+    /// tests decode `sign_bitcoin_transaction_impl`'s own hex output back
+    /// into bytes for independent re-verification.
+    fn hex_decode_for_test(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect()
     }
 
     #[test]

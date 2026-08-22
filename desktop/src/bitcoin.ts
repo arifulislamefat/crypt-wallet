@@ -1,9 +1,10 @@
 import { formatUnits } from "viem";
 
 /**
- * Bitcoin mainnet balance fetching — view-only, mirroring `solana.ts`'s
- * role for the Solana chain family: this module's only job is turning a
- * bech32 address into a displayable BTC balance. No UTXO selection, no
+ * Bitcoin mainnet balance and UTXO fetching — view-only, mirroring
+ * `solana.ts`'s role for the Solana chain family: this module's only job is
+ * turning a bech32 address into displayable BTC data (a summed balance, and
+ * the individual unspent outputs behind it). No UTXO *selection*, no
  * transaction construction, no signing — that's deliberately a later,
  * separate phase (see `crypto/src/bitcoin.rs`'s module doc comment for why
  * derivation and signing are staged separately for this chain).
@@ -94,4 +95,56 @@ export async function fetchBitcoinBalanceSats(address: string): Promise<bigint> 
  */
 export function formatSatsAsBtc(sats: bigint): string {
   return formatUnits(sats, BTC_DECIMALS);
+}
+
+/**
+ * One confirmed, spendable output — deliberately more granular than
+ * `fetchBitcoinBalanceSats`'s single summed number: a future transaction-
+ * construction phase has to reason about *which* outputs it's spending
+ * (`txid` + `vout` together are what a transaction input actually
+ * references), not just a total. Nothing in this phase uses that
+ * granularity yet — this is display-only, the plumbing this data will
+ * eventually feed.
+ */
+export interface BitcoinUtxo {
+  txid: string;
+  vout: number;
+  valueSats: bigint;
+}
+
+interface EsploraUtxo {
+  txid: string;
+  vout: number;
+  value: number;
+  status: { confirmed: boolean };
+}
+
+/**
+ * Fetch `address`'s individual unspent outputs via Esplora's
+ * `/address/:address/utxo` endpoint (same base URL/verification as
+ * `fetchBitcoinBalanceSats` — see this module's own doc comment). Returns
+ * only confirmed UTXOs, same reasoning as the balance fetch's exclusion of
+ * `mempool_stats`: an unconfirmed output isn't safely spendable yet, so
+ * treating it as available here would misrepresent what the wallet can
+ * actually do with it.
+ */
+export async function fetchBitcoinUtxos(address: string): Promise<BitcoinUtxo[]> {
+  const response = await fetch(`${BITCOIN_ESPLORA_API_BASE}/address/${address}/utxo`);
+
+  if (!response.ok) {
+    throw new BitcoinApiError(`Bitcoin UTXO request failed: HTTP ${response.status}`);
+  }
+
+  const data: unknown = await response.json();
+  if (!Array.isArray(data)) {
+    throw new BitcoinApiError("malformed Esplora response: expected an array of UTXOs");
+  }
+
+  return (data as EsploraUtxo[])
+    .filter((utxo) => utxo.status?.confirmed)
+    .map((utxo) => ({
+      txid: utxo.txid,
+      vout: utxo.vout,
+      valueSats: BigInt(utxo.value),
+    }));
 }

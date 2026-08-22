@@ -242,6 +242,15 @@
               <div class="row">
                 <button id="refresh-bitcoin-balance-btn" type="button">Refresh BTC balance</button>
               </div>
+
+              <p class="hint token-balances-label">
+                Individual unspent outputs (UTXOs) behind the balance above --
+                shown per-output, not just summed, since a future send flow
+                will need to reason about which specific outputs it spends.
+              </p>
+              <p id="bitcoin-utxo-error" class="error"></p>
+              <p id="bitcoin-utxo-empty" class="hint hidden">No UTXOs for this address.</p>
+              <ul id="bitcoin-utxo-list" class="token-balance-list" aria-live="polite"></ul>
             </fieldset>
           </div>
         </div>

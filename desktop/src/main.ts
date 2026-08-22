@@ -26,7 +26,7 @@ import {
   isValidSolanaAddress,
   sendRawSolanaTransaction,
 } from "./solana";
-import { fetchBitcoinBalanceSats, formatSatsAsBtc } from "./bitcoin";
+import { type BitcoinUtxo, fetchBitcoinBalanceSats, fetchBitcoinUtxos, formatSatsAsBtc } from "./bitcoin";
 import {
   EtherscanApiError,
   EtherscanConfigError,
@@ -255,6 +255,15 @@ let solanaBalanceRequestId = 0;
 
 /** Same stale-response guard as `balanceRequestId`, for the Bitcoin BTC balance fetch. */
 let bitcoinBalanceRequestId = 0;
+
+/**
+ * Same stale-response guard as `balanceRequestId`, for the Bitcoin UTXO
+ * list fetch -- its own request id, not reused from `bitcoinBalanceRequestId`,
+ * for the same reason `tokenBalanceRequestId` is separate from
+ * `balanceRequestId`: a slow or failing UTXO fetch must never block or
+ * blank out the balance display, and vice versa.
+ */
+let bitcoinUtxoRequestId = 0;
 
 /**
  * Same stale-response guard as `balanceRequestId`, for the transaction
@@ -960,6 +969,12 @@ async function fetchBitcoinBalance() {
   valueEl.classList.add("loading");
   refreshBtn.disabled = true;
 
+  // Independent of the balance fetch below (its own request-id guard, its
+  // own error handling) -- a slow or failing UTXO fetch must never block or
+  // blank out the balance display, and vice versa. Same reasoning as
+  // `fetchBalance`'s own `void fetchTokenBalances(...)` call.
+  void fetchBitcoinUtxoList();
+
   try {
     const sats = await fetchBitcoinBalanceSats(bitcoinAddress);
     if (requestId !== bitcoinBalanceRequestId) {
@@ -978,6 +993,64 @@ async function fetchBitcoinBalance() {
     if (requestId === bitcoinBalanceRequestId) {
       refreshBtn.disabled = false;
     }
+  }
+}
+
+/**
+ * Fetch and render the active Bitcoin address's individual confirmed
+ * UTXOs — deliberately more granular than `fetchBitcoinBalance`'s summed
+ * number (see `BitcoinUtxo`'s own doc comment in `bitcoin.ts`). Mirrors
+ * `fetchTxHistory`'s shape (status-free here, just error/empty/list) rather
+ * than `fetchTokenBalances`'s per-item-fetch pattern, since this is a
+ * single indexer call for the whole list, not one call per row.
+ */
+async function fetchBitcoinUtxoList() {
+  const listEl = el("bitcoin-utxo-list");
+  const emptyEl = el("bitcoin-utxo-empty");
+  const errorEl = el("bitcoin-utxo-error");
+
+  if (!bitcoinAddress) {
+    return;
+  }
+  const address = bitcoinAddress;
+
+  const requestId = ++bitcoinUtxoRequestId;
+  errorEl.textContent = "";
+  emptyEl.classList.add("hidden");
+  listEl.replaceChildren();
+
+  try {
+    const utxos = await fetchBitcoinUtxos(address);
+    if (requestId !== bitcoinUtxoRequestId) {
+      return; // Superseded by a newer request; drop this result.
+    }
+    if (utxos.length === 0) {
+      emptyEl.classList.remove("hidden");
+    } else {
+      renderBitcoinUtxoList(utxos);
+    }
+  } catch (error) {
+    if (requestId !== bitcoinUtxoRequestId) {
+      return;
+    }
+    errorEl.textContent = `Could not fetch UTXOs: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+/**
+ * Render each UTXO as `txid:vout — amount` — both `txid` and `vout` shown
+ * in full (not truncated), since together they're exactly what a future
+ * transaction input references; truncating either here would make this
+ * data less useful for the purpose it exists to prepare for.
+ */
+function renderBitcoinUtxoList(utxos: BitcoinUtxo[]) {
+  const listEl = el("bitcoin-utxo-list");
+  listEl.replaceChildren();
+  for (const utxo of utxos) {
+    const item = document.createElement("li");
+    item.className = "token-balance-item";
+    item.textContent = `${utxo.txid}:${utxo.vout} — ${formatSatsAsBtc(utxo.valueSats)} BTC (${utxo.valueSats} sats)`;
+    listEl.appendChild(item);
   }
 }
 
@@ -2660,6 +2733,10 @@ async function lock() {
   el("bitcoin-balance-value").textContent = "";
   el("bitcoin-balance-value").classList.remove("loading");
   el("bitcoin-balance-error").textContent = "";
+  bitcoinUtxoRequestId++; // Invalidate any Bitcoin UTXO fetch still in flight.
+  el("bitcoin-utxo-list").replaceChildren();
+  el("bitcoin-utxo-empty").classList.add("hidden");
+  el("bitcoin-utxo-error").textContent = "";
   bitcoinInterstitialAcknowledged = false;
   el("bitcoin-interstitial-address").textContent = "";
   switchChainFamily("evm");

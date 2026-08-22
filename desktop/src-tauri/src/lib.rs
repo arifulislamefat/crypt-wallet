@@ -57,13 +57,15 @@ alloy::sol! {
 /// constant).
 ///
 /// Deliberately NOT the same list as "chains we can sign for" — see
-/// `SENDABLE_CHAIN_IDS`, below, which is a separate, narrower list. Adding
-/// a network to `SUPPORTED_CHAIN_IDS` enables read-only balance/history
-/// viewing for it and nothing else; enabling it to actually SIGN is a
-/// separate, deliberate addition to `SENDABLE_CHAIN_IDS`, never a side
-/// effect of this list growing. That split is what let this app add
-/// Ethereum mainnet as view-only without silently also enabling mainnet
-/// sending.
+/// `SENDABLE_CHAIN_IDS`, below, which is a separate list (currently equal
+/// in membership, not in meaning — see its own doc comment for the
+/// 2026-08-22 policy reversal that made them agree). Adding a network to
+/// `SUPPORTED_CHAIN_IDS` enables read-only balance/history viewing for it
+/// and nothing else; enabling it to actually SIGN is a separate,
+/// deliberate addition to `SENDABLE_CHAIN_IDS`, never a side effect of
+/// this list growing. That split is what let this app add Ethereum
+/// mainnet as view-only first, then later, separately and deliberately,
+/// enable mainnet sending once that was the explicit decision.
 const SEPOLIA_CHAIN_ID: u64 = 11155111;
 const MAINNET_CHAIN_ID: u64 = 1;
 /// Verified 2026-08-27 against https://chainlist.org/chain/56 directly.
@@ -116,23 +118,50 @@ const SUPPORTED_CHAIN_IDS: [u64; 12] = [
     OPTIMISM_SEPOLIA_CHAIN_ID,
 ];
 
-/// Chain IDs this app will actually sign a transaction for — every testnet
-/// above, and none of the mainnets. This is the real enforcement behind
-/// each mainnet's "view-only" restriction (see `sign_transaction_impl`'s
-/// and `sign_token_transfer_impl`'s own chain-id checks, which are what
-/// actually consult this list); `networks.ts`'s `sendSupported` flag is
-/// only the frontend's copy of the same decision, there to give a good
-/// experience (block the send flow before a form is filled out) rather
-/// than to be the boundary itself.
+/// Chain IDs this app will actually sign a transaction for. This is the
+/// real enforcement behind whether a network is sendable (see
+/// `sign_transaction_impl`'s and `sign_token_transfer_impl`'s own chain-id
+/// checks, which are what actually consult this list); `networks.ts`'s
+/// `sendSupported` flag is only the frontend's copy of the same decision,
+/// there to give a good experience (block the send flow before a form is
+/// filled out) rather than to be the boundary itself.
 ///
-/// Mainnet sending is out of scope for this app across every chain here,
-/// not evaluated per-chain: real-fund sending is a deliberate, separately-
-/// reviewed decision this list does not make by omission.
-const SENDABLE_CHAIN_IDS: [u64; 6] = [
+/// POLICY HISTORY — read before changing this list again: from this app's
+/// EVM mainnet support being added through 2026-08-22, this list held ONLY
+/// testnets — every mainnet was architecturally, deliberately excluded
+/// pending an external security audit, "no chain is exempt just because
+/// its signer works" (see the Solana equivalent block added and then
+/// reversed the same night, `SOLANA_SENDABLE_NETWORKS` below). On
+/// 2026-08-22, the wallet owner made an explicit, deliberate decision to
+/// reverse that restriction and enable mainnet sending for every chain
+/// this app supports — not an audit having occurred, not a per-chain
+/// evaluation, a direct policy reversal recorded here so a future reader
+/// does not mistake the absence of the old restriction for an oversight.
+/// All 6 mainnets (`MAINNET_CHAIN_ID`, `BSC_CHAIN_ID`, `ARBITRUM_CHAIN_ID`,
+/// `BASE_CHAIN_ID`, `POLYGON_CHAIN_ID`, `OPTIMISM_CHAIN_ID`) now sit
+/// alongside every testnet — this list is currently identical to
+/// `SUPPORTED_CHAIN_IDS`, kept as its own separate, explicitly-enumerated
+/// list rather than collapsed into an alias, since the two lists represent
+/// genuinely different decisions (read-only support vs. sign-for) that
+/// happen to currently agree, not the same decision twice — a future
+/// restriction (e.g. a custom network, or re-tightening this policy) would
+/// need to diverge them again. See `desktop/src/main.ts`'s
+/// `EVM_MAINNET_WARNING_ACKNOWLEDGED`-style one-time warning gate for the
+/// compensating control this reversal shipped with: informed consent
+/// before a user's first real-fund send this session, since removing the
+/// architectural block does not mean removing the "this hasn't been
+/// audited" disclosure.
+const SENDABLE_CHAIN_IDS: [u64; 12] = [
     SEPOLIA_CHAIN_ID,
+    MAINNET_CHAIN_ID,
+    BSC_CHAIN_ID,
     BSC_TESTNET_CHAIN_ID,
+    ARBITRUM_CHAIN_ID,
     ARBITRUM_SEPOLIA_CHAIN_ID,
+    BASE_CHAIN_ID,
     BASE_SEPOLIA_CHAIN_ID,
+    POLYGON_CHAIN_ID,
+    OPTIMISM_CHAIN_ID,
     POLYGON_AMOY_CHAIN_ID,
     OPTIMISM_SEPOLIA_CHAIN_ID,
 ];
@@ -152,12 +181,16 @@ fn require_supported_chain_id(chain_id: u64) -> Result<(), String> {
 }
 
 /// `Err` if `chain_id` is a recognized network (already passed
-/// `require_supported_chain_id`) but isn't one this app will sign for —
-/// i.e. it's a mainnet. Deliberately a fixed, generic message rather than
-/// naming the specific chain: with four sendable networks now, "only
-/// Sepolia" would itself be wrong, and the useful information for a user
-/// is "not this network," not an exhaustive list they'd have to cross-
-/// reference against the selector anyway.
+/// `require_supported_chain_id`) but isn't one this app will sign for.
+/// Since the 2026-08-22 policy reversal (see `SENDABLE_CHAIN_IDS`'s own
+/// doc comment) `SENDABLE_CHAIN_IDS` now equals `SUPPORTED_CHAIN_IDS`
+/// exactly, so this currently never rejects anything that
+/// `require_supported_chain_id` already let through — kept as its own
+/// separate check anyway, not deleted, because the two lists represent
+/// genuinely different decisions that happen to agree today, not
+/// permanently the same list (see that doc comment). Deliberately a fixed,
+/// generic message rather than naming a specific chain, for whenever this
+/// check is next load-bearing again.
 fn require_sendable_chain_id(chain_id: u64) -> Result<(), String> {
     if !SENDABLE_CHAIN_IDS.contains(&chain_id) {
         return Err("Sending is not yet supported on this network".to_string());
@@ -169,16 +202,22 @@ fn require_sendable_chain_id(chain_id: u64) -> Result<(), String> {
 /// -- Solana's real, protocol-level equivalent of EVM's numeric chain ID,
 /// even though this app does not yet expose a Solana network selector in
 /// the UI (`desktop/src/solana.ts` hardcodes the mainnet-beta RPC endpoint
-/// today; see that module's own doc comment). Mirrors `SENDABLE_CHAIN_IDS`
-/// exactly, including the exclusion: mainnet-beta is deliberately absent.
+/// today; see that module's own doc comment).
 ///
-/// No chain gets treated as an exception to this app's no-mainnet-sending-
-/// until-audit policy just because its signer happened to get built and
-/// verified first. Solana's signer WAS proven against real mainnet earlier
-/// (see `sign_solana_transaction`'s own doc comment for that verified
-/// checkpoint send) -- which is exactly why this allowlist, not the absence
-/// of a signer, is what has to do the blocking now.
-const SOLANA_SENDABLE_NETWORKS: [&str; 2] = ["devnet", "testnet"];
+/// POLICY HISTORY -- read before changing this again: from this being
+/// added through 2026-08-22, "mainnet-beta" was deliberately excluded here,
+/// mirroring `SENDABLE_CHAIN_IDS`'s then-current EVM mainnet exclusion --
+/// "no chain is exempt just because its signer works," even though
+/// Solana's signer was proven against real mainnet via a verified
+/// checkpoint send before this check existed (see `sign_solana_transaction`'s
+/// own doc comment). On 2026-08-22, the wallet owner made an explicit,
+/// deliberate decision to reverse that restriction across every chain this
+/// app supports, EVM and Solana together -- not an audit having occurred,
+/// a direct policy reversal. "mainnet-beta" now sits alongside
+/// "devnet"/"testnet" here. See `desktop/src/main.ts`'s one-time mainnet
+/// warning gate for the compensating control this reversal shipped with:
+/// informed consent before a user's first real Solana send this session.
+const SOLANA_SENDABLE_NETWORKS: [&str; 3] = ["mainnet-beta", "devnet", "testnet"];
 
 /// `Err` unless `network` is one of `SOLANA_SENDABLE_NETWORKS` -- the
 /// Solana-side equivalent of `require_sendable_chain_id`, called by
@@ -1226,12 +1265,12 @@ fn sign_transaction_impl(
     from_index: u32,
 ) -> Result<String, String> {
     require_supported_chain_id(chain_id)?;
-    // TEMPORARY, deliberate restriction — not a bug: this app can already
-    // READ every mainnet here (balance/history, entirely on the frontend),
-    // but signing real-value mainnet transactions is a separate decision
-    // this app does not make by omission. Adding a mainnet to
-    // `SENDABLE_CHAIN_IDS` is its own deliberate, reviewed change, not a
-    // side effect of adding it to `SUPPORTED_CHAIN_IDS` for reading.
+    // As of the 2026-08-22 policy reversal, `SENDABLE_CHAIN_IDS` equals
+    // `SUPPORTED_CHAIN_IDS` -- every mainnet this app can read is now also
+    // one it will sign for. This call is not dead code, though: the two
+    // lists remain separate on purpose (see `SENDABLE_CHAIN_IDS`'s own doc
+    // comment) so a future restriction only has to change one list, not
+    // remove this call site.
     require_sendable_chain_id(chain_id)?;
 
     // Strict EIP-55 checksum validation — rejects malformed input outright
@@ -1357,8 +1396,8 @@ fn sign_token_transfer_impl(
     // sends: this is the last line of defense before a real signature is
     // produced, so it does not trust the caller's chain_id.
     require_supported_chain_id(chain_id)?;
-    // TEMPORARY, deliberate restriction — see sign_transaction_impl's
-    // identical check for the full reasoning. Not a bug.
+    // See sign_transaction_impl's identical check -- same reasoning, kept
+    // as its own call site even though both lists agree today.
     require_sendable_chain_id(chain_id)?;
 
     let token_contract = AlloyAddress::parse_checksummed(token_address, None).map_err(|_| {
@@ -1519,15 +1558,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// restriction below, and was the correct way to prove this signer works.
 ///
 /// This command itself is NOT temporary — it's the real signing primitive
-/// the Solana send flow calls. What IS a deliberate, current restriction:
-/// `network` is checked against `SOLANA_SENDABLE_NETWORKS`
-/// (`require_sendable_solana_network`) before any signature is produced,
-/// the exact same architectural block EVM's mainnets already get via
-/// `SENDABLE_CHAIN_IDS` — no mainnet sending anywhere in this app until an
-/// external audit, full stop. Solana does not get treated as an exception
-/// just because its signer happened to get built and verified first; the
-/// checkpoint send above is exactly why this check, not the absence of a
-/// working signer, is what has to do the blocking now.
+/// the Solana send flow calls. `network` is still checked against
+/// `SOLANA_SENDABLE_NETWORKS` (`require_sendable_solana_network`) before
+/// any signature is produced — but as of the 2026-08-22 policy reversal
+/// (see that constant's own doc comment), `mainnet-beta` now passes that
+/// check too, same as every EVM mainnet now passes `SENDABLE_CHAIN_IDS`.
+/// This function no longer refuses mainnet sends; the frontend's one-time
+/// mainnet warning gate (`desktop/src/main.ts`) is what now carries the
+/// "this hasn't been audited" disclosure that the hard block used to.
 ///
 /// `to`/`lamports`/`recent_blockhash` are untrusted frontend input and
 /// parsed strictly, the same discipline as every EVM signing command in
@@ -1908,10 +1946,10 @@ mod tests {
         };
         let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
 
-        // "devnet", not "mainnet-beta": mainnet sending is now blocked (see
-        // `sign_solana_transaction_refuses_to_sign_for_mainnet_beta` below)
-        // -- this test is about the signing math itself, so it deliberately
-        // uses the one network that check actually lets through.
+        // "devnet": arbitrary now that every network is sendable (see
+        // `sign_solana_transaction_succeeds_for_mainnet_beta` below for the
+        // mainnet-beta case specifically) -- this test is about the signing
+        // math itself, not which network was passed.
         let signed_base64 =
             sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, FAKE_BLOCKHASH, "devnet", 0)
                 .expect("signing should succeed");
@@ -1975,27 +2013,30 @@ mod tests {
     }
 
     #[test]
-    fn require_sendable_solana_network_allows_devnet_and_testnet_and_rejects_mainnet_beta() {
-        // Every network this app considers sendable for Solana is let
-        // through...
+    fn require_sendable_solana_network_allows_mainnet_beta_devnet_and_testnet() {
+        // Post-2026-08-22 policy reversal (see `SOLANA_SENDABLE_NETWORKS`'s
+        // own doc comment): every network this app knows about for Solana,
+        // mainnet-beta included, is sendable now.
+        assert!(require_sendable_solana_network("mainnet-beta").is_ok());
         assert!(require_sendable_solana_network("devnet").is_ok());
         assert!(require_sendable_solana_network("testnet").is_ok());
-        // ...and mainnet-beta -- the one that carries real funds -- is not,
-        // same as every EVM mainnet via `require_sendable_chain_id`.
-        let error = require_sendable_solana_network("mainnet-beta")
-            .expect_err("mainnet-beta must be rejected");
+        // A network Solana itself doesn't recognize is still refused --
+        // this remains a real allowlist, not a check that always passes.
+        let error = require_sendable_solana_network("not-a-real-cluster")
+            .expect_err("an unrecognized cluster name must be refused");
         assert_eq!(error, "Sending is not yet supported on this network");
     }
 
     #[test]
-    fn sign_solana_transaction_refuses_to_sign_for_mainnet_beta() {
-        // The actual policy enforcement: even a fully unlocked wallet with a
-        // well-formed recipient/blockhash must never produce a mainnet-beta
-        // signature -- no chain is exempt from the no-mainnet-sending-
-        // until-audit policy just because its signer works.
+    fn sign_solana_transaction_succeeds_for_mainnet_beta() {
+        // The actual policy-reversal enforcement: a fully unlocked wallet
+        // with a well-formed recipient/blockhash now DOES produce a
+        // mainnet-beta signature -- the explicit, deliberate opposite of
+        // this test's pre-reversal name/assertion
+        // (`sign_solana_transaction_refuses_to_sign_for_mainnet_beta`).
         let unlocked = unlocked_with_fresh_mnemonic();
         let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
-        let error = sign_solana_transaction_impl(
+        let signed_base64 = sign_solana_transaction_impl(
             &unlocked,
             &recipient,
             1_000_000,
@@ -2003,8 +2044,8 @@ mod tests {
             "mainnet-beta",
             0,
         )
-        .expect_err("mainnet-beta signing must be refused");
-        assert_eq!(error, "Sending is not yet supported on this network");
+        .expect("mainnet-beta signing must now succeed");
+        assert!(!signed_base64.is_empty());
     }
 
     #[test]
@@ -2028,29 +2069,26 @@ mod tests {
     }
 
     #[test]
-    fn require_sendable_chain_id_allows_every_testnet_and_rejects_every_mainnet() {
-        // Every testnet this app knows about is sendable...
-        assert!(require_sendable_chain_id(SEPOLIA_CHAIN_ID).is_ok());
-        assert!(require_sendable_chain_id(BSC_TESTNET_CHAIN_ID).is_ok());
-        assert!(require_sendable_chain_id(ARBITRUM_SEPOLIA_CHAIN_ID).is_ok());
-        assert!(require_sendable_chain_id(BASE_SEPOLIA_CHAIN_ID).is_ok());
-        assert!(require_sendable_chain_id(POLYGON_AMOY_CHAIN_ID).is_ok());
-        assert!(require_sendable_chain_id(OPTIMISM_SEPOLIA_CHAIN_ID).is_ok());
-
-        // ...and every mainnet -- old and newly added alike -- is refused,
-        // with the same generic message regardless of which mainnet.
-        for mainnet_id in [
-            MAINNET_CHAIN_ID,
-            BSC_CHAIN_ID,
-            ARBITRUM_CHAIN_ID,
-            BASE_CHAIN_ID,
-            POLYGON_CHAIN_ID,
-            OPTIMISM_CHAIN_ID,
-        ] {
-            let error = require_sendable_chain_id(mainnet_id)
-                .expect_err(&format!("mainnet chain id {mainnet_id} must be refused"));
-            assert_eq!(error, "Sending is not yet supported on this network");
+    fn require_sendable_chain_id_allows_every_supported_chain_including_every_mainnet() {
+        // Post-2026-08-22 policy reversal (see `SENDABLE_CHAIN_IDS`'s own
+        // doc comment): `SENDABLE_CHAIN_IDS` now equals `SUPPORTED_CHAIN_IDS`
+        // exactly -- every chain this app can read, it can now also sign for,
+        // mainnets included. This test's pre-reversal name/assertion
+        // (`..._allows_every_testnet_and_rejects_every_mainnet`) is the
+        // direct opposite of current policy.
+        for id in SUPPORTED_CHAIN_IDS {
+            assert!(
+                require_sendable_chain_id(id).is_ok(),
+                "expected chain id {id} to be sendable"
+            );
         }
+        assert_eq!(SENDABLE_CHAIN_IDS.len(), 12, "this test should cover every entry");
+
+        // A chain id this app doesn't recognize at all is still refused --
+        // this remains a real allowlist, not a check that always passes.
+        let error = require_sendable_chain_id(43114) // Avalanche C-Chain
+            .expect_err("an unsupported chain id must be refused");
+        assert_eq!(error, "Sending is not yet supported on this network");
     }
 
     #[test]
@@ -2086,34 +2124,13 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_is_a_recognized_chain_id_but_sending_is_refused() {
-        // Mainnet is a real entry in SUPPORTED_CHAIN_IDS (read-only balance/
-        // history viewing needs it to be recognized) -- this test exists
-        // specifically to prove that recognizing it is NOT the same as
-        // allowing it to sign. Deliberately locked, same reasoning as
-        // unrecognized_chain_id_is_rejected_before_any_signing: proves this
-        // check also runs before touching session state.
-        let unlocked = UnlockedWallet::default();
-
-        let result = sign_transaction_impl(
-            &unlocked,
-            "0x0000000000000000000000000000000000dEaD",
-            "0",
-            0,
-            "0",
-            "0",
-            21000,
-            1, // Ethereum mainnet -- recognized, but sending must still be refused
-            0,
-        );
-
-        let error = result.expect_err("mainnet sending must be refused");
-        assert_eq!(error, "Sending is not yet supported on this network");
-        assert!(
-            !error.to_lowercase().contains("locked"),
-            "got a 'wallet locked' error instead of the sepolia-only message -- the \
-             chain-id check ran after touching session state, not before: {error}"
-        );
+    fn mainnet_is_a_recognized_and_now_sendable_chain_id() {
+        // Post-2026-08-22 policy reversal (see `SENDABLE_CHAIN_IDS`'s own
+        // doc comment), mainnet is recognized AND sendable -- this test's
+        // pre-reversal name/assertion (`..._but_sending_is_refused`) is the
+        // direct opposite of current policy.
+        assert!(require_supported_chain_id(MAINNET_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(MAINNET_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -2291,30 +2308,12 @@ mod tests {
     }
 
     #[test]
-    fn token_transfer_mainnet_is_recognized_but_sending_is_refused() {
-        // Same reasoning as mainnet_is_a_recognized_chain_id_but_sending_is_refused,
-        // for the token-transfer signing path.
-        let unlocked = UnlockedWallet::default();
-
-        let result = sign_token_transfer_impl(
-            &unlocked,
-            "0x0000000000000000000000000000000000dEaD",
-            "0x0000000000000000000000000000000000dEaD",
-            "0",
-            0,
-            "0",
-            "0",
-            65_000,
-            1, // Ethereum mainnet -- recognized, but sending must still be refused
-            0,
-        );
-
-        let error = result.expect_err("mainnet token sending must be refused");
-        assert_eq!(error, "Sending is not yet supported on this network");
-        assert!(
-            !error.to_lowercase().contains("locked"),
-            "chain-id check must run before touching session state: {error}"
-        );
+    fn token_transfer_mainnet_is_recognized_and_now_sendable() {
+        // Same reasoning as mainnet_is_a_recognized_and_now_sendable_chain_id
+        // -- token-transfer signing consults the exact same two allowlist
+        // functions, so there is nothing token-specific to re-derive here.
+        assert!(require_supported_chain_id(MAINNET_CHAIN_ID).is_ok());
+        assert!(require_sendable_chain_id(MAINNET_CHAIN_ID).is_ok());
     }
 
     #[test]

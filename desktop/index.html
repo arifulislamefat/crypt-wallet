@@ -291,6 +291,24 @@
         <p id="send-error" class="error"></p>
       </section>
 
+      <!--
+        One-time mainnet audit-disclosure warning, shown once per session
+        before a user's first EVM mainnet send reaches the real confirmation
+        screen -- see `evmMainnetWarningAcknowledged` in main.ts. Not shown
+        at all for a testnet send.
+      -->
+      <section id="step-mainnet-warning" class="step hidden">
+        <h2>Security warning</h2>
+        <p class="warning">
+          This wallet has not undergone an external security audit. Mainnet
+          transactions are real and irreversible. Proceed?
+        </p>
+        <div class="row">
+          <button id="mainnet-warning-cancel-btn" type="button">Cancel</button>
+          <button id="mainnet-warning-proceed-btn" type="button">Proceed</button>
+        </div>
+      </section>
+
       <!-- Send step 2: mandatory confirmation, no skip path -->
       <section id="step-send-confirm" class="step hidden">
         <h2>Confirm this transaction</h2>
@@ -371,6 +389,25 @@
 
         <p id="solana-send-status" class="hint"></p>
         <p id="solana-send-error" class="error"></p>
+      </section>
+
+      <!--
+        One-time mainnet audit-disclosure warning, shown once per session
+        before a user's first Solana send reaches the real confirmation
+        screen -- see `solanaMainnetWarningAcknowledged` in main.ts. Every
+        Solana send targets mainnet-beta today (no devnet/testnet selector
+        exists in the UI yet), so unlike EVM's version this always applies.
+      -->
+      <section id="step-solana-mainnet-warning" class="step hidden">
+        <h2>Security warning</h2>
+        <p class="warning">
+          This wallet has not undergone an external security audit. Mainnet
+          transactions are real and irreversible. Proceed?
+        </p>
+        <div class="row">
+          <button id="solana-mainnet-warning-cancel-btn" type="button">Cancel</button>
+          <button id="solana-mainnet-warning-proceed-btn" type="button">Proceed</button>
+        </div>
       </section>
 
       <!-- Solana send step 2: mandatory confirmation, no skip path -->

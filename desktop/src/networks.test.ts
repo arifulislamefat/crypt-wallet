@@ -98,17 +98,18 @@ describe("network configuration", () => {
     }
   });
 
-  it("marks every testnet sendable and every mainnet read-only", () => {
+  it("marks every built-in network sendable, mainnets included, post the 2026-08-22 policy reversal", () => {
+    // Pre-2026-08-22 this asserted `sendSupported === isTestnet` (every
+    // mainnet read-only). That correlation was a property of this app's
+    // then-current scope, not a rule the code enforces -- see
+    // NetworkConfig.isTestnet's own doc comment -- and the wallet owner's
+    // explicit, deliberate policy reversal broke it on purpose: every
+    // built-in network is sendable now, regardless of `isTestnet`.
     for (const id of ALL_NETWORK_IDS) {
-      const network = NETWORKS[id];
-      expect(network.sendSupported).toBe(network.isTestnet);
+      expect(NETWORKS[id].sendSupported).toBe(true);
     }
-    // Concrete enumeration, not just the derived rule above -- pins down
-    // exactly which four are which, so a typo'd `isTestnet` on one entry
-    // can't silently pass by coincidentally matching its own sendSupported
-    // value. This correlation is a property of today's built-in networks,
-    // not a rule the code enforces -- see NetworkConfig.isTestnet's own
-    // doc comment on why the two fields are deliberately independent.
+    // Concrete enumeration, not just the loop above -- pins down exactly
+    // which six are testnets, so a typo'd `isTestnet` can't silently pass.
     for (const id of [
       "sepolia",
       "bscTestnet",
@@ -118,11 +119,9 @@ describe("network configuration", () => {
       "optimismSepolia",
     ] as const) {
       expect(NETWORKS[id].isTestnet).toBe(true);
-      expect(NETWORKS[id].sendSupported).toBe(true);
     }
     for (const id of ["mainnet", "bsc", "arbitrum", "base", "polygon", "optimism"] as const) {
       expect(NETWORKS[id].isTestnet).toBe(false);
-      expect(NETWORKS[id].sendSupported).toBe(false);
     }
   });
 

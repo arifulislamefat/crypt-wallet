@@ -38,13 +38,19 @@ export const SOLANA_NETWORK = "mainnet-beta";
  * Kept in sync by hand with the backend's `SOLANA_SENDABLE_NETWORKS`
  * allowlist, the same "two copies of one decision, one authoritative"
  * pattern EVM's per-network `sendSupported` flag already uses (see
- * `networks.ts`). `false` here purely drives the UI (disabling the Send
- * button before a form is even shown) -- the backend's own check is the
- * actual enforcement boundary. No chain gets treated as an exception to
- * this app's no-mainnet-sending-until-audit policy just because its signer
- * happened to get built and verified first.
+ * `networks.ts`). Purely drives the UI (disabling the Send button before a
+ * form is even shown) -- the backend's own check is the actual enforcement
+ * boundary.
+ *
+ * POLICY HISTORY: `false` from this constant's addition through
+ * 2026-08-22, mirroring the architectural, Rust-enforced mainnet-beta
+ * block that existed then (`SOLANA_SENDABLE_NETWORKS` in
+ * `desktop/src-tauri/src/lib.rs`). On 2026-08-22 the wallet owner made an
+ * explicit, deliberate decision to reverse that restriction across every
+ * chain this app supports -- see that constant's own doc comment for the
+ * full history. `true` now: mainnet-beta sending is enabled.
  */
-export const SOLANA_SEND_SUPPORTED = false;
+export const SOLANA_SEND_SUPPORTED = true;
 
 /** Display label for `SOLANA_NETWORK`, matching EVM's `NetworkConfig.label` shape for consistent send-availability wording. */
 export const SOLANA_NETWORK_LABEL = "Solana (mainnet-beta)";

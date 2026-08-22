@@ -59,12 +59,14 @@ export interface NetworkConfig {
    * selector (see `main.ts`'s `renderNetworkSelect` and the "Show test
    * networks" toggle) and to style the "which network am I looking at"
    * banner. Deliberately a separate field from `sendSupported` rather than
-   * derived from it: today every built-in testnet here happens to be
-   * sendable and every built-in mainnet isn't, but that's a property of
-   * this app's current scope, not a definition — a future mainnet-sending
-   * rollout flipping one network's `sendSupported` must not silently move
-   * it into the wrong group in the selector, and nothing in this codebase
-   * should ever infer one field from the other.
+   * derived from it — from this app's EVM mainnet support being added
+   * through 2026-08-22, every built-in testnet was sendable and every
+   * built-in mainnet wasn't, and it would have been easy to conflate the
+   * two fields then; as of the 2026-08-22 policy reversal (see
+   * `sendSupported`'s own doc comment) every built-in network is sendable
+   * regardless of `isTestnet`, which only underscores why they were kept
+   * independent — nothing in this codebase should ever infer one field
+   * from the other.
    */
   isTestnet: boolean;
   /**
@@ -103,12 +105,19 @@ export interface NetworkConfig {
    * send flow before the user fills out a form, not after), not as the
    * actual security boundary.
    *
-   * Every built-in testnet added so far is sendable and every built-in
-   * mainnet isn't — that's this app's deliberate, current scope (mainnet
-   * sending is its own future decision per network, not something that
-   * falls out of adding read support), not a rule this type enforces. A
-   * custom network defaults to `true` regardless of `isTestnet` (see
-   * `buildCustomNetworkConfig`) — in practice this is moot today, since
+   * POLICY HISTORY: from this app's EVM mainnet support being added
+   * through 2026-08-22, every built-in testnet was sendable and every
+   * built-in mainnet wasn't — an architectural, Rust-enforced block on
+   * mainnet sending pending an external security audit, mirrored here for
+   * the frontend experience. On 2026-08-22 the wallet owner made an
+   * explicit, deliberate decision to reverse that restriction (see
+   * `SENDABLE_CHAIN_IDS`'s own doc comment in
+   * `desktop/src-tauri/src/lib.rs` for the full history) — every built-in
+   * network is `sendSupported: true` now, mainnets included. The Rust-side
+   * check remains the actual enforcement boundary; this flag remains only
+   * a frontend UX convenience, kept in sync by hand as always. A custom
+   * network defaults to `true` regardless of `isTestnet` (see
+   * `buildCustomNetworkConfig`) — in practice this is moot, since
    * `isCustom`'s CSP pre-check in main.ts blocks every real request to a
    * custom network's RPC endpoint anyway.
    */
@@ -228,12 +237,15 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     defaultRpcUrl: DEFAULT_MAINNET_RPC_URL,
     explorerBaseUrl: "https://etherscan.io",
     nativeCurrencySymbol: "ETH",
-    // Deliberate, temporary restriction -- not a bug. Mirrored by a real
-    // backend check (see this field's own doc comment above); this flag is
-    // what gives the *frontend* a chance to say so clearly before the user
-    // fills out an entire send form, per the project's requirement that
-    // hitting this wall happen up front, not at the confirmation step.
-    sendSupported: false,
+    // Mainnet sending was architecturally blocked here (Rust-side
+    // `SENDABLE_CHAIN_IDS`) from this network's addition through
+    // 2026-08-22, when the wallet owner made an explicit, deliberate
+    // decision to reverse that policy across every chain this app
+    // supports -- see `SENDABLE_CHAIN_IDS`'s own doc comment in
+    // `desktop/src-tauri/src/lib.rs` for the full policy history. This
+    // flag is kept in sync by hand with that backend allowlist, same
+    // pattern as every other network here.
+    sendSupported: true,
     tokens: MAINNET_TOKENS,
   },
   bscTestnet: {
@@ -263,7 +275,7 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     defaultRpcUrl: DEFAULT_BSC_RPC_URL,
     explorerBaseUrl: "https://bscscan.com",
     nativeCurrencySymbol: "BNB",
-    sendSupported: false,
+    sendSupported: true,
     tokens: [],
   },
   arbitrumSepolia: {
@@ -294,7 +306,7 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     defaultRpcUrl: DEFAULT_ARBITRUM_RPC_URL,
     explorerBaseUrl: "https://arbiscan.io",
     nativeCurrencySymbol: "ETH",
-    sendSupported: false,
+    sendSupported: true,
     tokens: [],
   },
   baseSepolia: {
@@ -326,7 +338,7 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     defaultRpcUrl: DEFAULT_BASE_RPC_URL,
     explorerBaseUrl: "https://basescan.org",
     nativeCurrencySymbol: "ETH",
-    sendSupported: false,
+    sendSupported: true,
     tokens: [],
   },
   polygon: {
@@ -339,7 +351,7 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     defaultRpcUrl: DEFAULT_POLYGON_RPC_URL,
     explorerBaseUrl: "https://polygonscan.com",
     nativeCurrencySymbol: "POL",
-    sendSupported: false,
+    sendSupported: true,
     tokens: [],
   },
   polygonAmoy: {
@@ -369,7 +381,7 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
     defaultRpcUrl: DEFAULT_OPTIMISM_RPC_URL,
     explorerBaseUrl: "https://optimistic.etherscan.io",
     nativeCurrencySymbol: "ETH",
-    sendSupported: false,
+    sendSupported: true,
     tokens: [],
   },
   optimismSepolia: {
@@ -396,9 +408,10 @@ export const NETWORKS: Readonly<Record<NetworkId, NetworkConfig>> = {
  * toggle) — a testnet default would be permanently hidden from its own
  * selector, which is exactly the bug `renderNetworkSelect`'s doc comment
  * describes. Testnet configs stay in `NETWORKS` and remain independently
- * selectable via a fixed `NetworkId` (e.g. for whoever needs to exercise a
- * real send flow before mainnet sending is a thing) — they're just not
- * user-facing in this build.
+ * selectable via a fixed `NetworkId` (e.g. for exercising a send flow
+ * without real funds at stake, still meaningful now that mainnet sending
+ * is also enabled — see `sendSupported`'s own doc comment) — they're just
+ * not user-facing in this build.
  */
 export const DEFAULT_NETWORK: NetworkId = "mainnet";
 

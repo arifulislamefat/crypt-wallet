@@ -65,10 +65,12 @@ type Step =
   | "confirm"
   | "done"
   | "send"
+  | "mainnet-warning"
   | "send-confirm"
   | "send-status"
   | "reveal"
   | "solana-send"
+  | "solana-mainnet-warning"
   | "solana-send-confirm"
   | "solana-send-status";
 
@@ -80,10 +82,12 @@ const ALL_STEPS: Step[] = [
   "confirm",
   "done",
   "send",
+  "mainnet-warning",
   "send-confirm",
   "send-status",
   "reveal",
   "solana-send",
+  "solana-mainnet-warning",
   "solana-send-confirm",
   "solana-send-status",
 ];
@@ -124,6 +128,26 @@ let solanaInterstitialAcknowledged = false;
 
 /** Same once-per-session gate as `solanaInterstitialAcknowledged`, for switching into the Bitcoin chain family — see `switchChainFamily`. */
 let bitcoinInterstitialAcknowledged = false;
+
+/**
+ * Whether the mandatory "this wallet has not undergone an external
+ * security audit, mainnet transactions are real and irreversible" warning
+ * has been shown and acknowledged this session, for an EVM mainnet send.
+ * Reset on lock — same once-per-session pattern as
+ * `solanaInterstitialAcknowledged`/`bitcoinInterstitialAcknowledged`: a
+ * fresh unlock is treated as a fresh session for this purpose.
+ *
+ * Added alongside the 2026-08-22 decision to reverse this app's
+ * architectural no-mainnet-sending-until-audit policy (see
+ * `SENDABLE_CHAIN_IDS`'s doc comment in `desktop/src-tauri/src/lib.rs`):
+ * removing the hard Rust-side block does not mean removing informed
+ * consent before a user's first real-fund send. See `reviewSend`'s gate
+ * into the `"mainnet-warning"` step.
+ */
+let evmMainnetWarningAcknowledged = false;
+
+/** Same purpose as `evmMainnetWarningAcknowledged`, for a Solana mainnet-beta send — see `reviewSolanaSend`'s gate into the `"solana-mainnet-warning"` step. */
+let solanaMainnetWarningAcknowledged = false;
 
 /**
  * Networks the user has added this session, keyed by their generated id
@@ -1324,11 +1348,10 @@ function updateSendAvailability() {
 
 /**
  * Same purpose as `updateSendAvailability`, for the Solana send button --
- * reflects `SOLANA_SEND_SUPPORTED` (currently always `false`: no mainnet
- * sending anywhere in this app until an external audit, the same
- * architectural block every EVM mainnet already gets). Unlike EVM there is
- * no network switcher to react to yet, so this only needs to run once, at
- * startup -- see `DOMContentLoaded`.
+ * reflects `SOLANA_SEND_SUPPORTED` (`true` as of the 2026-08-22 policy
+ * reversal — see that constant's own doc comment in `solana.ts`). Unlike
+ * EVM there is no network switcher to react to yet, so this only needs to
+ * run once, at startup -- see `DOMContentLoaded`.
  */
 function updateSolanaSendAvailability() {
   el<HTMLButtonElement>("solana-send-nav-btn").disabled = !SOLANA_SEND_SUPPORTED;
@@ -2329,6 +2352,16 @@ async function reviewSend() {
   el<HTMLInputElement>("send-ack-checkbox").checked = false;
   el<HTMLButtonElement>("send-confirm-btn").disabled = true;
   el("send-confirm-error").textContent = "";
+
+  // One-time mainnet audit-disclosure gate (see `evmMainnetWarningAcknowledged`'s
+  // own doc comment): only for a mainnet, only once per session. `preparedSend`
+  // and every review-* field above are already fully populated at this point,
+  // so the warning's own "Proceed" button can jump straight to send-confirm
+  // without redoing any of this work.
+  if (!network.isTestnet && !evmMainnetWarningAcknowledged) {
+    showStep("mainnet-warning");
+    return;
+  }
   showStep("send-confirm");
 }
 
@@ -2391,10 +2424,12 @@ async function confirmSend() {
     // network's real chain ID, not a hardcoded constant -- the backend's
     // own require_supported_chain_id + require_sendable_chain_id checks
     // are the actual enforcement that a non-sendable network is refused;
-    // this value is just reporting the truth to that check, not what makes
-    // the restriction hold (the frontend's `network.sendSupported` gate
-    // upstream, in goToSend/reviewSend, is what normally prevents reaching
-    // this call at all for a mainnet).
+    // this value is just reporting the truth to that check. `sendSupported`
+    // is now `true` for every built-in network including every mainnet
+    // (see that flag's own doc comment) -- the one-time mainnet warning
+    // (`evmMainnetWarningAcknowledged`) is what stands between reviewSend
+    // and this call for a user's first mainnet send this session, not a
+    // hard block.
     rawSignedHex =
       send.kind === "eth"
         ? await invoke<string>("sign_transaction", {
@@ -2593,6 +2628,16 @@ async function reviewSolanaSend() {
   el<HTMLInputElement>("solana-send-ack-checkbox").checked = false;
   el<HTMLButtonElement>("solana-send-confirm-btn").disabled = true;
   el("solana-send-confirm-error").textContent = "";
+
+  // One-time mainnet audit-disclosure gate, same reasoning as reviewSend's
+  // own (see `solanaMainnetWarningAcknowledged`'s doc comment). Every
+  // Solana send today targets `SOLANA_NETWORK` ("mainnet-beta" -- there is
+  // no devnet/testnet selector in the UI yet), so this is unconditional
+  // here rather than checking a testnet flag the way reviewSend does.
+  if (!solanaMainnetWarningAcknowledged) {
+    showStep("solana-mainnet-warning");
+    return;
+  }
   showStep("solana-send-confirm");
 }
 
@@ -2625,9 +2670,12 @@ async function confirmSolanaSend() {
     // check is the actual enforcement that a non-sendable network is
     // refused (mirrors `sign_transaction`'s `chainId` reasoning in
     // `confirmSend`); this value just reports the truth to that check. The
-    // frontend's `SOLANA_SEND_SUPPORTED` gate upstream, in
-    // goToSolanaSend/reviewSolanaSend, is what normally prevents reaching
-    // this call at all while it's `false`.
+    // frontend's `SOLANA_SEND_SUPPORTED` check upstream, in
+    // goToSolanaSend/reviewSolanaSend, is only ever a UX gate now that it's
+    // `true` (see that constant's own doc comment) -- the one-time mainnet
+    // warning (`solanaMainnetWarningAcknowledged`) is what stands between
+    // reviewSolanaSend and this call for a user's first Solana send this
+    // session, not a hard block.
     signedBase64 = await invoke<string>("sign_solana_transaction", {
       to: send.recipient,
       lamports: Number(send.lamports),
@@ -2705,6 +2753,8 @@ async function unlock() {
 
 async function lock() {
   await invoke("lock_wallet");
+  evmMainnetWarningAcknowledged = false;
+  solanaMainnetWarningAcknowledged = false;
   accounts = [];
   activeAccountIndex = 0;
   activeAccountAddress = null;
@@ -2847,6 +2897,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   el("send-asset-select").addEventListener("change", () => void handleAssetSelectionChanged());
   el("send-review-btn").addEventListener("click", () => void reviewSend());
+  el("mainnet-warning-cancel-btn").addEventListener("click", () => {
+    showStep("send");
+  });
+  el("mainnet-warning-proceed-btn").addEventListener("click", () => {
+    evmMainnetWarningAcknowledged = true;
+    showStep("send-confirm");
+  });
   el("send-back-btn").addEventListener("click", () => {
     el("send-confirm-error").textContent = "";
     showStep("send");
@@ -2872,6 +2929,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     showStep("unlocked");
   });
   el("solana-send-review-btn").addEventListener("click", () => void reviewSolanaSend());
+  el("solana-mainnet-warning-cancel-btn").addEventListener("click", () => {
+    showStep("solana-send");
+  });
+  el("solana-mainnet-warning-proceed-btn").addEventListener("click", () => {
+    solanaMainnetWarningAcknowledged = true;
+    showStep("solana-send-confirm");
+  });
   el("solana-send-back-btn").addEventListener("click", () => {
     el("solana-send-confirm-error").textContent = "";
     showStep("solana-send");

@@ -103,6 +103,7 @@
           <p class="address-row">
             <span class="chain-badge chain-badge-evm">EVM</span>
             <span id="unlocked-address" class="address"></span>
+            <button class="copy-address-btn" data-copy-target="unlocked-address" type="button">Copy</button>
           </p>
 
           <fieldset class="balance-section">
@@ -162,6 +163,7 @@
             <p class="address-row">
               <span class="chain-badge chain-badge-solana">SOL</span>
               <span id="solana-interstitial-address" class="address"></span>
+              <button class="copy-address-btn" data-copy-target="solana-interstitial-address" type="button">Copy</button>
             </p>
             <div class="row">
               <button id="solana-interstitial-continue-btn" type="button">Continue</button>
@@ -181,6 +183,7 @@
               <p class="address-row">
                 <span class="chain-badge chain-badge-solana">SOL</span>
                 <span id="solana-active-address" class="address"></span>
+                <button class="copy-address-btn" data-copy-target="solana-active-address" type="button">Copy</button>
               </p>
 
               <div class="row">
@@ -218,6 +221,7 @@
             <p class="address-row">
               <span class="chain-badge chain-badge-bitcoin">BTC</span>
               <span id="bitcoin-interstitial-address" class="address"></span>
+              <button class="copy-address-btn" data-copy-target="bitcoin-interstitial-address" type="button">Copy</button>
             </p>
             <div class="row">
               <button id="bitcoin-interstitial-continue-btn" type="button">Continue</button>
@@ -235,6 +239,7 @@
               <p class="address-row">
                 <span class="chain-badge chain-badge-bitcoin">BTC</span>
                 <span id="bitcoin-active-address" class="address"></span>
+                <button class="copy-address-btn" data-copy-target="bitcoin-active-address" type="button">Copy</button>
               </p>
 
               <p id="bitcoin-balance-value" class="balance-value" aria-live="polite"></p>
@@ -326,6 +331,7 @@
           <dd class="address-row">
             <span class="chain-badge chain-badge-evm">EVM</span>
             <span id="review-recipient" class="address"></span>
+            <button class="copy-address-btn" data-copy-target="review-recipient" type="button">Copy</button>
           </dd>
           <dt>Amount</dt>
           <dd id="review-amount"></dd>
@@ -427,6 +433,7 @@
           <dd class="address-row">
             <span class="chain-badge chain-badge-solana">SOL</span>
             <span id="solana-review-recipient" class="address"></span>
+            <button class="copy-address-btn" data-copy-target="solana-review-recipient" type="button">Copy</button>
           </dd>
           <dt>Amount</dt>
           <dd id="solana-review-amount"></dd>
@@ -527,6 +534,7 @@
           <dd class="address-row">
             <span class="chain-badge chain-badge-bitcoin">BTC</span>
             <span id="bitcoin-review-recipient" class="address"></span>
+            <button class="copy-address-btn" data-copy-target="bitcoin-review-recipient" type="button">Copy</button>
           </dd>
           <dt>Amount</dt>
           <dd id="bitcoin-review-amount"></dd>
@@ -735,7 +743,10 @@
         <h2>Wallet created</h2>
         <p>Your wallet is encrypted and saved on this device.</p>
         <p class="hint">Your first account address:</p>
-        <p id="address" class="address"></p>
+        <p class="address-row">
+          <span id="address" class="address"></span>
+          <button class="copy-address-btn" data-copy-target="address" type="button">Copy</button>
+        </p>
         <p class="hint">
           The recovery phrase has been cleared from memory. Unlock with your
           passphrase to use the wallet.

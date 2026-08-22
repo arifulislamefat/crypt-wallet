@@ -2019,6 +2019,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(PendingMnemonic::default())
         .manage(unlocked)
         // Clear the session the moment the window loses focus (covers

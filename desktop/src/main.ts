@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { decodeFunctionData, encodeFunctionData, erc20Abi, formatEther, formatGwei, formatUnits } from "viem";
 import {
@@ -534,6 +535,65 @@ function el<T extends HTMLElement>(id: string): T {
     throw new Error(`missing element: ${id}`);
   }
   return node as T;
+}
+
+/**
+ * Wire every `.copy-address-btn` in the document to copy the current
+ * `textContent` of the address element named in its `data-copy-target`
+ * attribute to the system clipboard, via Tauri's clipboard-manager plugin
+ * (`@tauri-apps/plugin-clipboard-manager`'s `writeText`) — not a raw
+ * `navigator.clipboard` call, since Tauri's webview only exposes clipboard
+ * access through this capability-gated plugin (see
+ * `desktop/src-tauri/capabilities/default.json`'s
+ * `clipboard-manager:allow-write-text` grant, deliberately the only
+ * clipboard permission this app requests — read/image/HTML access are
+ * never needed and never granted).
+ *
+ * The target element's text is read fresh on every click, not captured
+ * once at wire-up time — these buttons sit next to addresses that change
+ * as the active account or chain family changes (`unlocked-address`,
+ * `solana-active-address`, etc.), so a stale snapshot would silently copy
+ * the wrong address after a switch.
+ *
+ * Called once, at `DOMContentLoaded`: every copy button in this app is
+ * already present in the initial HTML (none are created dynamically), so
+ * one pass over `.copy-address-btn` at startup wires all of them — no
+ * per-screen re-wiring needed.
+ */
+function wireCopyButtons() {
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".copy-address-btn")) {
+    const targetId = button.dataset.copyTarget;
+    if (!targetId) {
+      continue;
+    }
+    let resetTimer: ReturnType<typeof setTimeout> | undefined;
+    button.addEventListener("click", () => {
+      void (async () => {
+        const text = el(targetId).textContent?.trim();
+        if (!text) {
+          return;
+        }
+        try {
+          await writeText(text);
+        } catch {
+          // No dedicated error UI for a clipboard-write failure -- rare,
+          // non-critical (the address is still fully visible to copy by
+          // hand), and simply not showing the "Copied!" confirmation below
+          // is itself the signal that it didn't work.
+          return;
+        }
+
+        clearTimeout(resetTimer);
+        const original = button.textContent;
+        button.textContent = "Copied!";
+        button.classList.add("copied");
+        resetTimer = setTimeout(() => {
+          button.textContent = original;
+          button.classList.remove("copied");
+        }, 1500);
+      })();
+    });
+  }
 }
 
 function showStep(step: Step) {
@@ -3060,6 +3120,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   renderNetworkBanner();
   updateSendAvailability();
   updateSolanaSendAvailability();
+  wireCopyButtons();
   el<HTMLSelectElement>("network-select").addEventListener("change", (event) => {
     switchNetwork((event.target as HTMLSelectElement).value);
   });

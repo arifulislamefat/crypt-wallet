@@ -356,6 +356,29 @@ fieldset input[type="password"] {
   word-break: break-all;
 }
 
+/*
+ * Copy-to-clipboard buttons next to every displayed address (account
+ * switcher, chain-interstitial addresses, send-confirmation recipients,
+ * the post-setup "your first address" screen). Deliberately small and
+ * icon-only, not full-size buttons like "Send"/"Confirm" -- these sit
+ * inline with monospace address text and shouldn't visually compete with
+ * the actual primary actions on each screen.
+ */
+.copy-address-btn {
+  flex: none;
+  padding: 0.2em 0.5em;
+  font-size: 0.85em;
+  font-weight: 400;
+  box-shadow: none;
+  line-height: 1.4;
+}
+
+/* Shown briefly after a successful copy -- see `wireCopyButtons` in main.ts. Green, not the default hover blue, so "it worked" reads at a glance, not just "it's focused." */
+.copy-address-btn.copied {
+  border-color: #2da44e;
+  color: #2da44e;
+}
+
 .chain-family-toggle {
   margin: 1rem 0;
   gap: 0.5rem;

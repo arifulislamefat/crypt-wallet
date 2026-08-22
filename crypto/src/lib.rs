@@ -2,9 +2,12 @@
 //!
 //! Scope of this crate, deliberately narrow: BIP-39 mnemonic generation and
 //! import, BIP-32/44 hierarchical derivation and EVM address derivation
-//! (`derivation.rs`/`evm.rs`), and SLIP-10 ed25519 derivation and Solana
+//! (`derivation.rs`/`evm.rs`), SLIP-10 ed25519 derivation and Solana
 //! address derivation (`solana.rs`) — see that module's own doc comment for
-//! why it's a genuinely separate algorithm, not a variant of the EVM path.
+//! why it's a genuinely separate algorithm, not a variant of the EVM path —
+//! and BIP-32/BIP-84 native SegWit Bitcoin derivation and address
+//! derivation (`bitcoin.rs`), which shares its derivation algorithm with
+//! EVM (same curve, same BIP-32) but not its address encoding.
 //!
 //! Explicitly OUT of scope for this crate (by design, not oversight):
 //! - Transaction construction, RLP encoding, and the EIP-1559/EIP-2718
@@ -34,11 +37,13 @@
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod bitcoin;
 pub mod derivation;
 pub mod evm;
 pub mod mnemonic;
 pub mod solana;
 
+pub use bitcoin::BitcoinAccountKey;
 pub use derivation::{DerivationError, EvmAccountKey};
 pub use evm::Address;
 pub use mnemonic::{MnemonicError, Seed, SecretMnemonic, WordCount};

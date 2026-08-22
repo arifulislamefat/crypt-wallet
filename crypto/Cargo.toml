@@ -99,5 +99,45 @@ ed25519-dalek = { version = "2", features = ["zeroize"] }
 # doc comment.
 bs58 = "0.5"
 
+# --- Bitcoin (BIP-84 native SegWit) derivation and address encoding ---
+# Standard BIP-32 over secp256k1 -- the SAME algorithm and curve `bip32`/
+# `k256` above already implement for EVM (unlike Solana's SLIP-10, this is
+# not a different derivation scheme, just a different path prefix), so no
+# new derivation dependency is needed at all. Two new primitives ARE needed
+# for the address-encoding step, evaluated on the same "established,
+# maintained, not the first search result" bar as every other crate here:
+#
+# - `ripemd`: RustCrypto's implementation (github.com/RustCrypto/hashes,
+#   owned by the `rustcrypto:hashes` GitHub team) -- same organization
+#   already trusted elsewhere in this workspace for sha2/sha3/hmac. Needed
+#   for HASH160 = RIPEMD160(SHA256(pubkey)), the standard Bitcoin pubkey-
+#   hash construction; `sha2` for the SHA256 half is already a dependency
+#   above (added for SLIP-10), reused here rather than duplicated.
+# - `bech32`: the rust-bitcoin organization's own crate (owned by
+#   apoelstra/clarkmoody/TheBlueMatt on crates.io) -- the same organization
+#   already trusted for `bip39` above, and the reference implementation
+#   BIP-173/BIP-350 (SegWit address encoding) were themselves specified
+#   against. Its `segwit` module provides a purpose-built
+#   `encode(hrp, witness_version, program)` API that handles the bech32-
+#   vs-bech32m checksum choice internally per witness version, rather than
+#   this crate needing to implement that BIP-350 distinction by hand.
+#
+# Every value this module's derivation produces was independently
+# cross-checked against a from-scratch Python implementation (stdlib
+# hmac/hashlib for BIP-32, the `ecdsa` and `bech32` PyPI packages for the
+# public-key math and address encoding) during development, matching the
+# official BIP-84 spec's own published test vectors byte-for-byte -- see
+# bitcoin.rs's test module, same discipline as the SLIP-10 vector
+# verification for Solana.
+# Pinned to 0.1, not the newer 0.2, deliberately: 0.2 depends on `digest`
+# 0.11, while every other hash crate in this dependency tree (sha2, sha3,
+# hmac) is on the `digest` 0.10 line -- 0.1 is the version that actually
+# unifies with what's already here (confirmed via a real build: 0.2
+# produced two incompatible copies of the `Digest` trait in the
+# dependency graph, a compile error, not a silent bug, but worth pinning
+# around rather than hitting every time).
+ripemd = "0.1"
+bech32 = "0.12"
+
 [dev-dependencies]
 hex = "0.4"

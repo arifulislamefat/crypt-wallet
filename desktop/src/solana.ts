@@ -22,6 +22,33 @@ export const SOLANA_MAINNET_RPC_URL = "https://solana-rpc.publicnode.com";
 /** SOL's fixed decimal count — every lamport/SOL conversion in this app uses this, never a magic number inline. */
 export const SOL_DECIMALS = 9;
 
+/**
+ * The Solana cluster this app's RPC endpoint above actually points at --
+ * Solana's own real, protocol-level equivalent of EVM's numeric chain ID.
+ * Sent to the backend on every `sign_solana_transaction` call so its own
+ * `SOLANA_SENDABLE_NETWORKS` allowlist check (`desktop/src-tauri/src/lib.rs`)
+ * is what actually enforces which networks can be signed for -- this
+ * constant is just reporting the truth to that check, not what makes any
+ * restriction hold.
+ */
+export const SOLANA_NETWORK = "mainnet-beta";
+
+/**
+ * Whether this app currently signs real transactions for `SOLANA_NETWORK`.
+ * Kept in sync by hand with the backend's `SOLANA_SENDABLE_NETWORKS`
+ * allowlist, the same "two copies of one decision, one authoritative"
+ * pattern EVM's per-network `sendSupported` flag already uses (see
+ * `networks.ts`). `false` here purely drives the UI (disabling the Send
+ * button before a form is even shown) -- the backend's own check is the
+ * actual enforcement boundary. No chain gets treated as an exception to
+ * this app's no-mainnet-sending-until-audit policy just because its signer
+ * happened to get built and verified first.
+ */
+export const SOLANA_SEND_SUPPORTED = false;
+
+/** Display label for `SOLANA_NETWORK`, matching EVM's `NetworkConfig.label` shape for consistent send-availability wording. */
+export const SOLANA_NETWORK_LABEL = "Solana (mainnet-beta)";
+
 /** A malformed or error RPC response — network failures surface as the underlying `fetch`/`TypeError`, not this. */
 export class SolanaRpcError extends Error {}
 

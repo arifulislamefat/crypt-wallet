@@ -165,6 +165,33 @@ fn require_sendable_chain_id(chain_id: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Solana's own cluster identifiers -- "mainnet-beta", "devnet", "testnet"
+/// -- Solana's real, protocol-level equivalent of EVM's numeric chain ID,
+/// even though this app does not yet expose a Solana network selector in
+/// the UI (`desktop/src/solana.ts` hardcodes the mainnet-beta RPC endpoint
+/// today; see that module's own doc comment). Mirrors `SENDABLE_CHAIN_IDS`
+/// exactly, including the exclusion: mainnet-beta is deliberately absent.
+///
+/// No chain gets treated as an exception to this app's no-mainnet-sending-
+/// until-audit policy just because its signer happened to get built and
+/// verified first. Solana's signer WAS proven against real mainnet earlier
+/// (see `sign_solana_transaction`'s own doc comment for that verified
+/// checkpoint send) -- which is exactly why this allowlist, not the absence
+/// of a signer, is what has to do the blocking now.
+const SOLANA_SENDABLE_NETWORKS: [&str; 2] = ["devnet", "testnet"];
+
+/// `Err` unless `network` is one of `SOLANA_SENDABLE_NETWORKS` -- the
+/// Solana-side equivalent of `require_sendable_chain_id`, called by
+/// [`sign_solana_transaction_impl`] before it will produce a signature.
+/// Deliberately the same fixed, generic message as that check: the useful
+/// information for a user is "not this network," not an internal allowlist.
+fn require_sendable_solana_network(network: &str) -> Result<(), String> {
+    if !SOLANA_SENDABLE_NETWORKS.contains(&network) {
+        return Err("Sending is not yet supported on this network".to_string());
+    }
+    Ok(())
+}
+
 /// Filename of the sealed vault inside the app data directory.
 const VAULT_FILENAME: &str = "wallet.vault";
 
@@ -1487,21 +1514,35 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// real, entire-balance transfer between two of this wallet's own Solana
 /// accounts, independently confirmed on-chain (signature, sender,
 /// recipient, and amount all cross-checked via direct RPC, not just the
-/// app's own success message) before the checkpoint panel was removed.
+/// app's own success message) before the checkpoint panel was removed. That
+/// verified real signing/broadcast still stands — it is not undone by the
+/// restriction below, and was the correct way to prove this signer works.
+///
 /// This command itself is NOT temporary — it's the real signing primitive
-/// a general Solana send flow will call. `to`/`lamports`/`recent_blockhash`
-/// are untrusted frontend input and parsed strictly, the same discipline
-/// as every EVM signing command in this file — a malformed address or
-/// blockhash is rejected outright, never guessed at.
+/// the Solana send flow calls. What IS a deliberate, current restriction:
+/// `network` is checked against `SOLANA_SENDABLE_NETWORKS`
+/// (`require_sendable_solana_network`) before any signature is produced,
+/// the exact same architectural block EVM's mainnets already get via
+/// `SENDABLE_CHAIN_IDS` — no mainnet sending anywhere in this app until an
+/// external audit, full stop. Solana does not get treated as an exception
+/// just because its signer happened to get built and verified first; the
+/// checkpoint send above is exactly why this check, not the absence of a
+/// working signer, is what has to do the blocking now.
+///
+/// `to`/`lamports`/`recent_blockhash` are untrusted frontend input and
+/// parsed strictly, the same discipline as every EVM signing command in
+/// this file — a malformed address or blockhash is rejected outright, never
+/// guessed at.
 #[tauri::command]
 fn sign_solana_transaction(
     to: String,
     lamports: u64,
     recent_blockhash: String,
+    network: String,
     from_index: u32,
     unlocked: State<'_, UnlockedWallet>,
 ) -> Result<String, String> {
-    sign_solana_transaction_impl(&unlocked, &to, lamports, &recent_blockhash, from_index)
+    sign_solana_transaction_impl(&unlocked, &to, lamports, &recent_blockhash, &network, from_index)
 }
 
 /// The testable core of [`sign_solana_transaction`].
@@ -1510,8 +1551,16 @@ fn sign_solana_transaction_impl(
     to: &str,
     lamports: u64,
     recent_blockhash: &str,
+    network: &str,
     from_index: u32,
 ) -> Result<String, String> {
+    // Checked first, before parsing anything else — same ordering as
+    // `sign_transaction_impl`'s own chain-id checks: this is the last line
+    // of defense before a real signature is produced, so it does not trust
+    // the caller's `network` string, however that value got here, and does
+    // not do any other work first.
+    require_sendable_solana_network(network)?;
+
     let to_pubkey: SolanaPubkey = to
         .parse()
         .map_err(|_| "recipient is not a well-formed Solana address".to_string())?;
@@ -1859,8 +1908,12 @@ mod tests {
         };
         let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
 
+        // "devnet", not "mainnet-beta": mainnet sending is now blocked (see
+        // `sign_solana_transaction_refuses_to_sign_for_mainnet_beta` below)
+        // -- this test is about the signing math itself, so it deliberately
+        // uses the one network that check actually lets through.
         let signed_base64 =
-            sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, FAKE_BLOCKHASH, 0)
+            sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, FAKE_BLOCKHASH, "devnet", 0)
                 .expect("signing should succeed");
 
         // Independent verification: decode the returned bytes and verify
@@ -1898,6 +1951,7 @@ mod tests {
             "11111111111111111111111111111111",
             1_000_000,
             FAKE_BLOCKHASH,
+            "devnet",
             0,
         )
         .expect_err("locked wallet must refuse");
@@ -1907,7 +1961,8 @@ mod tests {
     #[test]
     fn sign_solana_transaction_rejects_a_malformed_recipient() {
         let unlocked = unlocked_with_fresh_mnemonic();
-        let result = sign_solana_transaction_impl(&unlocked, "not-a-solana-address", 1_000_000, FAKE_BLOCKHASH, 0);
+        let result =
+            sign_solana_transaction_impl(&unlocked, "not-a-solana-address", 1_000_000, FAKE_BLOCKHASH, "devnet", 0);
         assert!(result.is_err(), "malformed recipient must be rejected");
     }
 
@@ -1915,8 +1970,41 @@ mod tests {
     fn sign_solana_transaction_rejects_a_malformed_blockhash() {
         let unlocked = unlocked_with_fresh_mnemonic();
         let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
-        let result = sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, "not-a-hash", 0);
+        let result = sign_solana_transaction_impl(&unlocked, &recipient, 1_000_000, "not-a-hash", "devnet", 0);
         assert!(result.is_err(), "malformed blockhash must be rejected");
+    }
+
+    #[test]
+    fn require_sendable_solana_network_allows_devnet_and_testnet_and_rejects_mainnet_beta() {
+        // Every network this app considers sendable for Solana is let
+        // through...
+        assert!(require_sendable_solana_network("devnet").is_ok());
+        assert!(require_sendable_solana_network("testnet").is_ok());
+        // ...and mainnet-beta -- the one that carries real funds -- is not,
+        // same as every EVM mainnet via `require_sendable_chain_id`.
+        let error = require_sendable_solana_network("mainnet-beta")
+            .expect_err("mainnet-beta must be rejected");
+        assert_eq!(error, "Sending is not yet supported on this network");
+    }
+
+    #[test]
+    fn sign_solana_transaction_refuses_to_sign_for_mainnet_beta() {
+        // The actual policy enforcement: even a fully unlocked wallet with a
+        // well-formed recipient/blockhash must never produce a mainnet-beta
+        // signature -- no chain is exempt from the no-mainnet-sending-
+        // until-audit policy just because its signer works.
+        let unlocked = unlocked_with_fresh_mnemonic();
+        let recipient = get_solana_account_address_impl(1, &unlocked).expect("derive account 1");
+        let error = sign_solana_transaction_impl(
+            &unlocked,
+            &recipient,
+            1_000_000,
+            FAKE_BLOCKHASH,
+            "mainnet-beta",
+            0,
+        )
+        .expect_err("mainnet-beta signing must be refused");
+        assert_eq!(error, "Sending is not yet supported on this network");
     }
 
     #[test]

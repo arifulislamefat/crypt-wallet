@@ -15,6 +15,9 @@ import {
 import { fetchTokenBalance, fetchTokenMetadata, parseUnitsStrict, type TokenMetadata } from "./tokens";
 import {
   BASE_FEE_LAMPORTS_PER_SIGNATURE,
+  SOLANA_NETWORK,
+  SOLANA_NETWORK_LABEL,
+  SOLANA_SEND_SUPPORTED,
   SOL_DECIMALS,
   confirmSolanaTransaction,
   fetchLatestBlockhash,
@@ -1246,6 +1249,21 @@ function updateSendAvailability() {
     : `Sending is not supported on ${network.label} yet.`;
 }
 
+/**
+ * Same purpose as `updateSendAvailability`, for the Solana send button --
+ * reflects `SOLANA_SEND_SUPPORTED` (currently always `false`: no mainnet
+ * sending anywhere in this app until an external audit, the same
+ * architectural block every EVM mainnet already gets). Unlike EVM there is
+ * no network switcher to react to yet, so this only needs to run once, at
+ * startup -- see `DOMContentLoaded`.
+ */
+function updateSolanaSendAvailability() {
+  el<HTMLButtonElement>("solana-send-nav-btn").disabled = !SOLANA_SEND_SUPPORTED;
+  el("solana-send-nav-hint").textContent = SOLANA_SEND_SUPPORTED
+    ? ""
+    : `Sending is not supported on ${SOLANA_NETWORK_LABEL} yet.`;
+}
+
 function readCustomNetworkFormInput(): CustomNetworkFormInput {
   return {
     label: el<HTMLInputElement>("custom-network-name").value,
@@ -2383,10 +2401,21 @@ async function confirmSend() {
  * (deliberately, per this feature's spec). Nothing to prefetch here beyond
  * clearing prior state; `reviewSolanaSend` does the real validation and
  * network calls.
+ *
+ * Also checks `SOLANA_SEND_SUPPORTED` before anything else, mirroring
+ * `goToSend`'s own check exactly: `updateSolanaSendAvailability` already
+ * disables the nav button that gets here, so this is defense in depth
+ * against a stale/bypassed disabled state, not the primary way a user
+ * encounters the restriction.
  */
 function goToSolanaSend() {
   clearSolanaSendState();
   showStep("solana-send");
+
+  if (!SOLANA_SEND_SUPPORTED) {
+    el("solana-send-error").textContent = `Sending is not supported on ${SOLANA_NETWORK_LABEL} yet.`;
+    return;
+  }
 }
 
 /**
@@ -2402,6 +2431,14 @@ async function reviewSolanaSend() {
   const statusEl = el("solana-send-status");
   const reviewBtn = el<HTMLButtonElement>("solana-send-review-btn");
   errorEl.textContent = "";
+
+  // Same defense-in-depth reasoning as reviewSend's own check: the nav
+  // button and goToSolanaSend both already gate this, but this still runs
+  // again here in case either was somehow bypassed.
+  if (!SOLANA_SEND_SUPPORTED) {
+    errorEl.textContent = `Sending is not supported on ${SOLANA_NETWORK_LABEL} yet.`;
+    return;
+  }
 
   const recipient = el<HTMLInputElement>("solana-send-recipient").value.trim();
   const amountInput = el<HTMLInputElement>("solana-send-amount").value.trim();
@@ -2510,10 +2547,19 @@ async function confirmSolanaSend() {
   progressEl.textContent = "Signing…";
   let signedBase64: string;
   try {
+    // `network` is `SOLANA_NETWORK`, the real cluster this app's RPC
+    // endpoint targets -- the backend's own `SOLANA_SENDABLE_NETWORKS`
+    // check is the actual enforcement that a non-sendable network is
+    // refused (mirrors `sign_transaction`'s `chainId` reasoning in
+    // `confirmSend`); this value just reports the truth to that check. The
+    // frontend's `SOLANA_SEND_SUPPORTED` gate upstream, in
+    // goToSolanaSend/reviewSolanaSend, is what normally prevents reaching
+    // this call at all while it's `false`.
     signedBase64 = await invoke<string>("sign_solana_transaction", {
       to: send.recipient,
       lamports: Number(send.lamports),
       recentBlockhash: send.recentBlockhash,
+      network: SOLANA_NETWORK,
       fromIndex: activeSolanaAccountIndex,
     });
   } catch (error) {
@@ -2637,6 +2683,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   el<HTMLInputElement>("rpc-url").value = activeNetwork().defaultRpcUrl;
   renderNetworkBanner();
   updateSendAvailability();
+  updateSolanaSendAvailability();
   el<HTMLSelectElement>("network-select").addEventListener("change", (event) => {
     switchNetwork((event.target as HTMLSelectElement).value);
   });
